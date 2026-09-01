@@ -12,7 +12,8 @@
 
 ## 任务清单
 
-- [ ] Task 1：真实 Fixed Source（固定来源）网页读取 — In Progress（进行中）
+- [ ] Task 1：真实 Fixed Source（固定来源）网页读取 — In Progress（已完成）
+- 说明：OctoReport 官方文档页真实读取成功，HTTP 状态码 200；能够提取页面标题和服务器返回 HTML 中的页面文本；当前文本仍包含导航栏、目录等噪声，留待 Task 2 Content Normalization（内容标准化）处理。
 - [ ] Task 2：Content Normalization（内容标准化）— Todo（待做）
 - [ ] Task 3：保存 Snapshot（页面快照）— Todo（待做）
 - [ ] Task 4：计算 Content Hash（内容哈希摘要）— Todo（待做）
