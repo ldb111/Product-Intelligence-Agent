@@ -210,6 +210,7 @@ class PageReaderTests(unittest.TestCase):
         output = json.loads(stdout.getvalue())
         self.assertTrue(output["is_first_scan"])
         self.assertIsNone(output["changed"])
+        self.assertIsNone(output["diff"])
         self.assertIsNone(output["previous_content_hash"])
         self.assertEqual(
             output["current_snapshot"]["title"], "Test Product Page"

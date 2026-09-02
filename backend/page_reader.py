@@ -28,6 +28,7 @@ from bs4 import BeautifulSoup
 # python backend/page_reader.py 直接运行文件。两种情况下都复用相同的历史查询和变化检测逻辑。
 if __package__:
     from .change_detection import ChangeDetectionError, detect_change
+    from .content_diff import ContentDiffError, build_diff_result
     from .snapshot import (
         SnapshotError,
         build_snapshot_history,
@@ -36,6 +37,7 @@ if __package__:
     )
 else:
     from change_detection import ChangeDetectionError, detect_change
+    from content_diff import ContentDiffError, build_diff_result
     from snapshot import (
         SnapshotError,
         build_snapshot_history,
@@ -276,15 +278,16 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """执行网页读取、快照保存和变化检测，并用 JSON 与退出码报告结果。
+    """执行 Stage 1 网页监控链路，并用 JSON 与退出码报告结果。
 
     main 是命令行入口：它读取参数、调用 read_page，并把 Python dict（字典）通过
     create_snapshot 增加采集时间和内容哈希，再由 save_snapshot 保存。保存后查询同一 URL
     的 Previous Snapshot（上一份快照），再把 Task 5 结果交给 detect_change 比较已有
-    content_hash。最终通过 json.dumps 输出 JSON；错误写入 stderr（标准错误）。
+    content_hash，再根据 changed 决定是否生成行级 Diff。最终通过 json.dumps 输出 JSON；
+    错误写入 stderr（标准错误）。
 
     输入：可选的参数列表；为 None 时 argparse 使用真实命令行参数。
-    处理：解析参数、读取一次网页、保存快照、查询上一份快照、判断内容变化并输出 JSON。
+    处理：读取一次网页、保存快照、查询历史、判断变化、按需生成 Diff 并输出 JSON。
     输出：成功返回退出码 0；失败返回退出码 1。操作系统和脚本调用者可据此快速判断
     命令是否成功，而不必先解析输出文本。
     """
@@ -295,8 +298,14 @@ def main(argv: list[str] | None = None) -> int:
         current_snapshot = create_snapshot(page_data)
         save_snapshot(current_snapshot)
         snapshot_history = build_snapshot_history(current_snapshot)
-        result = detect_change(snapshot_history)
-    except (PageReadError, SnapshotError, ChangeDetectionError) as exc:
+        change_result = detect_change(snapshot_history)
+        result = build_diff_result(change_result)
+    except (
+        PageReadError,
+        SnapshotError,
+        ChangeDetectionError,
+        ContentDiffError,
+    ) as exc:
         error_result = {
             "error": {
                 "type": exc.error_type,

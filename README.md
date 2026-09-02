@@ -2,9 +2,9 @@
 
 AI 产品研究与竞争信号监控项目。
 
-## 当前功能：网页读取、页面快照与变化检测
+## 当前功能：Stage 1 网页变化监控链路
 
-输入一个 HTTP/HTTPS URL，程序会请求服务器返回的 HTML，删除确定性的结构噪声，提取标题和页面文本，为标准化内容计算 SHA-256 哈希并保存 JSON 页面快照，然后查找上一份快照并比较两份 `content_hash`。当前实现只判断标准化正文是否变化，不生成具体文本差异，也不判断变化是否具有竞争意义。
+输入一个 HTTP/HTTPS URL，程序会读取并标准化服务器返回的 HTML，保存带 SHA-256 内容哈希的 JSON 页面快照，查找上一份快照，判断标准化正文是否变化，并在发生变化时生成行级 Unified Diff（统一差异）。当前 Diff 只描述文本变化，不判断变化是否具有竞争意义。
 
 ### 安装依赖
 
@@ -30,6 +30,7 @@ python backend/page_reader.py "https://example.com" --timeout 5
 {
   "is_first_scan": true,
   "changed": null,
+  "diff": null,
   "previous_content_hash": null,
   "current_content_hash": "...",
   "current_snapshot": {

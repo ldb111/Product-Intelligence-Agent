@@ -39,7 +39,8 @@
 - 说明：基于相同 URL 和 captured_at（采集时间） 从历史快照中找到当前快照之前最近的一份，并正确识别 First Scan（首次采集）场景。
 - [ ] Task 6：Change Detection（变化检测）— Todo（完成）
 - 说明：比较 Previous Snapshot（上一份页面快照）与 Current Snapshot（当前页面快照）的 content_hash，识别页面内容是否变化，并对 First Scan（首次采集）返回未知状态。
-- [ ] Task 7：Diff（差异比较）— Todo（待做）
+- [ ] Task 7：Diff（差异比较）— Todo（完成）
+- 说明：在 Change Detection（变化检测）确认页面发生变化后，对前后两份标准化 content 进行行级比较，输出具体新增、删除和修改的文本差异。
 - [ ] Stage 1 验收 — Todo（待做）
 
 ### 当天完成标准
