@@ -1,8 +1,8 @@
 """创建并持久化 Product Intelligence Agent 的 JSON 页面快照。
 
-本模块负责 Task 3 和 Task 4：接收已经由 page_reader 完成读取和内容标准化的页面数据，
-增加带时区的采集时间和 Content Hash（内容哈希），并保存为 UTF-8 JSON 文件。
-它不会重新请求网页，也不负责上一份快照查询、哈希比较或变化检测。
+本模块负责 Task 3～Task 5：创建并保存带采集时间和 Content Hash（内容哈希）的页面
+快照，以及从同一 URL 的历史记录中找到当前快照之前时间最近的一份快照。它不会重新
+请求网页，也不比较内容哈希或判断页面是否变化。
 """
 
 from __future__ import annotations
@@ -177,3 +177,142 @@ def save_snapshot(
             ) from exc
 
         return candidate_path
+
+
+def _parse_captured_at(value: Any, source: str) -> datetime:
+    """把 Snapshot 中的 ISO 8601 字符串解析为可比较的带时区日期时间。
+
+    在业务链路中的职责：确保当前快照和历史快照使用同一种可靠的时间比较方式，避免
+    直接比较字符串或文件名而得到错误顺序。
+
+    输入：captured_at 字段值，以及用于错误提示的快照来源说明。
+    处理：使用 datetime.fromisoformat 解析，并确认结果包含 UTC 时区偏移量。
+    输出：可按真实时间先后比较的 datetime；格式无效或不带时区时抛出 SnapshotError。
+    """
+    if not isinstance(value, str):
+        raise SnapshotError(
+            "invalid_snapshot_data", f"captured_at in {source} must be a string."
+        )
+
+    try:
+        captured_at = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise SnapshotError(
+            "invalid_snapshot_data",
+            f"captured_at in {source} is not valid ISO 8601: {value}.",
+        ) from exc
+
+    # 不带时区的 datetime 无法明确代表全球时间线上的一个时刻。如果允许它参与比较，
+    # 不同机器或时区可能得到不同结果，因此把它视为无效快照数据。
+    if captured_at.utcoffset() is None:
+        raise SnapshotError(
+            "invalid_snapshot_data", f"captured_at in {source} must include a timezone."
+        )
+
+    return captured_at
+
+
+def find_previous_snapshot(
+    current_snapshot: dict[str, Any], directory: str | Path | None = None
+) -> dict[str, Any] | None:
+    """查找同一 URL 在当前快照之前时间最近的一份历史 Snapshot。
+
+    在业务链路中的职责：只回答“当前快照的上一份历史快照是哪一份”，为下一阶段的
+    Change Detection（变化检测）准备前后两个版本；本函数不比较 content_hash。
+
+    输入：包含 url 和 captured_at 的当前快照；可选快照目录，默认 data/snapshots。
+    处理：读取目录内 JSON，只保留 URL 完全相同且 captured_at 严格早于当前时间的记录，
+    然后选择 captured_at 最大、也就是时间距离当前快照最近的一份。
+    输出：找到时返回完整的上一份快照字典；目录不存在、为空或没有候选记录时返回 None。
+
+    重要业务规则：时间依据只来自 JSON 内部 captured_at，不使用文件名；严格使用小于
+    而不是小于等于，确保当前快照自己和相同采集时间的记录不会被错误选中。
+    """
+    try:
+        current_url = current_snapshot["url"]
+        current_captured_at_value = current_snapshot["captured_at"]
+    except KeyError as exc:
+        raise SnapshotError(
+            "invalid_snapshot_data",
+            f"Current snapshot is missing required field: {exc.args[0]}.",
+        ) from exc
+
+    current_captured_at = _parse_captured_at(
+        current_captured_at_value, "current snapshot"
+    )
+    snapshot_directory = (
+        Path(directory) if directory is not None else DEFAULT_SNAPSHOT_DIRECTORY
+    )
+
+    # 目录不存在或尚无快照表示该 URL 没有可用历史，这属于正常的 First Scan（首次采集），
+    # 不应该被当成文件系统错误。
+    if not snapshot_directory.exists():
+        return None
+
+    previous_snapshot: dict[str, Any] | None = None
+    previous_captured_at: datetime | None = None
+
+    # glob 返回顺序可能受文件系统影响，所以不能依赖遍历顺序。循环中始终保留当前已知
+    # 时间最大的候选记录，最终结果只由 JSON 内容决定。
+    for snapshot_path in snapshot_directory.glob("*.json"):
+        try:
+            with snapshot_path.open("r", encoding="utf-8") as snapshot_file:
+                historical_snapshot = json.load(snapshot_file)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise SnapshotError(
+                "snapshot_read_failed",
+                f"Failed to read snapshot file {snapshot_path}: {exc}",
+            ) from exc
+
+        if not isinstance(historical_snapshot, dict):
+            raise SnapshotError(
+                "invalid_snapshot_data",
+                f"Snapshot file {snapshot_path} must contain a JSON object.",
+            )
+
+        # URL 使用完全相等判断，不做大小写转换、去除参数或其他“近似匹配”，防止把不同
+        # 页面混进同一条历史链路。
+        if historical_snapshot.get("url") != current_url:
+            continue
+
+        if "captured_at" not in historical_snapshot:
+            raise SnapshotError(
+                "invalid_snapshot_data",
+                f"Snapshot file {snapshot_path} is missing captured_at.",
+            )
+
+        historical_captured_at = _parse_captured_at(
+            historical_snapshot["captured_at"], str(snapshot_path)
+        )
+
+        # 严格排除当前快照自己、相同时间记录和未来记录。这里不读取或比较 content_hash。
+        if historical_captured_at >= current_captured_at:
+            continue
+
+        if (
+            previous_captured_at is None
+            or historical_captured_at > previous_captured_at
+        ):
+            previous_snapshot = historical_snapshot
+            previous_captured_at = historical_captured_at
+
+    return previous_snapshot
+
+
+def build_snapshot_history(
+    current_snapshot: dict[str, Any], directory: str | Path | None = None
+) -> dict[str, Any]:
+    """组成包含 First Scan 状态、当前快照和上一份快照的 Task 5 输出。
+
+    输入：当前 Snapshot，以及可选的历史快照目录。
+    处理：调用 find_previous_snapshot 查找上一份记录，并根据是否找到设置 is_first_scan。
+    输出：包含 is_first_scan、current_snapshot、previous_snapshot 的字典；首次采集时
+    previous_snapshot 为 None，序列化成 JSON 后对应 null。
+    """
+    previous_snapshot = find_previous_snapshot(current_snapshot, directory)
+
+    return {
+        "is_first_scan": previous_snapshot is None,
+        "current_snapshot": current_snapshot,
+        "previous_snapshot": previous_snapshot,
+    }

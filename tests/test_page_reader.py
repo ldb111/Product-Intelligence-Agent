@@ -208,8 +208,12 @@ class PageReaderTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         output = json.loads(stdout.getvalue())
-        self.assertEqual(output["title"], "Test Product Page")
-        self.assertIn("captured_at", output)
+        self.assertTrue(output["is_first_scan"])
+        self.assertEqual(
+            output["current_snapshot"]["title"], "Test Product Page"
+        )
+        self.assertIn("captured_at", output["current_snapshot"])
+        self.assertIsNone(output["previous_snapshot"])
         self.assertEqual(len(snapshot_files), 1)
 
     def test_cli_error_is_json_and_returns_nonzero(self) -> None:

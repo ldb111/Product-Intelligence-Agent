@@ -9,7 +9,13 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
-from backend.snapshot import compute_content_hash, create_snapshot, save_snapshot
+from backend.snapshot import (
+    build_snapshot_history,
+    compute_content_hash,
+    create_snapshot,
+    find_previous_snapshot,
+    save_snapshot,
+)
 
 
 class SnapshotTests(unittest.TestCase):
@@ -22,6 +28,27 @@ class SnapshotTests(unittest.TestCase):
             "title": "中文产品文档",
             "content": "第一行产品内容\n\n第二行产品内容",
         }
+
+    def _snapshot_at(
+        self, url: str, captured_at: str, content: str
+    ) -> dict[str, object]:
+        """构造时间可控的测试快照，避免测试依赖真实时钟。"""
+        return {
+            "url": url,
+            "status_code": 200,
+            "title": "测试页面",
+            "content": content,
+            "captured_at": captured_at,
+            "content_hash": compute_content_hash(content),
+        }
+
+    def _write_named_snapshot(
+        self, directory: Path, filename: str, snapshot: dict[str, object]
+    ) -> None:
+        """用指定文件名写入测试快照，证明查询结果不依赖文件名顺序。"""
+        (directory / filename).write_text(
+            json.dumps(snapshot, ensure_ascii=False), encoding="utf-8"
+        )
 
     def test_compute_content_hash_returns_standard_sha256_hex_digest(self) -> None:
         # "hello" 的 SHA-256 是公开、固定的测试值。与它直接比较可以同时验证算法、
@@ -137,3 +164,63 @@ class SnapshotTests(unittest.TestCase):
                 json.loads(first_path.read_text(encoding="utf-8")),
                 json.loads(second_path.read_text(encoding="utf-8")),
             )
+
+    def test_finds_nearest_previous_snapshot_using_json_time(self) -> None:
+        url = "https://example.com/product"
+        snapshot_a = self._snapshot_at(url, "2026-09-02T10:00:00+08:00", "A")
+        snapshot_b = self._snapshot_at(url, "2026-09-02T11:00:00+08:00", "B")
+        current_snapshot = self._snapshot_at(
+            url, "2026-09-02T12:00:00+08:00", "C"
+        )
+        future_snapshot = self._snapshot_at(
+            url, "2026-09-02T13:00:00+08:00", "Future"
+        )
+        other_url_snapshot = self._snapshot_at(
+            "https://other.example.com/product",
+            "2026-09-02T11:59:00+08:00",
+            "Other URL",
+        )
+
+        with TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            # 文件名字母顺序故意与时间顺序不一致，并把当前和未来快照也放进目录。
+            self._write_named_snapshot(directory, "z_oldest.json", snapshot_a)
+            self._write_named_snapshot(directory, "a_nearest.json", snapshot_b)
+            self._write_named_snapshot(directory, "m_current.json", current_snapshot)
+            self._write_named_snapshot(directory, "b_future.json", future_snapshot)
+            self._write_named_snapshot(directory, "c_other_url.json", other_url_snapshot)
+
+            previous_snapshot = find_previous_snapshot(current_snapshot, directory)
+            history = build_snapshot_history(current_snapshot, directory)
+
+        self.assertEqual(previous_snapshot, snapshot_b)
+        self.assertFalse(history["is_first_scan"])
+        self.assertEqual(history["current_snapshot"], current_snapshot)
+        self.assertEqual(history["previous_snapshot"], snapshot_b)
+
+    def test_first_scan_when_directory_missing_or_only_contains_current(self) -> None:
+        current_snapshot = self._snapshot_at(
+            "https://example.com/new-page",
+            "2026-09-02T12:00:00+08:00",
+            "First content",
+        )
+
+        with TemporaryDirectory() as temporary_directory:
+            missing_directory = Path(temporary_directory) / "not-created"
+            missing_directory_history = build_snapshot_history(
+                current_snapshot, missing_directory
+            )
+
+            existing_directory = Path(temporary_directory) / "snapshots"
+            existing_directory.mkdir()
+            self._write_named_snapshot(
+                existing_directory, "current-only.json", current_snapshot
+            )
+            current_only_history = build_snapshot_history(
+                current_snapshot, existing_directory
+            )
+
+        for history in (missing_directory_history, current_only_history):
+            self.assertTrue(history["is_first_scan"])
+            self.assertEqual(history["current_snapshot"], current_snapshot)
+            self.assertIsNone(history["previous_snapshot"])
