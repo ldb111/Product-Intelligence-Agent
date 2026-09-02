@@ -12,6 +12,8 @@ import threading
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 import requests
@@ -192,12 +194,23 @@ class PageReaderTests(unittest.TestCase):
 
     def test_cli_success_output_is_valid_json(self) -> None:
         stdout = io.StringIO()
-        with redirect_stdout(stdout):
-            exit_code = main([f"{self.base_url}/ok"])
+        # CLI 成功时现在会保存 Snapshot。测试把默认目录替换成临时目录，确保自动化
+        # 测试不会在正式 data/snapshots 中留下文件。
+        with TemporaryDirectory() as temporary_directory:
+            with patch(
+                "backend.snapshot.DEFAULT_SNAPSHOT_DIRECTORY",
+                Path(temporary_directory),
+            ):
+                with redirect_stdout(stdout):
+                    exit_code = main([f"{self.base_url}/ok"])
+
+            snapshot_files = list(Path(temporary_directory).glob("*.json"))
 
         self.assertEqual(exit_code, 0)
         output = json.loads(stdout.getvalue())
         self.assertEqual(output["title"], "Test Product Page")
+        self.assertIn("captured_at", output)
+        self.assertEqual(len(snapshot_files), 1)
 
     def test_cli_error_is_json_and_returns_nonzero(self) -> None:
         stderr = io.StringIO()

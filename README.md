@@ -2,9 +2,9 @@
 
 AI 产品研究与竞争信号监控项目。
 
-## 当前功能：基础网页读取
+## 当前功能：网页读取与页面快照
 
-输入一个 HTTP/HTTPS URL，程序会请求服务器返回的 HTML，并输出标题、页面文本和 HTTP 状态码。当前实现只读取服务器端 HTML，不执行 JavaScript，也不包含内容标准化、快照、变化检测、数据库或 LLM 调用。
+输入一个 HTTP/HTTPS URL，程序会请求服务器返回的 HTML，删除确定性的结构噪声，提取标题和页面文本，并将结果保存为 JSON 页面快照。当前实现只读取服务器端 HTML，不执行 JavaScript，也不包含内容哈希、上一份快照查询、变化检测、数据库或 LLM 调用。
 
 ### 安装依赖
 
@@ -24,14 +24,15 @@ python backend/page_reader.py "https://example.com"
 python backend/page_reader.py "https://example.com" --timeout 5
 ```
 
-成功时，程序向标准输出写入 JSON：
+成功时，程序在 `data/snapshots/` 新建一份 UTF-8 JSON 快照，并向标准输出写入相同的快照数据：
 
 ```json
 {
   "url": "https://example.com",
   "status_code": 200,
   "title": "Example Domain",
-  "content": "Example Domain\n..."
+  "content": "Example Domain\n...",
+  "captured_at": "2026-09-02T14:35:20.123456+08:00"
 }
 ```
 

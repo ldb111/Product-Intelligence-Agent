@@ -24,6 +24,13 @@ from urllib.parse import urlsplit
 import requests
 from bs4 import BeautifulSoup
 
+# 兼容两种现有运行方式：测试通过 backend.page_reader 导入模块，而 README 使用
+# python backend/page_reader.py 直接运行文件。两种情况下都复用 snapshot.py 的同一套逻辑。
+if __package__:
+    from .snapshot import SnapshotError, create_snapshot, save_snapshot
+else:
+    from snapshot import SnapshotError, create_snapshot, save_snapshot
+
 
 DEFAULT_TIMEOUT_SECONDS = 10.0
 # 这里只列出可以确定不属于产品正文的 HTML 标签。header、main、aside、a、button
@@ -257,22 +264,25 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """执行命令行流程，并用 JSON 和退出码向调用者报告结果。
+    """执行网页读取与快照保存，并用 JSON 和退出码向调用者报告结果。
 
     main 是命令行入口：它读取参数、调用 read_page，并把 Python dict（字典）通过
-    json.dumps 序列化为合法 JSON 字符串。成功数据写入 stdout（标准输出），便于管道
-    或其他程序继续读取；错误数据写入 stderr（标准错误），避免错误内容混入正常结果。
+    create_snapshot 增加采集时间，再由 save_snapshot 保存。完整快照通过 json.dumps
+    序列化为合法 JSON 字符串。成功数据写入 stdout（标准输出），便于管道或其他程序
+    继续读取；错误数据写入 stderr（标准错误），避免错误内容混入正常结果。
 
     输入：可选的参数列表；为 None 时 argparse 使用真实命令行参数。
-    处理：解析参数、执行网页读取，并把成功或预期失败转换为对应 JSON。
+    处理：解析参数、执行一次网页读取、创建并保存快照，再把成功或预期失败转换为 JSON。
     输出：成功返回退出码 0；失败返回退出码 1。操作系统和脚本调用者可据此快速判断
     命令是否成功，而不必先解析输出文本。
     """
     args = build_parser().parse_args(argv)
 
     try:
-        result = read_page(args.url, args.timeout)
-    except PageReadError as exc:
+        page_data = read_page(args.url, args.timeout)
+        result = create_snapshot(page_data)
+        save_snapshot(result)
+    except (PageReadError, SnapshotError) as exc:
         error_result = {
             "error": {
                 "type": exc.error_type,
