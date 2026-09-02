@@ -1,12 +1,12 @@
 """读取指定网页，并提取后续数据采集流程需要的基础原始数据。
 
-本模块负责 Task 1 的完整链路：校验 URL、发起 HTTP 请求、检查响应状态、
-解析服务器返回的 HTML，最后通过命令行输出 JSON。
+本模块负责 Task 1 和 Task 2 的基础链路：校验 URL、发起 HTTP 请求、检查响应状态、
+解析服务器返回的 HTML、删除确定性的结构噪声、标准化基础空白，最后通过命令行输出 JSON。
 
 当前实现有意保持简单：BeautifulSoup 只解析 HTTP 响应中已经存在的 HTML，
 不会像浏览器一样执行 JavaScript。因此，依赖 JavaScript 才显示正文的网页可能只能
-获取到部分内容。页面中的导航栏、页脚等噪声也会暂时保留，后续由
-Content Normalization（内容标准化）任务统一处理。
+获取到部分内容。本任务也不判断广告、Cookie 提示或动态推荐等非确定性噪声，
+这些内容仍可能出现在最终结果中。
 """
 
 from __future__ import annotations
@@ -26,6 +26,9 @@ from bs4 import BeautifulSoup
 
 
 DEFAULT_TIMEOUT_SECONDS = 10.0
+# 这里只列出可以确定不属于产品正文的 HTML 标签。header、main、aside、a、button
+# 可能包含有效产品信息，因此不能因为它们有时包含噪声就直接删除。
+NOISE_TAG_NAMES = ("script", "style", "noscript", "nav", "footer")
 # User-Agent 用于向服务器说明请求来自哪个客户端。部分网站会拒绝没有该请求头的访问，
 # 使用项目自己的标识也比伪装成真实浏览器更清晰、诚实。
 USER_AGENT = "Product-Intelligence-Agent/0.1"
@@ -133,32 +136,73 @@ def fetch_html(url: str, timeout: float = DEFAULT_TIMEOUT_SECONDS) -> tuple[int,
 
 
 def extract_page_data(html: bytes) -> tuple[str, str]:
-    """从服务器返回的 HTML 中提取网页标题和基础页面文本。
+    """从服务器返回的 HTML 中提取标题和标准化后的页面文本。
 
     在整个链路中的职责：把 fetch_html 返回的原始字节转换成后续阶段可使用的字符串。
 
     输入：服务器响应正文的原始 HTML bytes（字节）。
-    处理：BeautifulSoup 使用 Python 内置的 html.parser 构建 HTML 节点树，然后读取
-    ``<title>`` 标签和所有节点中的文本。
+    处理：BeautifulSoup 使用 Python 内置的 html.parser 构建 HTML 节点树，读取
+    ``<title>`` 标签，再调用 normalize_content 删除确定性噪声并整理页面文本。
     输出：``(title, content)`` 字符串元组；页面没有 title 标签时标题为空字符串。
 
     业务边界：BeautifulSoup 是 HTML 解析器，不是浏览器，不会执行 JavaScript。因此，
-    JavaScript 运行后才出现的正文不在本函数的输入里，也就无法被提取。``get_text``
-    会保留 HTML 中导航栏、页脚、菜单等文字；本任务需要的是原始页面文本，不在这里
-    猜测哪些内容有用。这些噪声将在后续 Content Normalization（内容标准化）中处理。
+    JavaScript 运行后才出现的正文不在本函数的输入里，也就无法被提取。当前标准化只
+    删除明确指定的标签，不进行通用主内容提取或网站专用判断。
     """
     try:
         # 解析后可以按标签访问页面结构，不需要用容易出错的字符串截取来读取 HTML。
         soup = BeautifulSoup(html, "html.parser")
         # title 从 HTML 的 <title> 标签取得；get_text 会合并标签内部文本并清理首尾空白。
         title = soup.title.get_text(" ", strip=True) if soup.title else ""
-        # content 提取整棵 HTML 节点树中的文本，并用换行分隔各段，暂不做业务标准化。
-        content = soup.get_text("\n", strip=True)
+        content = normalize_content(soup)
     except Exception as exc:
         # 将罕见的解析异常转换成统一业务异常，避免调用者把“解析失败”误解为正常空页面。
         raise PageReadError("parse_error", f"Failed to parse returned HTML: {exc}") from exc
 
     return title, content
+
+
+def normalize_content(soup: BeautifulSoup) -> str:
+    """删除确定性的 HTML 结构噪声，并生成空白格式稳定的纯文本。
+
+    在整个链路中的职责：位于“HTML 结构解析”和“纯文本输出”之间，减少导航栏、页脚、
+    脚本等确定性噪声，使后续 Snapshot（页面快照）保存和 Change Detection（变化检测）
+    面对的文本更加稳定。
+
+    输入：由 BeautifulSoup 解析完成、仍然保留 HTML 标签结构的页面树。
+    处理：先删除 script、style、noscript、nav、footer 标签及其内部内容；再把剩余 HTML
+    转换成文本，清理每行首尾空白、压缩行内重复空白，并把连续空行压缩为一个空行。
+    输出：保留合理换行结构的标准化页面文本字符串。
+
+    业务边界：这里只删除能够确定为结构噪声的标签。main、header、aside、a 和 button
+    即使有时包含菜单或操作文字，也可能承载有效产品信息，所以当前必须保留。广告、
+    Cookie 提示、动态日期和随机推荐等内容需要更复杂的判断，本任务不处理。
+    """
+    # decompose 会把标签和它包含的全部内容一起从页面树中移除。必须在 get_text 之前做，
+    # 否则脚本代码、导航文字等已经混入纯文本，之后很难可靠判断它们原本来自哪个标签。
+    for noise_tag in soup.find_all(NOISE_TAG_NAMES):
+        noise_tag.decompose()
+
+    raw_text = soup.get_text("\n")
+    normalized_lines: list[str] = []
+    blank_line_pending = False
+
+    for line in raw_text.splitlines():
+        # split 后再 join 会把空格、制表符等连续空白统一成一个普通空格，同时清理行首行尾。
+        normalized_line = " ".join(line.split())
+        if not normalized_line:
+            # 不立即追加空行，而是先记录。只有后面仍有正文时才补一个空行，这样既能
+            # 合并多个空行，也不会在结果开头或末尾留下无意义空行。
+            if normalized_lines:
+                blank_line_pending = True
+            continue
+
+        if blank_line_pending:
+            normalized_lines.append("")
+            blank_line_pending = False
+        normalized_lines.append(normalized_line)
+
+    return "\n".join(normalized_lines)
 
 
 def read_page(url: str, timeout: float = DEFAULT_TIMEOUT_SECONDS) -> dict[str, Any]:
