@@ -37,7 +37,8 @@
 - 说明：对标准化后的 content 使用 SHA-256（安全哈希算法 256 位）生成稳定的 content_hash，用于后续快速判断两份页面快照的内容是否一致。
 - [ ] Task 5：Previous Snapshot（上一份页面快照）— Todo（完成）
 - 说明：基于相同 URL 和 captured_at（采集时间） 从历史快照中找到当前快照之前最近的一份，并正确识别 First Scan（首次采集）场景。
-- [ ] Task 6：Change Detection（变化检测）— Todo（待做）
+- [ ] Task 6：Change Detection（变化检测）— Todo（完成）
+- 说明：比较 Previous Snapshot（上一份页面快照）与 Current Snapshot（当前页面快照）的 content_hash，识别页面内容是否变化，并对 First Scan（首次采集）返回未知状态。
 - [ ] Task 7：Diff（差异比较）— Todo（待做）
 - [ ] Stage 1 验收 — Todo（待做）
 
