@@ -6,6 +6,8 @@
 
 具体近期任务、执行状态和验收记录见 [current-sprint.md](current-sprint.md)。
 
+> **当前执行说明：** 2026-09-02 至 2026-09-06 因求职硬节点进入 Job-search Sprint（求职冲刺迭代），执行顺序以 [docs/current-sprint.md](./current-sprint.md) 为准；长期 Roadmap 仍保留，冲刺结束后继续按长期路线演进。
+
 ## 当前进度概览
 
 | 阶段 | 名称 | 状态 |
