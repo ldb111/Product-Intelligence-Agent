@@ -1,12 +1,13 @@
 """创建并持久化 Product Intelligence Agent 的 JSON 页面快照。
 
-本模块只负责 Task 3：接收已经由 page_reader 完成读取和内容标准化的页面数据，
-增加带时区的采集时间，并保存为 UTF-8 JSON 文件。它不会重新请求网页，也不负责
-Content Hash（内容哈希）、上一份快照查询或变化检测。
+本模块负责 Task 3 和 Task 4：接收已经由 page_reader 完成读取和内容标准化的页面数据，
+增加带时区的采集时间和 Content Hash（内容哈希），并保存为 UTF-8 JSON 文件。
+它不会重新请求网页，也不负责上一份快照查询、哈希比较或变化检测。
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from datetime import datetime
@@ -40,15 +41,36 @@ class SnapshotError(Exception):
         self.error_type = error_type
 
 
+def compute_content_hash(content: str) -> str:
+    """只根据标准化后的页面正文计算稳定的 SHA-256 内容哈希。
+
+    在业务链路中的职责：把较长的 content 转换为固定长度摘要，供后续任务快速判断
+    两份 Snapshot（页面快照）的标准化正文是否完全一致。本函数只计算摘要，不比较
+    两个摘要，也不会根据结果决定是否保存快照。
+
+    输入：Task 2 已经完成 Content Normalization（内容标准化）的 content 字符串。
+    处理：先用 UTF-8 把字符串编码为 bytes（字节），再用 Python 标准库 hashlib 的
+    SHA-256 算法计算摘要，最后转换为 64 位小写十六进制字符串。
+    输出：只由 content 决定的 SHA-256 十六进制 content_hash。
+
+    为什么只计算 content：url、status_code、title 和 captured_at 描述的是来源、响应或
+    采集上下文，它们变化时不一定代表正文变化。尤其 captured_at 每次采集都会不同，
+    如果参与计算，同一页面连续抓取也会产生不同哈希，失去快速比较正文的意义。
+    """
+    content_bytes = content.encode("utf-8")
+    return hashlib.sha256(content_bytes).hexdigest()
+
+
 def create_snapshot(page_data: dict[str, Any]) -> dict[str, Any]:
-    """为一次成功读取的页面数据增加采集时间，组成完整 Snapshot（页面快照）。
+    """为页面数据增加采集时间和内容哈希，组成完整 Snapshot（页面快照）。
 
     在业务链路中的职责：连接 Task 2 页面结果和 Task 3 文件保存，但不会修改传入的
     page_data，也不会重新请求 URL。
 
     输入：包含 url、status_code、title、content 的页面结果字典。
-    处理：确认四个必需字段存在，并使用当前系统时区生成 ISO 8601 格式的 captured_at。
-    输出：包含原四个字段及 captured_at 的新快照字典。
+    处理：确认四个必需字段存在，生成带时区的 captured_at，并且只根据 content 计算
+    SHA-256 content_hash。
+    输出：包含原四个字段、captured_at 和 content_hash 的新快照字典。
     """
     missing_fields = [field for field in PAGE_DATA_FIELDS if field not in page_data]
     if missing_fields:
@@ -60,6 +82,7 @@ def create_snapshot(page_data: dict[str, Any]) -> dict[str, Any]:
     # astimezone() 把当前时间变成带 UTC 偏移量的本地时间；isoformat() 生成类似
     # 2026-09-02T14:35:20.123456+08:00 的明确时间，避免日后无法判断快照所属时区。
     captured_at = datetime.now().astimezone().isoformat(timespec="microseconds")
+    content_hash = compute_content_hash(page_data["content"])
 
     return {
         "url": page_data["url"],
@@ -67,6 +90,7 @@ def create_snapshot(page_data: dict[str, Any]) -> dict[str, Any]:
         "title": page_data["title"],
         "content": page_data["content"],
         "captured_at": captured_at,
+        "content_hash": content_hash,
     }
 
 
