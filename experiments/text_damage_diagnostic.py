@@ -299,7 +299,7 @@ def diagnose_page(url: str, targets: tuple[str, ...], timeout: float) -> dict[st
     输出：包含 URL、HTTP 状态码和每个目标文本诊断结果的字典。
     """
     validated_url = validate_url(url)
-    status_code, html = fetch_html(validated_url, timeout)
+    status_code, html, _ = fetch_html(validated_url, timeout)
     stages = build_stage_representations(html)
 
     return {

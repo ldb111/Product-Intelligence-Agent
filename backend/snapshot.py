@@ -18,7 +18,16 @@ from typing import Any
 # 使用模块文件定位项目根目录，而不是依赖用户从哪个工作目录执行命令。这样正式快照
 # 始终进入项目的 data/snapshots，不会意外保存到当前终端所在的其他目录。
 DEFAULT_SNAPSHOT_DIRECTORY = Path(__file__).resolve().parent.parent / "data" / "snapshots"
-PAGE_DATA_FIELDS = ("url", "status_code", "title", "content", "blocks")
+PAGE_DATA_FIELDS = (
+    "url",
+    "requested_url",
+    "final_url",
+    "status_code",
+    "title",
+    "content",
+    "blocks",
+    "acquisition_method",
+)
 # 抽取算法升级可能在网页未变化时改变 content 格式。把稳定版本写进每份新快照，能够
 # 让 Change Detection 区分“网页变化”和“采集技术升级”，避免制造假 Diff。
 EXTRACTION_VERSION = "structured_blocks_v1"
@@ -70,7 +79,7 @@ def create_snapshot(page_data: dict[str, Any]) -> dict[str, Any]:
     在业务链路中的职责：连接 Task 2 页面结果和 Task 3 文件保存，但不会修改传入的
     page_data，也不会重新请求 URL。
 
-    输入：包含 url、status_code、title、content、blocks 的页面结果字典。
+    输入：包含 URL、状态码、标题、content、blocks 和 acquisition_method 的页面结果。
     处理：确认必需字段存在，原样保留 blocks，生成带时区的 captured_at，只根据
     content 计算 SHA-256 content_hash，并写入当前 extraction_version。
     输出：包含页面数据、captured_at、content_hash 和 extraction_version 的新快照字典。
@@ -89,11 +98,16 @@ def create_snapshot(page_data: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "url": page_data["url"],
+        "requested_url": page_data["requested_url"],
+        "final_url": page_data["final_url"],
         "status_code": page_data["status_code"],
         "title": page_data["title"],
         "content": page_data["content"],
         # blocks 保持 list/dict 结构直接进入 JSON，不转换成字符串，也不参与 content_hash。
         "blocks": page_data["blocks"],
+        # acquisition_method 只用于说明可信正文来自 requests 还是 Chromium；它和 URL、
+        # captured_at 一样不参与 content_hash，因此采集方式切换不会自行制造内容变化。
+        "acquisition_method": page_data["acquisition_method"],
         "captured_at": captured_at,
         "content_hash": content_hash,
         "extraction_version": EXTRACTION_VERSION,

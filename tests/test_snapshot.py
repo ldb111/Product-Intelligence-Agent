@@ -25,6 +25,8 @@ class SnapshotTests(unittest.TestCase):
     def setUp(self) -> None:
         self.page_data = {
             "url": "https://example.com/docs/product?id=1&language=zh",
+            "requested_url": "https://example.com/docs/product?id=1&language=zh",
+            "final_url": "https://www.example.com/docs/product?id=1&language=zh",
             "status_code": 200,
             "title": "中文产品文档",
             "content": "第一行产品内容\n\n第二行产品内容",
@@ -35,6 +37,7 @@ class SnapshotTests(unittest.TestCase):
                     "links": [],
                 }
             ],
+            "acquisition_method": "static",
         }
 
     def _snapshot_at(
@@ -80,10 +83,13 @@ class SnapshotTests(unittest.TestCase):
     def test_snapshot_hash_ignores_metadata_and_capture_time(self) -> None:
         changed_metadata = {
             "url": "https://another.example.com/other-page",
+            "requested_url": "https://another.example.com/other-page",
+            "final_url": "https://another.example.com/final-page",
             "status_code": 201,
             "title": "不同标题",
             "content": self.page_data["content"],
             "blocks": [{"type": "paragraph", "text": "不同结构", "links": []}],
+            "acquisition_method": "browser",
         }
         china_timezone = timezone(timedelta(hours=8))
 
@@ -104,6 +110,10 @@ class SnapshotTests(unittest.TestCase):
         self.assertNotEqual(first_snapshot["status_code"], second_snapshot["status_code"])
         self.assertNotEqual(first_snapshot["title"], second_snapshot["title"])
         self.assertNotEqual(first_snapshot["captured_at"], second_snapshot["captured_at"])
+        self.assertNotEqual(
+            first_snapshot["acquisition_method"],
+            second_snapshot["acquisition_method"],
+        )
         self.assertEqual(first_snapshot["content"], second_snapshot["content"])
         self.assertEqual(first_snapshot["content_hash"], second_snapshot["content_hash"])
 
@@ -122,10 +132,13 @@ class SnapshotTests(unittest.TestCase):
             set(saved_snapshot),
             {
                 "url",
+                "requested_url",
+                "final_url",
                 "status_code",
                 "title",
                 "content",
                 "blocks",
+                "acquisition_method",
                 "captured_at",
                 "content_hash",
                 "extraction_version",
@@ -145,6 +158,9 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual(saved_snapshot["blocks"], self.page_data["blocks"])
         self.assertIsInstance(saved_snapshot["blocks"], list)
         self.assertEqual(saved_snapshot["extraction_version"], EXTRACTION_VERSION)
+        self.assertEqual(saved_snapshot["requested_url"], self.page_data["requested_url"])
+        self.assertEqual(saved_snapshot["final_url"], self.page_data["final_url"])
+        self.assertEqual(saved_snapshot["acquisition_method"], "static")
 
         # 中文直接存在于 UTF-8 文件中，证明没有被 JSON 转义成难以阅读的 \uXXXX。
         self.assertIn("中文产品文档", raw_json)
@@ -212,7 +228,7 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual(history["current_snapshot"], current_snapshot)
         self.assertEqual(history["previous_snapshot"], snapshot_b)
 
-    def test_reads_legacy_snapshot_without_blocks_or_extraction_version(self) -> None:
+    def test_reads_legacy_snapshot_without_new_audit_fields(self) -> None:
         """旧文件缺少新字段时仍可作为同一 URL 的 Previous Snapshot。"""
         url = "https://example.com/legacy-product"
         legacy_snapshot = self._snapshot_at(
@@ -232,6 +248,9 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual(found_snapshot, legacy_snapshot)
         self.assertNotIn("blocks", found_snapshot)
         self.assertNotIn("extraction_version", found_snapshot)
+        self.assertNotIn("acquisition_method", found_snapshot)
+        self.assertNotIn("requested_url", found_snapshot)
+        self.assertNotIn("final_url", found_snapshot)
 
     def test_first_scan_when_directory_missing_or_only_contains_current(self) -> None:
         current_snapshot = self._snapshot_at(

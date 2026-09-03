@@ -18,8 +18,40 @@ from unittest.mock import patch
 
 import requests
 
-from backend.page_reader import PageReadError, extract_page_data, main, read_page
+from backend.browser_reader import BrowserReadError
+from backend.page_reader import (
+    PageReadError,
+    acquire_page_with_browser_fallback,
+    extract_page_data,
+    main,
+    read_page,
+)
 from backend.snapshot import EXTRACTION_VERSION
+
+
+def _browser_capture(html: str, final_url: str = "https://example.com/final") -> dict:
+    """构造可控浏览器结果，让 Fallback 测试不依赖真实 Chromium 或公网。"""
+    return {
+        "status_code": 200,
+        "final_url": final_url,
+        "title": "Browser Rendered Page",
+        "html": html.encode("utf-8"),
+    }
+
+
+def _trusted_browser_capture() -> dict:
+    """构造能够通过 Quality Gate 的浏览器正文。"""
+    return _browser_capture(
+        """
+        <html><body>
+          <h1>Rendered Product</h1>
+          <p>This rendered page contains complete product details, pricing, security,
+          integrations, team collaboration, usage guidance, and support information.</p>
+          <ul><li>Feature A</li><li>Feature B</li></ul>
+        </body></html>
+        """,
+        final_url="https://www.example.com/rendered-final",
+    )
 
 
 class _TestPageHandler(BaseHTTPRequestHandler):
@@ -131,20 +163,48 @@ class PageReaderTests(unittest.TestCase):
         self.assertIn("Product Alpha", result["content"])
         self.assertIn("Server-rendered main text.", result["content"])
         self.assertEqual(
-            set(result), {"url", "status_code", "title", "content", "blocks"}
+            set(result),
+            {
+                "url",
+                "requested_url",
+                "final_url",
+                "status_code",
+                "title",
+                "content",
+                "blocks",
+                "acquisition_method",
+            },
         )
         self.assertIsInstance(result["blocks"], list)
+        self.assertEqual(result["url"], f"{self.base_url}/ok")
+        self.assertEqual(result["requested_url"], f"{self.base_url}/ok")
+        self.assertEqual(result["final_url"], f"{self.base_url}/ok")
+        self.assertEqual(result["acquisition_method"], "static")
 
     def test_normalization_removes_noise_and_preserves_allowed_content(self) -> None:
         url = f"{self.base_url}/normalization"
         result = read_page(url)
 
-        # 原有四个字段继续保留，V0.2-1 只新增 blocks。
+        # url 保持用户请求身份；requested_url、final_url 和 acquisition_method 只增加
+        # 采集审计信息，不改变正文结构。
         self.assertEqual(result["url"], url)
+        self.assertEqual(result["requested_url"], url)
+        self.assertEqual(result["final_url"], url)
+        self.assertEqual(result["acquisition_method"], "static")
         self.assertEqual(result["status_code"], 200)
         self.assertEqual(result["title"], "Normalization Test Page")
         self.assertEqual(
-            set(result), {"url", "status_code", "title", "content", "blocks"}
+            set(result),
+            {
+                "url",
+                "requested_url",
+                "final_url",
+                "status_code",
+                "title",
+                "content",
+                "blocks",
+                "acquisition_method",
+            },
         )
 
         content = result["content"]
@@ -225,15 +285,16 @@ class PageReaderTests(unittest.TestCase):
         stdout = io.StringIO()
         # CLI 成功时现在会保存 Snapshot。测试把默认目录替换成临时目录，确保自动化
         # 测试不会在正式 data/snapshots 中留下文件。
-        with TemporaryDirectory() as temporary_directory:
-            with patch(
-                "backend.snapshot.DEFAULT_SNAPSHOT_DIRECTORY",
-                Path(temporary_directory),
-            ):
-                with redirect_stdout(stdout):
-                    exit_code = main([f"{self.base_url}/ok"])
+        with patch("backend.page_reader.read_browser_page") as mocked_browser:
+            with TemporaryDirectory() as temporary_directory:
+                with patch(
+                    "backend.snapshot.DEFAULT_SNAPSHOT_DIRECTORY",
+                    Path(temporary_directory),
+                ):
+                    with redirect_stdout(stdout):
+                        exit_code = main([f"{self.base_url}/ok"])
 
-            snapshot_files = list(Path(temporary_directory).glob("*.json"))
+                snapshot_files = list(Path(temporary_directory).glob("*.json"))
 
         self.assertEqual(exit_code, 0)
         output = json.loads(stdout.getvalue())
@@ -251,6 +312,11 @@ class PageReaderTests(unittest.TestCase):
         self.assertEqual(
             output["current_snapshot"]["extraction_version"], EXTRACTION_VERSION
         )
+        self.assertEqual(output["current_snapshot"]["acquisition_method"], "static")
+        self.assertEqual(output["current_snapshot"]["url"], f"{self.base_url}/ok")
+        self.assertEqual(
+            output["current_snapshot"]["final_url"], f"{self.base_url}/ok"
+        )
         self.assertIn("captured_at", output["current_snapshot"])
         self.assertEqual(
             output["current_content_hash"],
@@ -259,51 +325,257 @@ class PageReaderTests(unittest.TestCase):
         self.assertIsNone(output["previous_snapshot"])
         self.assertEqual(output["quality_gate"]["status"], "PASS")
         self.assertTrue(output["quality_gate"]["downstream_allowed"])
+        self.assertEqual(output["acquisition_method"], "static")
+        self.assertEqual(output["requested_url"], f"{self.base_url}/ok")
+        self.assertEqual(output["final_url"], f"{self.base_url}/ok")
+        self.assertIsNone(output["browser_quality_gate"])
+        self.assertIsNone(output["static_acquisition_error"])
+        mocked_browser.assert_not_called()
         self.assertEqual(len(snapshot_files), 1)
 
-    def test_quality_failure_does_not_create_trusted_snapshot(self) -> None:
+    def test_static_fail_calls_browser_and_browser_fail_does_not_save(self) -> None:
         stdout = io.StringIO()
+        browser_result = _browser_capture(
+            "<html><body><p>CaSee 凯见 加载中</p></body></html>"
+        )
 
-        with patch("backend.page_reader.create_snapshot") as mocked_create:
-            with patch("backend.page_reader.save_snapshot") as mocked_save:
-                with redirect_stdout(stdout):
-                    exit_code = main([f"{self.base_url}/placeholder"])
+        with patch(
+            "backend.page_reader.read_browser_page", return_value=browser_result
+        ) as mocked_browser:
+            with patch("backend.page_reader.create_snapshot") as mocked_create:
+                with patch("backend.page_reader.save_snapshot") as mocked_save:
+                    with redirect_stdout(stdout):
+                        exit_code = main([f"{self.base_url}/placeholder"])
 
         output = json.loads(stdout.getvalue())
         self.assertEqual(exit_code, 1)
         self.assertEqual(output["status_code"], 200)
+        self.assertEqual(output["acquisition_method"], "browser")
+        self.assertEqual(output["static_quality_gate"]["status"], "FAIL")
+        self.assertEqual(output["browser_quality_gate"]["status"], "FAIL")
         self.assertEqual(output["quality_gate"]["status"], "FAIL")
         self.assertFalse(output["quality_gate"]["downstream_allowed"])
         self.assertEqual(
             output["quality_gate"]["reasons"][0]["code"],
             "dynamic_placeholder",
         )
+        mocked_browser.assert_called_once_with(f"{self.base_url}/placeholder")
         mocked_create.assert_not_called()
         mocked_save.assert_not_called()
 
-    def test_quality_warning_does_not_create_trusted_snapshot(self) -> None:
+    def test_static_http_error_browser_pass_saves_trusted_snapshot(self) -> None:
         stdout = io.StringIO()
 
-        with patch("backend.page_reader.create_snapshot") as mocked_create:
-            with patch("backend.page_reader.save_snapshot") as mocked_save:
-                with redirect_stdout(stdout):
-                    exit_code = main([f"{self.base_url}/sparse"])
+        with patch(
+            "backend.page_reader.read_browser_page",
+            return_value=_trusted_browser_capture(),
+        ) as mocked_browser:
+            with TemporaryDirectory() as temporary_directory:
+                with patch(
+                    "backend.snapshot.DEFAULT_SNAPSHOT_DIRECTORY",
+                    Path(temporary_directory),
+                ):
+                    with redirect_stdout(stdout):
+                        exit_code = main([f"{self.base_url}/missing"])
+                snapshot_files = list(Path(temporary_directory).glob("*.json"))
+
+        output = json.loads(stdout.getvalue())
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(output["acquisition_method"], "browser")
+        self.assertEqual(output["static_acquisition_error"]["type"], "http_error")
+        self.assertIsNone(output["static_quality_gate"])
+        self.assertEqual(output["browser_quality_gate"]["status"], "PASS")
+        self.assertEqual(len(snapshot_files), 1)
+        mocked_browser.assert_called_once_with(f"{self.base_url}/missing")
+
+    def test_static_request_failure_and_timeout_call_browser(self) -> None:
+        for error_type in ("request_failed", "timeout"):
+            with self.subTest(error_type=error_type):
+                static_error = PageReadError(error_type, f"simulated {error_type}")
+                with patch(
+                    "backend.page_reader.read_page", side_effect=static_error
+                ):
+                    with patch(
+                        "backend.page_reader.read_browser_page",
+                        return_value=_trusted_browser_capture(),
+                    ) as mocked_browser:
+                        result = acquire_page_with_browser_fallback(
+                            "https://example.com"
+                        )
+
+                self.assertEqual(result["page_data"]["acquisition_method"], "browser")
+                self.assertEqual(result["quality_gate"]["status"], "PASS")
+                self.assertEqual(
+                    result["static_acquisition_error"]["type"], error_type
+                )
+                mocked_browser.assert_called_once_with("https://example.com")
+
+    def test_invalid_url_does_not_call_browser(self) -> None:
+        with patch("backend.page_reader.read_browser_page") as mocked_browser:
+            with self.assertRaises(PageReadError) as raised:
+                acquire_page_with_browser_fallback("ftp://example.com/file")
+
+        self.assertEqual(raised.exception.error_type, "invalid_url")
+        mocked_browser.assert_not_called()
+
+    def test_static_error_and_browser_fail_do_not_save_snapshot(self) -> None:
+        stdout = io.StringIO()
+        static_error = PageReadError("request_failed", "simulated static failure")
+        browser_result = _browser_capture(
+            "<html><body><p>CaSee 凯见 加载中</p></body></html>"
+        )
+
+        with patch("backend.page_reader.read_page", side_effect=static_error):
+            with patch(
+                "backend.page_reader.read_browser_page", return_value=browser_result
+            ):
+                with patch("backend.page_reader.create_snapshot") as mocked_create:
+                    with patch("backend.page_reader.save_snapshot") as mocked_save:
+                        with redirect_stdout(stdout):
+                            exit_code = main(["https://example.com"])
 
         output = json.loads(stdout.getvalue())
         self.assertEqual(exit_code, 1)
+        self.assertEqual(output["quality_gate"]["status"], "FAIL")
+        self.assertEqual(
+            output["static_acquisition_error"]["type"], "request_failed"
+        )
+        mocked_create.assert_not_called()
+        mocked_save.assert_not_called()
+
+    def test_static_error_and_browser_exception_do_not_save_snapshot(self) -> None:
+        stderr = io.StringIO()
+        static_error = PageReadError("timeout", "simulated static timeout")
+
+        with patch("backend.page_reader.read_page", side_effect=static_error):
+            with patch(
+                "backend.page_reader.read_browser_page",
+                side_effect=BrowserReadError(
+                    "browser_timeout", "simulated browser timeout"
+                ),
+            ):
+                with patch("backend.page_reader.create_snapshot") as mocked_create:
+                    with patch("backend.page_reader.save_snapshot") as mocked_save:
+                        with redirect_stderr(stderr):
+                            exit_code = main(["https://example.com"])
+
+        output = json.loads(stderr.getvalue())
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(output["error"]["type"], "browser_timeout")
+        self.assertEqual(output["static_acquisition_error"]["type"], "timeout")
+        mocked_create.assert_not_called()
+        mocked_save.assert_not_called()
+
+    def test_static_warning_calls_browser_and_browser_warning_does_not_save(self) -> None:
+        stdout = io.StringIO()
+        browser_result = _browser_capture(
+            "<html><body><p>Still short product description.</p></body></html>"
+        )
+
+        with patch(
+            "backend.page_reader.read_browser_page", return_value=browser_result
+        ) as mocked_browser:
+            with patch("backend.page_reader.create_snapshot") as mocked_create:
+                with patch("backend.page_reader.save_snapshot") as mocked_save:
+                    with redirect_stdout(stdout):
+                        exit_code = main([f"{self.base_url}/sparse"])
+
+        output = json.loads(stdout.getvalue())
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(output["static_quality_gate"]["status"], "WARNING")
+        self.assertEqual(output["browser_quality_gate"]["status"], "WARNING")
         self.assertEqual(output["quality_gate"]["status"], "WARNING")
         self.assertFalse(output["quality_gate"]["downstream_allowed"])
+        mocked_browser.assert_called_once_with(f"{self.base_url}/sparse")
+        mocked_create.assert_not_called()
+        mocked_save.assert_not_called()
+
+    def test_browser_pass_uses_rendered_content_and_saves_snapshot(self) -> None:
+        stdout = io.StringIO()
+        rendered_html = """
+        <html><head><title>Fallback title</title></head><body>
+          <h1>Rendered Product</h1>
+          <p>This browser-rendered product page now contains complete feature details.</p>
+          <p>It includes pricing, team collaboration, security, integrations, and usage guidance.</p>
+          <ul><li>Feature A</li><li>Feature B</li></ul>
+        </body></html>
+        """
+        browser_result = _browser_capture(
+            rendered_html, final_url="https://www.example.com/rendered-final"
+        )
+
+        with patch(
+            "backend.page_reader.read_browser_page", return_value=browser_result
+        ) as mocked_browser:
+            with TemporaryDirectory() as temporary_directory:
+                with patch(
+                    "backend.snapshot.DEFAULT_SNAPSHOT_DIRECTORY",
+                    Path(temporary_directory),
+                ):
+                    with redirect_stdout(stdout):
+                        exit_code = main([f"{self.base_url}/placeholder"])
+                snapshot_files = list(Path(temporary_directory).glob("*.json"))
+                saved_snapshot = json.loads(
+                    snapshot_files[0].read_text(encoding="utf-8")
+                )
+
+        output = json.loads(stdout.getvalue())
+        current_snapshot = output["current_snapshot"]
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(output["static_quality_gate"]["status"], "FAIL")
+        self.assertEqual(output["browser_quality_gate"]["status"], "PASS")
+        self.assertEqual(output["quality_gate"]["status"], "PASS")
+        self.assertEqual(output["acquisition_method"], "browser")
+        self.assertEqual(
+            output["final_url"], "https://www.example.com/rendered-final"
+        )
+        self.assertEqual(current_snapshot["acquisition_method"], "browser")
+        self.assertEqual(current_snapshot["url"], f"{self.base_url}/placeholder")
+        self.assertEqual(
+            current_snapshot["requested_url"], f"{self.base_url}/placeholder"
+        )
+        self.assertEqual(
+            current_snapshot["final_url"], "https://www.example.com/rendered-final"
+        )
+        self.assertIn("Rendered Product", current_snapshot["content"])
+        self.assertEqual(len(snapshot_files), 1)
+        self.assertEqual(saved_snapshot["acquisition_method"], "browser")
+        self.assertEqual(
+            saved_snapshot["final_url"], "https://www.example.com/rendered-final"
+        )
+        mocked_browser.assert_called_once_with(f"{self.base_url}/placeholder")
+
+    def test_browser_timeout_returns_clear_error_and_does_not_save(self) -> None:
+        stderr = io.StringIO()
+
+        with patch(
+            "backend.page_reader.read_browser_page",
+            side_effect=BrowserReadError(
+                "browser_timeout", "Simulated bounded browser timeout."
+            ),
+        ):
+            with patch("backend.page_reader.create_snapshot") as mocked_create:
+                with patch("backend.page_reader.save_snapshot") as mocked_save:
+                    with redirect_stderr(stderr):
+                        exit_code = main([f"{self.base_url}/placeholder"])
+
+        output = json.loads(stderr.getvalue())
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(output["error"]["type"], "browser_timeout")
+        self.assertIn("browser timeout", output["error"]["message"].lower())
         mocked_create.assert_not_called()
         mocked_save.assert_not_called()
 
     def test_cli_error_is_json_and_returns_nonzero(self) -> None:
         stderr = io.StringIO()
-        with redirect_stderr(stderr):
-            exit_code = main([f"{self.base_url}/missing"])
+        with patch("backend.page_reader.read_browser_page") as mocked_browser:
+            with redirect_stderr(stderr):
+                exit_code = main(["not-a-url"])
 
         self.assertEqual(exit_code, 1)
         output = json.loads(stderr.getvalue())
-        self.assertEqual(output["error"]["type"], "http_error")
+        self.assertEqual(output["error"]["type"], "invalid_url")
+        mocked_browser.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -3,10 +3,10 @@
 本模块负责 Stage 1 的网页读取链路：校验 URL、发起 HTTP 请求、检查响应状态、解析
 服务器返回的 HTML、删除确定性的结构噪声，再生成 Structured Blocks 和兼容纯文本。
 
-当前实现有意保持简单：BeautifulSoup 只解析 HTTP 响应中已经存在的 HTML，
-不会像浏览器一样执行 JavaScript。因此，依赖 JavaScript 才显示正文的网页可能只能
-获取到部分内容。本任务也不判断广告、Cookie 提示或动态推荐等非确定性噪声，
-这些内容仍可能出现在最终结果中。
+当前实现默认用 requests 获取服务器 HTML；当静态请求出现可恢复的网络失败，或
+Quality Gate 判断静态结果不可信时，才使用 Chromium 执行 JavaScript 并重新采集。
+两条路径最终复用同一套 Structured Blocks 解析。本任务不判断广告、Cookie 提示或
+动态推荐等非确定性噪声，这些内容仍可能出现在最终结果中。
 """
 
 from __future__ import annotations
@@ -27,6 +27,7 @@ from bs4 import BeautifulSoup
 # 兼容两种现有运行方式：测试通过 backend.page_reader 导入模块，而 README 使用
 # python backend/page_reader.py 直接运行文件。两种情况下都复用相同的历史查询和变化检测逻辑。
 if __package__:
+    from .browser_reader import BrowserReadError, read_browser_page
     from .change_detection import ChangeDetectionError, detect_change
     from .content_quality import evaluate_content_quality
     from .content_diff import ContentDiffError, build_diff_result
@@ -38,6 +39,7 @@ if __package__:
     )
     from .structured_content import extract_structured_blocks, serialize_blocks
 else:
+    from browser_reader import BrowserReadError, read_browser_page
     from change_detection import ChangeDetectionError, detect_change
     from content_quality import evaluate_content_quality
     from content_diff import ContentDiffError, build_diff_result
@@ -57,6 +59,11 @@ NOISE_TAG_NAMES = ("script", "style", "noscript", "nav", "footer")
 # User-Agent 用于向服务器说明请求来自哪个客户端。部分网站会拒绝没有该请求头的访问，
 # 使用项目自己的标识也比伪装成真实浏览器更清晰、诚实。
 USER_AGENT = "Product-Intelligence-Agent/0.1"
+STATIC_ACQUISITION_METHOD = "static"
+BROWSER_ACQUISITION_METHOD = "browser"
+# 只有静态网络采集已经实际尝试、但没有得到可用响应时才进入浏览器。输入格式和超时
+# 参数错误属于调用者输入问题，换一个采集工具也无法修复，因此不包含在这个集合中。
+RECOVERABLE_STATIC_ERROR_TYPES = {"timeout", "request_failed", "http_error"}
 
 
 class PageReadError(Exception):
@@ -115,8 +122,10 @@ def validate_url(url: str) -> str:
     return cleaned_url
 
 
-def fetch_html(url: str, timeout: float = DEFAULT_TIMEOUT_SECONDS) -> tuple[int, bytes]:
-    """请求一个已校验的网页，并返回成功响应的状态码和原始 HTML 字节。
+def fetch_html(
+    url: str, timeout: float = DEFAULT_TIMEOUT_SECONDS
+) -> tuple[int, bytes, str]:
+    """请求网页并返回状态码、原始 HTML 字节和重定向后的最终 URL。
 
     在整个链路中的职责：只处理 HTTP 通信，不负责理解页面内容。函数会发送 GET 请求，
     接收 requests.Response 响应对象，并在把 HTML 交给解析步骤前确认请求确实成功。
@@ -124,7 +133,7 @@ def fetch_html(url: str, timeout: float = DEFAULT_TIMEOUT_SECONDS) -> tuple[int,
     输入：经过 validate_url 校验的 HTTP/HTTPS URL，以及允许等待的超时秒数。
     处理：携带项目 User-Agent 发起 GET 请求；正常跟随重定向；区分超时、其他网络异常
     和非 2xx HTTP 状态。
-    输出：``(status_code, raw_html_bytes)`` 元组；失败时抛出 PageReadError。
+    输出：``(status_code, raw_html_bytes, final_url)``；失败时抛出 PageReadError。
     """
     try:
         # requests.get 的主要输入是目标 URL、请求头和 timeout，返回值 Response 包含
@@ -157,7 +166,7 @@ def fetch_html(url: str, timeout: float = DEFAULT_TIMEOUT_SECONDS) -> tuple[int,
 
     # response.content 是服务器响应正文的原始 bytes（字节），尚未被本项目转换成页面
     # 文本。保留字节交给 BeautifulSoup，有助于解析器结合 HTML 信息识别字符编码。
-    return response.status_code, response.content
+    return response.status_code, response.content, response.url
 
 
 def extract_page_data_with_blocks(
@@ -241,6 +250,38 @@ def normalize_content(soup: BeautifulSoup) -> str:
     return content
 
 
+def _build_page_result(
+    *,
+    requested_url: str,
+    final_url: str,
+    status_code: int,
+    html: bytes,
+    acquisition_method: str,
+    browser_title: str | None = None,
+) -> dict[str, Any]:
+    """把静态或浏览器 HTML 统一转换为同一种页面数据结构。
+
+    输入：请求 URL、最终 URL、状态码、HTML、采集方式，以及浏览器可选标题。
+    处理：复用现有 Structured Blocks 解析；浏览器明确返回标题时优先使用该值。
+    输出：可交给 Quality Gate，并在 PASS 后交给 create_snapshot 的页面字典。
+
+    ``url`` 暂时继续等于 requested_url，保持当前历史查询身份稳定；final_url 单独保存，
+    避免重定向信息丢失，但本任务不扩展完整 URL Identity 规则。
+    """
+    extracted_title, content, blocks = extract_page_data_with_blocks(html)
+    title = browser_title if browser_title else extracted_title
+    return {
+        "url": requested_url,
+        "requested_url": requested_url,
+        "final_url": final_url,
+        "status_code": status_code,
+        "title": title,
+        "content": content,
+        "blocks": blocks,
+        "acquisition_method": acquisition_method,
+    }
+
+
 def read_page(url: str, timeout: float = DEFAULT_TIMEOUT_SECONDS) -> dict[str, Any]:
     """串联 URL 校验、网页请求和 HTML 解析，生成一次完整的网页读取结果。
 
@@ -249,7 +290,7 @@ def read_page(url: str, timeout: float = DEFAULT_TIMEOUT_SECONDS) -> dict[str, A
 
     输入：URL 字符串和可选的超时秒数。
     处理：先检查 timeout，再校验 URL、获取 HTML、提取标题、blocks 和兼容页面文本。
-    输出：包含 ``url``、``status_code``、``title``、``content``、``blocks`` 的字典。
+    输出：页面原有字段，以及 requested_url、final_url、acquisition_method 审计字段。
     该字典仍是 Python 对象，最终由 main 中的 json.dumps 转换成 JSON 字符串。
     """
     # 非正数超时没有实际意义，也可能让 requests 产生不够直观的底层错误，因此提前拒绝。
@@ -258,15 +299,87 @@ def read_page(url: str, timeout: float = DEFAULT_TIMEOUT_SECONDS) -> dict[str, A
 
     # 三步各自只负责一种工作；在这里串联后，数据依次从 URL 变为 HTML，再变为结构化字典。
     validated_url = validate_url(url)
-    status_code, html = fetch_html(validated_url, timeout)
-    title, content, blocks = extract_page_data_with_blocks(html)
+    status_code, html, final_url = fetch_html(validated_url, timeout)
+    return _build_page_result(
+        requested_url=validated_url,
+        final_url=final_url,
+        status_code=status_code,
+        html=html,
+        acquisition_method=STATIC_ACQUISITION_METHOD,
+    )
 
+
+def acquire_page_with_browser_fallback(
+    url: str, timeout: float = DEFAULT_TIMEOUT_SECONDS
+) -> dict[str, Any]:
+    """执行“静态优先、质量不合格时浏览器兜底”的完整采集决策。
+
+    输入：用户指定 URL 和静态 HTTP 请求超时。
+    处理：先调用 read_page。静态内容 PASS 时立即返回；质量 WARNING/FAIL，或静态请求
+    出现可恢复的 timeout、request_failed、http_error 时，改用 browser_reader 获取渲染
+    DOM，复用同一 Structured Blocks 入口，再运行一次 Quality Gate。
+    输出：选中的 page_data、最终 quality_gate、静态/浏览器质量结果，以及可选的静态
+    采集错误审计信息。
+
+    本函数只选择可信采集结果，不创建或保存 Snapshot。浏览器结果仍不合格时也会返回，
+    由 main 在 create_snapshot 之前统一 Fail Closed。
+    """
+    static_quality: dict[str, Any] | None = None
+    static_acquisition_error: dict[str, str] | None = None
+
+    try:
+        static_page_data = read_page(url, timeout)
+    except PageReadError as exc:
+        if exc.error_type not in RECOVERABLE_STATIC_ERROR_TYPES:
+            # invalid_url、invalid_timeout 和 parse_error 不属于浏览器能够合理修复的网络
+            # 采集失败。直接保留原错误，也避免为明显无效输入启动昂贵的 Chromium。
+            raise
+        static_acquisition_error = {
+            "type": exc.error_type,
+            "message": str(exc),
+        }
+        # 能进入此分支说明 read_page 已成功完成 URL 校验并在后续网络步骤失败。再次调用
+        # validate_url 只为取得去除首尾空白后的稳定 requested_url，不会发起网络请求。
+        requested_url = validate_url(url)
+    else:
+        requested_url = static_page_data["requested_url"]
+        static_quality = evaluate_content_quality(
+            static_page_data["content"], static_page_data["blocks"]
+        )
+        if static_quality["downstream_allowed"]:
+            return {
+                "page_data": static_page_data,
+                "quality_gate": static_quality,
+                "static_quality_gate": static_quality,
+                "browser_quality_gate": None,
+                "static_acquisition_error": None,
+            }
+
+    try:
+        browser_capture = read_browser_page(requested_url)
+    except BrowserReadError as exc:
+        # 浏览器错误仍由 main 按原有方式输出。若此前静态请求也失败，把该事实附在异常上，
+        # 让最终错误 JSON 能同时说明两次采集都未成功，而无需引入复杂 tracing 系统。
+        exc.static_acquisition_error = static_acquisition_error
+        raise
+
+    browser_page_data = _build_page_result(
+        requested_url=requested_url,
+        final_url=browser_capture["final_url"],
+        status_code=browser_capture["status_code"],
+        html=browser_capture["html"],
+        acquisition_method=BROWSER_ACQUISITION_METHOD,
+        browser_title=browser_capture["title"],
+    )
+    browser_quality = evaluate_content_quality(
+        browser_page_data["content"], browser_page_data["blocks"]
+    )
     return {
-        "url": validated_url,
-        "status_code": status_code,
-        "title": title,
-        "content": content,
-        "blocks": blocks,
+        "page_data": browser_page_data,
+        "quality_gate": browser_quality,
+        "static_quality_gate": static_quality,
+        "browser_quality_gate": browser_quality,
+        "static_acquisition_error": static_acquisition_error,
     }
 
 
@@ -296,10 +409,10 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     """执行 Stage 1 网页监控链路，并用 JSON 与退出码报告结果。
 
-    main 是命令行入口：它读取参数、调用 read_page，并把 Python dict（字典）通过
-    Quality Gate 判断本次静态采集是否可信。只有 PASS 才调用 create_snapshot 和
-    save_snapshot；WARNING/FAIL 会直接返回诊断结果，避免污染历史。保存成功后才查询
-    Previous Snapshot、比较 content_hash，并根据 changed 决定是否生成行级 Diff。
+    main 是命令行入口：它读取参数并执行“静态优先、浏览器兜底”的采集流程。最终
+    Quality Gate 只有 PASS 才调用 create_snapshot 和 save_snapshot；WARNING/FAIL 会
+    直接返回诊断结果，避免污染历史。保存成功后才查询 Previous Snapshot、比较
+    content_hash，并根据 changed 决定是否生成行级 Diff。
 
     输入：可选的参数列表；为 None 时 argparse 使用真实命令行参数。
     处理：读取并评估网页；可信时保存、查询历史、判断变化并按需生成 Diff。
@@ -308,16 +421,22 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
     try:
-        page_data = read_page(args.url, args.timeout)
-        quality_result = evaluate_content_quality(
-            page_data["content"], page_data["blocks"]
+        acquisition_result = acquire_page_with_browser_fallback(
+            args.url, args.timeout
         )
+        page_data = acquisition_result["page_data"]
+        quality_result = acquisition_result["quality_gate"]
         if not quality_result["downstream_allowed"]:
-            # HTTP 请求和解析本身成功，但内容不足以成为可信历史。这里在 create_snapshot
-            # 之前返回，所以既不会写文件，也不会触发 Previous Snapshot / Change Detection。
+            # 浏览器已经返回并完成解析，但最终内容仍不足以成为可信历史。这里在
+            # create_snapshot 之前返回，所以不会写文件，也不会触发历史比较。
             rejected_result = {
                 **page_data,
                 "quality_gate": quality_result,
+                "static_quality_gate": acquisition_result["static_quality_gate"],
+                "browser_quality_gate": acquisition_result["browser_quality_gate"],
+                "static_acquisition_error": acquisition_result[
+                    "static_acquisition_error"
+                ],
             }
             print(json.dumps(rejected_result, ensure_ascii=False, indent=2))
             return 1
@@ -328,8 +447,19 @@ def main(argv: list[str] | None = None) -> int:
         change_result = detect_change(snapshot_history)
         result = build_diff_result(change_result)
         result["quality_gate"] = quality_result
+        result["static_quality_gate"] = acquisition_result["static_quality_gate"]
+        result["browser_quality_gate"] = acquisition_result["browser_quality_gate"]
+        result["static_acquisition_error"] = acquisition_result[
+            "static_acquisition_error"
+        ]
+        # 成功输出虽然已经保留完整 current_snapshot，但把三个采集审计字段放在顶层，
+        # 可以让命令行调用者无需理解历史结构就直接看出正文来源和重定向结果。
+        result["acquisition_method"] = page_data["acquisition_method"]
+        result["requested_url"] = page_data["requested_url"]
+        result["final_url"] = page_data["final_url"]
     except (
         PageReadError,
+        BrowserReadError,
         SnapshotError,
         ChangeDetectionError,
         ContentDiffError,
@@ -341,6 +471,9 @@ def main(argv: list[str] | None = None) -> int:
                 "url": args.url,
             }
         }
+        static_acquisition_error = getattr(exc, "static_acquisition_error", None)
+        if static_acquisition_error is not None:
+            error_result["static_acquisition_error"] = static_acquisition_error
         # ensure_ascii=False 让中文保持可读；stderr 与退出码 1 共同表明本次命令失败。
         print(json.dumps(error_result, ensure_ascii=False, indent=2), file=sys.stderr)
         return 1
