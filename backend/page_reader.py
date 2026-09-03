@@ -28,6 +28,7 @@ from bs4 import BeautifulSoup
 # python backend/page_reader.py 直接运行文件。两种情况下都复用相同的历史查询和变化检测逻辑。
 if __package__:
     from .change_detection import ChangeDetectionError, detect_change
+    from .content_quality import evaluate_content_quality
     from .content_diff import ContentDiffError, build_diff_result
     from .snapshot import (
         SnapshotError,
@@ -38,6 +39,7 @@ if __package__:
     from .structured_content import extract_structured_blocks, serialize_blocks
 else:
     from change_detection import ChangeDetectionError, detect_change
+    from content_quality import evaluate_content_quality
     from content_diff import ContentDiffError, build_diff_result
     from snapshot import (
         SnapshotError,
@@ -295,25 +297,37 @@ def main(argv: list[str] | None = None) -> int:
     """执行 Stage 1 网页监控链路，并用 JSON 与退出码报告结果。
 
     main 是命令行入口：它读取参数、调用 read_page，并把 Python dict（字典）通过
-    create_snapshot 增加采集时间和内容哈希，再由 save_snapshot 保存。保存后查询同一 URL
-    的 Previous Snapshot（上一份快照），再把 Task 5 结果交给 detect_change 比较已有
-    content_hash，再根据 changed 决定是否生成行级 Diff。最终通过 json.dumps 输出 JSON；
-    错误写入 stderr（标准错误）。
+    Quality Gate 判断本次静态采集是否可信。只有 PASS 才调用 create_snapshot 和
+    save_snapshot；WARNING/FAIL 会直接返回诊断结果，避免污染历史。保存成功后才查询
+    Previous Snapshot、比较 content_hash，并根据 changed 决定是否生成行级 Diff。
 
     输入：可选的参数列表；为 None 时 argparse 使用真实命令行参数。
-    处理：读取一次网页、保存快照、查询历史、判断变化、按需生成 Diff 并输出 JSON。
-    输出：成功返回退出码 0；失败返回退出码 1。操作系统和脚本调用者可据此快速判断
-    命令是否成功，而不必先解析输出文本。
+    处理：读取并评估网页；可信时保存、查询历史、判断变化并按需生成 Diff。
+    输出：完整可信链路返回 0；请求错误或质量门槛拒绝下游时返回 1。
     """
     args = build_parser().parse_args(argv)
 
     try:
         page_data = read_page(args.url, args.timeout)
+        quality_result = evaluate_content_quality(
+            page_data["content"], page_data["blocks"]
+        )
+        if not quality_result["downstream_allowed"]:
+            # HTTP 请求和解析本身成功，但内容不足以成为可信历史。这里在 create_snapshot
+            # 之前返回，所以既不会写文件，也不会触发 Previous Snapshot / Change Detection。
+            rejected_result = {
+                **page_data,
+                "quality_gate": quality_result,
+            }
+            print(json.dumps(rejected_result, ensure_ascii=False, indent=2))
+            return 1
+
         current_snapshot = create_snapshot(page_data)
         save_snapshot(current_snapshot)
         snapshot_history = build_snapshot_history(current_snapshot)
         change_result = detect_change(snapshot_history)
         result = build_diff_result(change_result)
+        result["quality_gate"] = quality_result
     except (
         PageReadError,
         SnapshotError,

@@ -30,7 +30,34 @@ class _TestPageHandler(BaseHTTPRequestHandler):
             html = (
                 "<!doctype html><html><head><title>Test Product Page</title></head>"
                 "<body><h1>Product Alpha</h1><p>Server-rendered main text.</p>"
+                "<ul><li>Reliable product feature</li></ul>"
+                "<table><tr><th>Plan</th><th>Price</th></tr>"
+                "<tr><td>Pro</td><td>99</td></tr></table>"
                 "</body></html>"
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(html)))
+            self.end_headers()
+            self.wfile.write(html)
+            return
+
+        if self.path == "/placeholder":
+            html = (
+                "<!doctype html><html><head><title>CaSee Test</title></head>"
+                "<body><p>CaSee 凯见 加载中</p></body></html>"
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(html)))
+            self.end_headers()
+            self.wfile.write(html)
+            return
+
+        if self.path == "/sparse":
+            html = (
+                "<!doctype html><html><head><title>Sparse Test</title></head>"
+                "<body><p>Short product description.</p></body></html>"
             ).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -230,7 +257,44 @@ class PageReaderTests(unittest.TestCase):
             output["current_snapshot"]["content_hash"],
         )
         self.assertIsNone(output["previous_snapshot"])
+        self.assertEqual(output["quality_gate"]["status"], "PASS")
+        self.assertTrue(output["quality_gate"]["downstream_allowed"])
         self.assertEqual(len(snapshot_files), 1)
+
+    def test_quality_failure_does_not_create_trusted_snapshot(self) -> None:
+        stdout = io.StringIO()
+
+        with patch("backend.page_reader.create_snapshot") as mocked_create:
+            with patch("backend.page_reader.save_snapshot") as mocked_save:
+                with redirect_stdout(stdout):
+                    exit_code = main([f"{self.base_url}/placeholder"])
+
+        output = json.loads(stdout.getvalue())
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(output["status_code"], 200)
+        self.assertEqual(output["quality_gate"]["status"], "FAIL")
+        self.assertFalse(output["quality_gate"]["downstream_allowed"])
+        self.assertEqual(
+            output["quality_gate"]["reasons"][0]["code"],
+            "dynamic_placeholder",
+        )
+        mocked_create.assert_not_called()
+        mocked_save.assert_not_called()
+
+    def test_quality_warning_does_not_create_trusted_snapshot(self) -> None:
+        stdout = io.StringIO()
+
+        with patch("backend.page_reader.create_snapshot") as mocked_create:
+            with patch("backend.page_reader.save_snapshot") as mocked_save:
+                with redirect_stdout(stdout):
+                    exit_code = main([f"{self.base_url}/sparse"])
+
+        output = json.loads(stdout.getvalue())
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(output["quality_gate"]["status"], "WARNING")
+        self.assertFalse(output["quality_gate"]["downstream_allowed"])
+        mocked_create.assert_not_called()
+        mocked_save.assert_not_called()
 
     def test_cli_error_is_json_and_returns_nonzero(self) -> None:
         stderr = io.StringIO()
