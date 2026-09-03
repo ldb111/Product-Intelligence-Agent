@@ -5,10 +5,11 @@ from __future__ import annotations
 import unittest
 
 from backend.change_detection import ChangeDetectionError, detect_change
+from backend.snapshot import EXTRACTION_VERSION
 
 
 class ChangeDetectionTests(unittest.TestCase):
-    """验证变化结论只由前后 content_hash 决定。"""
+    """验证版本相同时由 Hash 判断，版本变化时跳过比较。"""
 
     def _snapshot(
         self,
@@ -17,6 +18,7 @@ class ChangeDetectionTests(unittest.TestCase):
         captured_at: str,
         title: str = "页面标题",
         status_code: int = 200,
+        extraction_version: str = EXTRACTION_VERSION,
     ) -> dict[str, object]:
         """构造字段可控的合法快照，避免测试依赖文件或真实网页。"""
         return {
@@ -26,6 +28,7 @@ class ChangeDetectionTests(unittest.TestCase):
             "content": "标准化正文",
             "captured_at": captured_at,
             "content_hash": content_hash,
+            "extraction_version": extraction_version,
             "other_field": "不参与变化判断",
         }
 
@@ -43,6 +46,7 @@ class ChangeDetectionTests(unittest.TestCase):
 
         self.assertTrue(result["is_first_scan"])
         self.assertIsNone(result["changed"])
+        self.assertIsNone(result["comparison_skipped_reason"])
         self.assertIsNone(result["previous_content_hash"])
         self.assertEqual(result["current_content_hash"], "a" * 64)
         self.assertEqual(result["current_snapshot"], current_snapshot)
@@ -74,6 +78,7 @@ class ChangeDetectionTests(unittest.TestCase):
 
         self.assertFalse(result["is_first_scan"])
         self.assertFalse(result["changed"])
+        self.assertIsNone(result["comparison_skipped_reason"])
         self.assertEqual(result["previous_content_hash"], same_hash)
         self.assertEqual(result["current_content_hash"], same_hash)
 
@@ -94,6 +99,7 @@ class ChangeDetectionTests(unittest.TestCase):
         )
 
         self.assertTrue(result["changed"])
+        self.assertIsNone(result["comparison_skipped_reason"])
         self.assertEqual(result["previous_content_hash"], "c" * 64)
         self.assertEqual(result["current_content_hash"], "d" * 64)
 
@@ -121,3 +127,55 @@ class ChangeDetectionTests(unittest.TestCase):
                     "invalid_change_detection_input",
                 )
                 self.assertIn("content_hash", str(raised.exception))
+
+    def test_different_extraction_versions_skip_hash_comparison(self) -> None:
+        previous_snapshot = self._snapshot(
+            "a" * 64,
+            captured_at="2026-09-02T11:00:00+08:00",
+            extraction_version="legacy_v1",
+        )
+        current_snapshot = self._snapshot(
+            "b" * 64,
+            captured_at="2026-09-02T12:00:00+08:00",
+        )
+
+        result = detect_change(
+            {
+                "is_first_scan": False,
+                "current_snapshot": current_snapshot,
+                "previous_snapshot": previous_snapshot,
+            }
+        )
+
+        self.assertFalse(result["is_first_scan"])
+        self.assertIsNone(result["changed"])
+        self.assertEqual(
+            result["comparison_skipped_reason"], "extraction_version_changed"
+        )
+        self.assertEqual(result["previous_content_hash"], "a" * 64)
+        self.assertEqual(result["current_content_hash"], "b" * 64)
+
+    def test_legacy_snapshot_without_version_skips_new_version_comparison(
+        self,
+    ) -> None:
+        previous_snapshot = self._snapshot(
+            "c" * 64, captured_at="2026-09-02T11:00:00+08:00"
+        )
+        del previous_snapshot["extraction_version"]
+        current_snapshot = self._snapshot(
+            "d" * 64, captured_at="2026-09-02T12:00:00+08:00"
+        )
+
+        result = detect_change(
+            {
+                "is_first_scan": False,
+                "current_snapshot": current_snapshot,
+                "previous_snapshot": previous_snapshot,
+            }
+        )
+
+        self.assertFalse(result["is_first_scan"])
+        self.assertIsNone(result["changed"])
+        self.assertEqual(
+            result["comparison_skipped_reason"], "extraction_version_changed"
+        )

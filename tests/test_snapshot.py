@@ -10,6 +10,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from backend.snapshot import (
+    EXTRACTION_VERSION,
     build_snapshot_history,
     compute_content_hash,
     create_snapshot,
@@ -27,12 +28,19 @@ class SnapshotTests(unittest.TestCase):
             "status_code": 200,
             "title": "中文产品文档",
             "content": "第一行产品内容\n\n第二行产品内容",
+            "blocks": [
+                {
+                    "type": "paragraph",
+                    "text": "第一行产品内容",
+                    "links": [],
+                }
+            ],
         }
 
     def _snapshot_at(
         self, url: str, captured_at: str, content: str
     ) -> dict[str, object]:
-        """构造时间可控的测试快照，避免测试依赖真实时钟。"""
+        """构造时间可控的 legacy 快照，用于验证旧 JSON 兼容性。"""
         return {
             "url": url,
             "status_code": 200,
@@ -75,6 +83,7 @@ class SnapshotTests(unittest.TestCase):
             "status_code": 201,
             "title": "不同标题",
             "content": self.page_data["content"],
+            "blocks": [{"type": "paragraph", "text": "不同结构", "links": []}],
         }
         china_timezone = timezone(timedelta(hours=8))
 
@@ -116,8 +125,10 @@ class SnapshotTests(unittest.TestCase):
                 "status_code",
                 "title",
                 "content",
+                "blocks",
                 "captured_at",
                 "content_hash",
+                "extraction_version",
             },
         )
         for field in ("url", "status_code", "title", "content"):
@@ -131,6 +142,9 @@ class SnapshotTests(unittest.TestCase):
             saved_snapshot["content_hash"],
             compute_content_hash(self.page_data["content"]),
         )
+        self.assertEqual(saved_snapshot["blocks"], self.page_data["blocks"])
+        self.assertIsInstance(saved_snapshot["blocks"], list)
+        self.assertEqual(saved_snapshot["extraction_version"], EXTRACTION_VERSION)
 
         # 中文直接存在于 UTF-8 文件中，证明没有被 JSON 转义成难以阅读的 \uXXXX。
         self.assertIn("中文产品文档", raw_json)
@@ -197,6 +211,27 @@ class SnapshotTests(unittest.TestCase):
         self.assertFalse(history["is_first_scan"])
         self.assertEqual(history["current_snapshot"], current_snapshot)
         self.assertEqual(history["previous_snapshot"], snapshot_b)
+
+    def test_reads_legacy_snapshot_without_blocks_or_extraction_version(self) -> None:
+        """旧文件缺少新字段时仍可作为同一 URL 的 Previous Snapshot。"""
+        url = "https://example.com/legacy-product"
+        legacy_snapshot = self._snapshot_at(
+            url, "2026-09-02T11:00:00+08:00", "旧版抽取正文"
+        )
+        current_snapshot = self._snapshot_at(
+            url, "2026-09-02T12:00:00+08:00", "新版抽取正文"
+        )
+        current_snapshot["blocks"] = self.page_data["blocks"]
+        current_snapshot["extraction_version"] = EXTRACTION_VERSION
+
+        with TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            self._write_named_snapshot(directory, "legacy.json", legacy_snapshot)
+            found_snapshot = find_previous_snapshot(current_snapshot, directory)
+
+        self.assertEqual(found_snapshot, legacy_snapshot)
+        self.assertNotIn("blocks", found_snapshot)
+        self.assertNotIn("extraction_version", found_snapshot)
 
     def test_first_scan_when_directory_missing_or_only_contains_current(self) -> None:
         current_snapshot = self._snapshot_at(

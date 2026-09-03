@@ -19,6 +19,7 @@ from unittest.mock import patch
 import requests
 
 from backend.page_reader import PageReadError, extract_page_data, main, read_page
+from backend.snapshot import EXTRACTION_VERSION
 
 
 class _TestPageHandler(BaseHTTPRequestHandler):
@@ -103,19 +104,20 @@ class PageReaderTests(unittest.TestCase):
         self.assertIn("Product Alpha", result["content"])
         self.assertIn("Server-rendered main text.", result["content"])
         self.assertEqual(
-            set(result), {"url", "status_code", "title", "content"}
+            set(result), {"url", "status_code", "title", "content", "blocks"}
         )
+        self.assertIsInstance(result["blocks"], list)
 
     def test_normalization_removes_noise_and_preserves_allowed_content(self) -> None:
         url = f"{self.base_url}/normalization"
         result = read_page(url)
 
-        # 先确认 Task 1 的输出结构没有被 Task 2 改变。
+        # 原有四个字段继续保留，V0.2-1 只新增 blocks。
         self.assertEqual(result["url"], url)
         self.assertEqual(result["status_code"], 200)
         self.assertEqual(result["title"], "Normalization Test Page")
         self.assertEqual(
-            set(result), {"url", "status_code", "title", "content"}
+            set(result), {"url", "status_code", "title", "content", "blocks"}
         )
 
         content = result["content"]
@@ -214,6 +216,13 @@ class PageReaderTests(unittest.TestCase):
         self.assertIsNone(output["previous_content_hash"])
         self.assertEqual(
             output["current_snapshot"]["title"], "Test Product Page"
+        )
+        self.assertEqual(
+            output["current_snapshot"]["blocks"],
+            read_page(f"{self.base_url}/ok")["blocks"],
+        )
+        self.assertEqual(
+            output["current_snapshot"]["extraction_version"], EXTRACTION_VERSION
         )
         self.assertIn("captured_at", output["current_snapshot"])
         self.assertEqual(

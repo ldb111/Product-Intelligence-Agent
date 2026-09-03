@@ -1,8 +1,8 @@
 """创建并持久化 Product Intelligence Agent 的 JSON 页面快照。
 
-本模块负责 Task 3～Task 5：创建并保存带采集时间和 Content Hash（内容哈希）的页面
-快照，以及从同一 URL 的历史记录中找到当前快照之前时间最近的一份快照。它不会重新
-请求网页，也不比较内容哈希或判断页面是否变化。
+本模块负责创建并保存包含 Structured Blocks、抽取版本、采集时间和 Content Hash 的
+页面快照，以及从同一 URL 的历史记录中找到当前快照之前时间最近的一份快照。它不会
+重新请求网页，也不比较内容哈希或判断页面是否变化。
 """
 
 from __future__ import annotations
@@ -18,7 +18,10 @@ from typing import Any
 # 使用模块文件定位项目根目录，而不是依赖用户从哪个工作目录执行命令。这样正式快照
 # 始终进入项目的 data/snapshots，不会意外保存到当前终端所在的其他目录。
 DEFAULT_SNAPSHOT_DIRECTORY = Path(__file__).resolve().parent.parent / "data" / "snapshots"
-PAGE_DATA_FIELDS = ("url", "status_code", "title", "content")
+PAGE_DATA_FIELDS = ("url", "status_code", "title", "content", "blocks")
+# 抽取算法升级可能在网页未变化时改变 content 格式。把稳定版本写进每份新快照，能够
+# 让 Change Detection 区分“网页变化”和“采集技术升级”，避免制造假 Diff。
+EXTRACTION_VERSION = "structured_blocks_v1"
 
 # Windows 文件名不能包含这些特殊字符和 ASCII 控制字符。URL 中常见的冒号、斜杠、
 # 问号正好属于该范围，所以生成文件名时必须替换。
@@ -67,10 +70,10 @@ def create_snapshot(page_data: dict[str, Any]) -> dict[str, Any]:
     在业务链路中的职责：连接 Task 2 页面结果和 Task 3 文件保存，但不会修改传入的
     page_data，也不会重新请求 URL。
 
-    输入：包含 url、status_code、title、content 的页面结果字典。
-    处理：确认四个必需字段存在，生成带时区的 captured_at，并且只根据 content 计算
-    SHA-256 content_hash。
-    输出：包含原四个字段、captured_at 和 content_hash 的新快照字典。
+    输入：包含 url、status_code、title、content、blocks 的页面结果字典。
+    处理：确认必需字段存在，原样保留 blocks，生成带时区的 captured_at，只根据
+    content 计算 SHA-256 content_hash，并写入当前 extraction_version。
+    输出：包含页面数据、captured_at、content_hash 和 extraction_version 的新快照字典。
     """
     missing_fields = [field for field in PAGE_DATA_FIELDS if field not in page_data]
     if missing_fields:
@@ -89,8 +92,11 @@ def create_snapshot(page_data: dict[str, Any]) -> dict[str, Any]:
         "status_code": page_data["status_code"],
         "title": page_data["title"],
         "content": page_data["content"],
+        # blocks 保持 list/dict 结构直接进入 JSON，不转换成字符串，也不参与 content_hash。
+        "blocks": page_data["blocks"],
         "captured_at": captured_at,
         "content_hash": content_hash,
+        "extraction_version": EXTRACTION_VERSION,
     }
 
 
@@ -226,7 +232,8 @@ def find_previous_snapshot(
     输出：找到时返回完整的上一份快照字典；目录不存在、为空或没有候选记录时返回 None。
 
     重要业务规则：时间依据只来自 JSON 内部 captured_at，不使用文件名；严格使用小于
-    而不是小于等于，确保当前快照自己和相同采集时间的记录不会被错误选中。
+    而不是小于等于，确保当前快照自己和相同采集时间的记录不会被错误选中。旧快照没有
+    blocks 或 extraction_version 仍然是合法历史记录，本函数不会要求或补写这些字段。
     """
     try:
         current_url = current_snapshot["url"]

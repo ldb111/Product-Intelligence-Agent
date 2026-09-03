@@ -11,6 +11,9 @@ import difflib
 from typing import Any
 
 
+EXTRACTION_VERSION_CHANGED_REASON = "extraction_version_changed"
+
+
 class ContentDiffError(Exception):
     """表示生成 Diff 所需的 Change Detection 输入不完整或不合法。
 
@@ -82,7 +85,7 @@ def build_diff_result(change_result: dict[str, Any]) -> dict[str, Any]:
     明确给出 changed=true 时，才读取前后 content 并调用 build_content_diff。
 
     输入：包含 is_first_scan、changed、current_snapshot、previous_snapshot 的 Task 6 结果。
-    处理：首次采集或无变化直接设置 diff=None；有变化时生成行级 Unified Diff。
+    处理：首次采集、抽取版本切换或无变化时设置 diff=None；有变化时生成行级 Diff。
     输出：保留 Task 6 所有字段并新增 diff 的字典；None 序列化为 JSON 后对应 null。
 
     业务规则：本函数信任 Task 6 的 changed 结论，不通过 content 或 Hash 再判断一次。
@@ -115,6 +118,19 @@ def build_diff_result(change_result: dict[str, Any]) -> dict[str, Any]:
                 "invalid_diff_input", "changed must be null for a first scan."
             )
         # 首次采集没有 Previous Snapshot，无法形成前后两份文本，因此不调用 Diff 算法。
+        result["diff"] = None
+        return result
+
+    if changed is None:
+        skipped_reason = change_result.get("comparison_skipped_reason")
+        if skipped_reason != EXTRACTION_VERSION_CHANGED_REASON:
+            raise ContentDiffError(
+                "invalid_diff_input",
+                "changed can be null for a non-first scan only when comparison "
+                "was skipped because extraction_version changed.",
+            )
+        # 当前快照是新抽取算法的技术基线，前后 content 不具备可比性，因此不能生成
+        # 看似真实的文本 Diff。原始前后快照仍保留在结果中供审计。
         result["diff"] = None
         return result
 

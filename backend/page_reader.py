@@ -1,7 +1,7 @@
 """读取指定网页，并提取后续数据采集流程需要的基础原始数据。
 
-本模块负责 Task 1 和 Task 2 的基础链路：校验 URL、发起 HTTP 请求、检查响应状态、
-解析服务器返回的 HTML、删除确定性的结构噪声、标准化基础空白，最后通过命令行输出 JSON。
+本模块负责 Stage 1 的网页读取链路：校验 URL、发起 HTTP 请求、检查响应状态、解析
+服务器返回的 HTML、删除确定性的结构噪声，再生成 Structured Blocks 和兼容纯文本。
 
 当前实现有意保持简单：BeautifulSoup 只解析 HTTP 响应中已经存在的 HTML，
 不会像浏览器一样执行 JavaScript。因此，依赖 JavaScript 才显示正文的网页可能只能
@@ -35,6 +35,7 @@ if __package__:
         create_snapshot,
         save_snapshot,
     )
+    from .structured_content import extract_structured_blocks, serialize_blocks
 else:
     from change_detection import ChangeDetectionError, detect_change
     from content_diff import ContentDiffError, build_diff_result
@@ -44,6 +45,7 @@ else:
         create_snapshot,
         save_snapshot,
     )
+    from structured_content import extract_structured_blocks, serialize_blocks
 
 
 DEFAULT_TIMEOUT_SECONDS = 10.0
@@ -156,74 +158,85 @@ def fetch_html(url: str, timeout: float = DEFAULT_TIMEOUT_SECONDS) -> tuple[int,
     return response.status_code, response.content
 
 
+def extract_page_data_with_blocks(
+    html: bytes,
+) -> tuple[str, str, list[dict[str, Any]]]:
+    """从 HTML 一次提取标题、Structured Blocks 和兼容 content。
+
+    在整个链路中的职责：这是 Stage 1 V0.2-1 的结构化解析入口。它先建立页面树并读取
+    title，再删除确定性噪声，从剩余 DOM 直接提取五类 Block，最后由 Block 稳定生成
+    content。这样表格、列表和代码结构不会在第一步就退化成无法恢复的一段纯文本。
+
+    输入：服务器返回的原始 HTML bytes（字节）。
+    处理：BeautifulSoup 解析、title 提取、噪声删除、Block 提取和 content 序列化。
+    输出：``(title, content, blocks)``；解析失败时抛出 PageReadError。
+
+    业务边界：这里只读取服务器 HTML，不执行 JavaScript；第一版只支持 heading、
+    paragraph、list、table、code，不进行主内容识别或网站专用解析。
+    """
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        title = soup.title.get_text(" ", strip=True) if soup.title else ""
+        blocks, content = build_structured_content(soup)
+    except Exception as exc:
+        raise PageReadError("parse_error", f"Failed to parse returned HTML: {exc}") from exc
+
+    return title, content, blocks
+
+
 def extract_page_data(html: bytes) -> tuple[str, str]:
     """从服务器返回的 HTML 中提取标题和标准化后的页面文本。
 
     在整个链路中的职责：把 fetch_html 返回的原始字节转换成后续阶段可使用的字符串。
 
     输入：服务器响应正文的原始 HTML bytes（字节）。
-    处理：BeautifulSoup 使用 Python 内置的 html.parser 构建 HTML 节点树，读取
-    ``<title>`` 标签，再调用 normalize_content 删除确定性噪声并整理页面文本。
+    处理：复用 extract_page_data_with_blocks 完成结构化解析，再只返回旧接口需要的部分。
     输出：``(title, content)`` 字符串元组；页面没有 title 标签时标题为空字符串。
 
     业务边界：BeautifulSoup 是 HTML 解析器，不是浏览器，不会执行 JavaScript。因此，
     JavaScript 运行后才出现的正文不在本函数的输入里，也就无法被提取。当前标准化只
     删除明确指定的标签，不进行通用主内容提取或网站专用判断。
     """
-    try:
-        # 解析后可以按标签访问页面结构，不需要用容易出错的字符串截取来读取 HTML。
-        soup = BeautifulSoup(html, "html.parser")
-        # title 从 HTML 的 <title> 标签取得；get_text 会合并标签内部文本并清理首尾空白。
-        title = soup.title.get_text(" ", strip=True) if soup.title else ""
-        content = normalize_content(soup)
-    except Exception as exc:
-        # 将罕见的解析异常转换成统一业务异常，避免调用者把“解析失败”误解为正常空页面。
-        raise PageReadError("parse_error", f"Failed to parse returned HTML: {exc}") from exc
-
+    title, content, _ = extract_page_data_with_blocks(html)
     return title, content
 
 
-def normalize_content(soup: BeautifulSoup) -> str:
-    """删除确定性的 HTML 结构噪声，并生成空白格式稳定的纯文本。
+def build_structured_content(
+    soup: BeautifulSoup,
+) -> tuple[list[dict[str, Any]], str]:
+    """删除确定性噪声，并从剩余 DOM 构造 blocks 和 content。
 
-    在整个链路中的职责：位于“HTML 结构解析”和“纯文本输出”之间，减少导航栏、页脚、
-    脚本等确定性噪声，使后续 Snapshot（页面快照）保存和 Change Detection（变化检测）
-    面对的文本更加稳定。
+    在整个链路中的职责：把噪声清理与 Structured Blocks 提取按固定顺序连接起来，确保
+    所有调用方都不会先丢失 HTML 结构再尝试恢复表格、列表或代码。
 
     输入：由 BeautifulSoup 解析完成、仍然保留 HTML 标签结构的页面树。
-    处理：先删除 script、style、noscript、nav、footer 标签及其内部内容；再把剩余 HTML
-    转换成文本，清理每行首尾空白、压缩行内重复空白，并把连续空行压缩为一个空行。
-    输出：保留合理换行结构的标准化页面文本字符串。
+    处理：删除 script、style、noscript、nav、footer，再提取五类 Block 并序列化。
+    输出：``(blocks, content)``；blocks 保留结构，content 兼容现有字符串链路。
 
     业务边界：这里只删除能够确定为结构噪声的标签。main、header、aside、a 和 button
-    即使有时包含菜单或操作文字，也可能承载有效产品信息，所以当前必须保留。广告、
-    Cookie 提示、动态日期和随机推荐等内容需要更复杂的判断，本任务不处理。
+    仍然保留。广告、Cookie 提示、动态日期和随机推荐等需要更复杂判断，本任务不处理。
     """
     # decompose 会把标签和它包含的全部内容一起从页面树中移除。必须在 get_text 之前做，
     # 否则脚本代码、导航文字等已经混入纯文本，之后很难可靠判断它们原本来自哪个标签。
     for noise_tag in soup.find_all(NOISE_TAG_NAMES):
         noise_tag.decompose()
 
-    raw_text = soup.get_text("\n")
-    normalized_lines: list[str] = []
-    blank_line_pending = False
+    blocks = extract_structured_blocks(soup)
+    return blocks, serialize_blocks(blocks)
 
-    for line in raw_text.splitlines():
-        # split 后再 join 会把空格、制表符等连续空白统一成一个普通空格，同时清理行首行尾。
-        normalized_line = " ".join(line.split())
-        if not normalized_line:
-            # 不立即追加空行，而是先记录。只有后面仍有正文时才补一个空行，这样既能
-            # 合并多个空行，也不会在结果开头或末尾留下无意义空行。
-            if normalized_lines:
-                blank_line_pending = True
-            continue
 
-        if blank_line_pending:
-            normalized_lines.append("")
-            blank_line_pending = False
-        normalized_lines.append(normalized_line)
+def normalize_content(soup: BeautifulSoup) -> str:
+    """保留旧调用接口，但最终 content 现在由 Structured Blocks 生成。
 
-    return "\n".join(normalized_lines)
+    输入：BeautifulSoup 页面树。
+    处理：复用 build_structured_content 完成噪声删除、结构提取和稳定序列化。
+    输出：供 Snapshot、Content Hash、Change Detection 和 Diff 继续使用的 content 字符串。
+
+    该函数不再直接调用 soup.get_text("\\n")。blocks 由 read_page 单独返回；旧调用方只
+    需要 content 时仍可继续使用本函数，因此现有函数名称和参数保持不变。
+    """
+    _, content = build_structured_content(soup)
+    return content
 
 
 def read_page(url: str, timeout: float = DEFAULT_TIMEOUT_SECONDS) -> dict[str, Any]:
@@ -233,8 +246,8 @@ def read_page(url: str, timeout: float = DEFAULT_TIMEOUT_SECONDS) -> dict[str, A
     不会漏掉 URL 校验或状态码检查，也让命令行和未来的其他调用方复用相同行为。
 
     输入：URL 字符串和可选的超时秒数。
-    处理：先检查 timeout，再校验 URL、获取 HTML、提取标题和页面文本。
-    输出：包含 ``url``、``status_code``、``title``、``content`` 的 Python dict（字典）。
+    处理：先检查 timeout，再校验 URL、获取 HTML、提取标题、blocks 和兼容页面文本。
+    输出：包含 ``url``、``status_code``、``title``、``content``、``blocks`` 的字典。
     该字典仍是 Python 对象，最终由 main 中的 json.dumps 转换成 JSON 字符串。
     """
     # 非正数超时没有实际意义，也可能让 requests 产生不够直观的底层错误，因此提前拒绝。
@@ -244,13 +257,14 @@ def read_page(url: str, timeout: float = DEFAULT_TIMEOUT_SECONDS) -> dict[str, A
     # 三步各自只负责一种工作；在这里串联后，数据依次从 URL 变为 HTML，再变为结构化字典。
     validated_url = validate_url(url)
     status_code, html = fetch_html(validated_url, timeout)
-    title, content = extract_page_data(html)
+    title, content, blocks = extract_page_data_with_blocks(html)
 
     return {
         "url": validated_url,
         "status_code": status_code,
         "title": title,
         "content": content,
+        "blocks": blocks,
     }
 
 

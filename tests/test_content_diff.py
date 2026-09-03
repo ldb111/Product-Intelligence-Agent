@@ -19,6 +19,7 @@ class ContentDiffTests(unittest.TestCase):
         changed: bool | None,
         previous_content: str | None,
         current_content: str,
+        comparison_skipped_reason: str | None = None,
     ) -> dict[str, object]:
         """构造字段可控的 Task 6 结果，避免依赖文件或真实网页。"""
         previous_snapshot = (
@@ -27,6 +28,7 @@ class ContentDiffTests(unittest.TestCase):
         return {
             "is_first_scan": is_first_scan,
             "changed": changed,
+            "comparison_skipped_reason": comparison_skipped_reason,
             "previous_content_hash": None if is_first_scan else "a" * 64,
             "current_content_hash": "b" * 64,
             "previous_snapshot": previous_snapshot,
@@ -59,6 +61,26 @@ class ContentDiffTests(unittest.TestCase):
         with patch("backend.content_diff.build_content_diff") as mocked_diff:
             result = build_diff_result(change_result)
 
+        self.assertIsNone(result["diff"])
+        mocked_diff.assert_not_called()
+
+    def test_extraction_version_change_does_not_generate_false_diff(self) -> None:
+        change_result = self._change_result(
+            is_first_scan=False,
+            changed=None,
+            previous_content="旧抽取算法文本",
+            current_content="新抽取算法文本",
+            comparison_skipped_reason="extraction_version_changed",
+        )
+
+        with patch("backend.content_diff.build_content_diff") as mocked_diff:
+            result = build_diff_result(change_result)
+
+        self.assertFalse(result["is_first_scan"])
+        self.assertIsNone(result["changed"])
+        self.assertEqual(
+            result["comparison_skipped_reason"], "extraction_version_changed"
+        )
         self.assertIsNone(result["diff"])
         mocked_diff.assert_not_called()
 
