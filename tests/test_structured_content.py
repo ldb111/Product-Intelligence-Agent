@@ -152,6 +152,92 @@ class StructuredContentTests(unittest.TestCase):
         self.assertIn("Start Trial", content)
         self.assertTrue(all(block["type"] == "paragraph" for block in blocks))
 
+    def test_complete_repeated_sibling_sequence_keeps_first_copy(self) -> None:
+        content, blocks = self._extract(
+            """
+            <section>
+              <article><p>A</p></article>
+              <article><p>B</p></article>
+              <article><p>C</p></article>
+              <article><p>A</p></article>
+              <article><p>B</p></article>
+              <article><p>C</p></article>
+            </section>
+            """
+        )
+
+        self.assertEqual([block["text"] for block in blocks], ["A", "B", "C"])
+        self.assertEqual(content.count("A"), 1)
+        self.assertEqual(content.count("B"), 1)
+        self.assertEqual(content.count("C"), 1)
+
+    def test_long_complete_repeated_card_sequence_keeps_five_cards(self) -> None:
+        cards = "".join(
+            f'<article data-card="{index}"><p>Card {index}</p></article>'
+            for index in range(1, 6)
+        )
+        _, blocks = self._extract(f"<section>{cards}{cards}</section>")
+
+        self.assertEqual(
+            [block["text"] for block in blocks],
+            ["Card 1", "Card 2", "Card 3", "Card 4", "Card 5"],
+        )
+
+    def test_same_text_in_different_parents_is_not_globally_deduplicated(self) -> None:
+        _, blocks = self._extract(
+            """
+            <meta charset="utf-8">
+            <section><p>申请试用</p></section>
+            <aside><p>申请试用</p></aside>
+            """
+        )
+
+        self.assertEqual([block["text"] for block in blocks], ["申请试用", "申请试用"])
+
+    def test_two_legal_identical_paragraphs_are_preserved(self) -> None:
+        _, blocks = self._extract(
+            "<section><p>合法重复正文</p><p>合法重复正文</p></section>"
+        )
+
+        self.assertEqual(len(blocks), 2)
+        self.assertEqual([block["text"] for block in blocks], ["合法重复正文"] * 2)
+
+    def test_incomplete_repeated_sequence_is_preserved(self) -> None:
+        _, blocks = self._extract(
+            """
+            <section>
+              <article><p>A</p></article><article><p>B</p></article>
+              <article><p>C</p></article><article><p>A</p></article>
+              <article><p>B</p></article>
+            </section>
+            """
+        )
+
+        self.assertEqual(
+            [block["text"] for block in blocks], ["A", "B", "C", "A", "B"]
+        )
+
+    def test_partially_similar_sequences_are_preserved(self) -> None:
+        _, blocks = self._extract(
+            """
+            <section>
+              <article><p>A</p></article><article><p>B</p></article>
+              <article><p>C</p></article><article><p>A</p></article>
+              <article><p>B</p></article><article><p>Changed C</p></article>
+            </section>
+            """
+        )
+
+        self.assertEqual(len(blocks), 6)
+        self.assertEqual(blocks[-1]["text"], "Changed C")
+
+    def test_repeated_single_element_pattern_is_not_treated_as_sequence(self) -> None:
+        _, blocks = self._extract(
+            "<section>" + "<p>Same button</p>" * 6 + "</section>"
+        )
+
+        self.assertEqual(len(blocks), 6)
+
 
 if __name__ == "__main__":
     unittest.main()

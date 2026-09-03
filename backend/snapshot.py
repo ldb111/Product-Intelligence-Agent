@@ -30,7 +30,7 @@ PAGE_DATA_FIELDS = (
 )
 # 抽取算法升级可能在网页未变化时改变 content 格式。把稳定版本写进每份新快照，能够
 # 让 Change Detection 区分“网页变化”和“采集技术升级”，避免制造假 Diff。
-EXTRACTION_VERSION = "structured_blocks_v1"
+EXTRACTION_VERSION = "structured_blocks_v2_dom_sequence_dedup"
 
 # Windows 文件名不能包含这些特殊字符和 ASCII 控制字符。URL 中常见的冒号、斜杠、
 # 问号正好属于该范围，所以生成文件名时必须替换。

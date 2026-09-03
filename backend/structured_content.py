@@ -1,8 +1,8 @@
 """把清理噪声后的 HTML 页面树转换为 Structured Blocks（结构化内容块）。
 
-本模块只负责 Stage 1 V0.2-1 的结构提取和稳定文本序列化，不请求网页、不删除噪声标签，
-也不处理 Snapshot、Change Detection 或 Diff。调用方应先删除已经确定的结构噪声，再把
-BeautifulSoup 页面树传入 extract_structured_blocks。
+本模块负责结构提取、完整重复 DOM 序列去重和稳定文本序列化，不请求网页、不删除噪声
+标签，也不处理 Snapshot、Change Detection 或 Diff。调用方应先删除已经确定的结构
+噪声，再把 BeautifulSoup 页面树传入 extract_structured_blocks。
 
 第一版只产生 heading、paragraph、list、table、code 五类 Block。BeautifulSoup 只处理
 服务器返回的 HTML，不执行 JavaScript，因此浏览器运行脚本后才出现的结构不在输入范围内。
@@ -75,10 +75,140 @@ TEXT_BOUNDARY_TAG_NAMES = {
     "blockquote",
 }
 
+# 只有同一父节点至少出现“3 个元素 × 完整两套”时才考虑去重；同时要求一套序列内部
+# 至少包含两种不同子树，避免 6 个合法相同按钮被误认为 A B C / A B C 轮播副本。
+MIN_REPEATED_SEQUENCE_LENGTH = 3
+MIN_DISTINCT_SUBTREES_IN_SEQUENCE = 2
+
 
 def _normalize_inline_whitespace(text: str) -> str:
     """整理一个逻辑文本块内部的空白，同时保持行内节点连续。"""
     return " ".join(text.split())
+
+
+def _normalize_attribute_value(value: Any) -> str | tuple[str, ...]:
+    """把 BeautifulSoup 属性值转换成可稳定比较、可哈希的简单类型。"""
+    if isinstance(value, (list, tuple)):
+        return tuple(str(item) for item in value)
+    return "" if value is None else str(value)
+
+
+def _build_subtree_fingerprint(tag: Tag) -> tuple[Any, ...]:
+    """为一个元素生成同时包含 DOM 结构和规范文本的子树指纹。
+
+    输入：父容器中的一个直接元素子节点。
+    处理：递归记录标签名、全部 HTML 属性、规范化文本和子节点顺序；注释及纯排版空白
+    不参与比较。属性也参与指纹，避免文字相同但链接地址、图片来源或语义属性不同的
+    卡片被误认为同一副本。
+    输出：可直接进行相等比较和集合去重的嵌套 tuple（元组）。
+    """
+    attributes = tuple(
+        sorted(
+            (
+                str(attribute_name),
+                _normalize_attribute_value(attribute_value),
+            )
+            for attribute_name, attribute_value in tag.attrs.items()
+        )
+    )
+    children: list[tuple[Any, ...]] = []
+
+    for child in tag.children:
+        if isinstance(child, (Comment, Doctype)):
+            continue
+        if isinstance(child, NavigableString):
+            normalized_text = _normalize_inline_whitespace(str(child))
+            if normalized_text:
+                children.append(("text", normalized_text))
+            continue
+        if isinstance(child, Tag):
+            children.append(_build_subtree_fingerprint(child))
+
+    return ("tag", tag.name, attributes, tuple(children))
+
+
+def _deduplicate_one_parent(parent: BeautifulSoup | Tag) -> int:
+    """删除一个父容器中完全重复的后半段元素序列，并返回删除数量。
+
+    该函数只接受“全部直接元素子节点恰好由两个相同半段组成”的强证据。父节点中如果
+    混有有意义的直接文本、元素数量为奇数、序列太短、两半任一指纹不同，都会保持原样。
+    """
+    direct_children: list[Tag] = []
+    for child in parent.children:
+        if isinstance(child, (Comment, Doctype)):
+            continue
+        if isinstance(child, NavigableString):
+            if str(child).strip():
+                return 0
+            continue
+        if isinstance(child, Tag):
+            direct_children.append(child)
+
+    child_count = len(direct_children)
+    if (
+        child_count < MIN_REPEATED_SEQUENCE_LENGTH * 2
+        or child_count % 2 != 0
+    ):
+        return 0
+
+    midpoint = child_count // 2
+    first_sequence = [
+        _build_subtree_fingerprint(child)
+        for child in direct_children[:midpoint]
+    ]
+    second_sequence = [
+        _build_subtree_fingerprint(child)
+        for child in direct_children[midpoint:]
+    ]
+
+    if first_sequence != second_sequence:
+        return 0
+    if len(set(first_sequence)) < MIN_DISTINCT_SUBTREES_IN_SEQUENCE:
+        return 0
+
+    # 只删除能够由完整前半段逐项证明的后半副本；第一套原始 DOM 保持不变。
+    for duplicated_child in direct_children[midpoint:]:
+        duplicated_child.decompose()
+    return midpoint
+
+
+def deduplicate_repeated_sibling_sequences(
+    soup: BeautifulSoup | Tag,
+) -> dict[str, int]:
+    """保守删除同一父容器中的完整重复 DOM 序列。
+
+    在业务链路中的职责：在 Structured Blocks 生成前移除轮播组件为视觉循环复制的整套
+    DOM，避免同一批真实内容两次进入 Canonical Content、Diff 和 Stage 2 输入。
+
+    输入：已完成确定性噪声删除、仍保留 DOM 结构的 BeautifulSoup 页面树或 Tag。
+    处理：先递归处理子容器，再检查每个父容器的直接元素子节点是否严格等于“两套完整
+    相同序列”；比较只发生在同一 parent 内，不跨页面区域查找相同文本。
+    输出：包含去重父容器数、重复序列数和删除子树数的诊断计数；页面树会原地更新。
+
+    已知边界：第一版只识别整个父容器恰好由两套序列组成的情况。三套副本、带前后装饰
+    节点、属性不一致的视觉副本会保守保留，宁可漏删也不猜测。
+    """
+    metrics = {
+        "deduplicated_parent_count": 0,
+        "deduplicated_sequence_count": 0,
+        "removed_subtree_count": 0,
+    }
+
+    def visit(parent: BeautifulSoup | Tag) -> None:
+        # 先检查父节点，保证“两个半段完全一致”的结论来自未经子级去重改写的原始子树；
+        # 随后只递归仍保留的第一套节点，不会操作已经 decompose 的后半副本。
+        removed_count = _deduplicate_one_parent(parent)
+        if removed_count:
+            metrics["deduplicated_parent_count"] += 1
+            metrics["deduplicated_sequence_count"] += 1
+            metrics["removed_subtree_count"] += removed_count
+
+        for child in list(parent.children):
+            if isinstance(child, Tag):
+                visit(child)
+
+    visit(soup)
+    return metrics
 
 
 def _collect_text_parts(
@@ -315,10 +445,11 @@ def extract_structured_blocks(soup: BeautifulSoup) -> list[StructuredBlock]:
     """从已删除噪声的 BeautifulSoup 页面树提取五类 Structured Blocks。
 
     输入：仍保留 HTML 结构、但已由调用方删除确定性噪声标签的页面树。
-    处理：按 DOM 顺序识别标题、段落、列表、表格和代码，并为无块标签包裹的可见文字
-    生成 paragraph；行内标签只贡献连续文字和链接信息。
+    处理：先保守删除同一父容器中的完整重复 DOM 序列，再按 DOM 顺序识别标题、段落、
+    列表、表格和代码；行内标签只贡献连续文字和链接信息。
     输出：顺序稳定、可直接 JSON 序列化的 Block 字典列表。
     """
+    deduplicate_repeated_sibling_sequences(soup)
     return _walk_container(soup)
 
 
