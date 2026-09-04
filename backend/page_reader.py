@@ -3,10 +3,10 @@
 本模块负责 Stage 1 的网页读取链路：校验 URL、发起 HTTP 请求、检查响应状态、解析
 服务器返回的 HTML、删除确定性的结构噪声，再生成 Structured Blocks 和兼容纯文本。
 
-当前实现默认用 requests 获取服务器 HTML；当静态请求出现可恢复的网络失败，或
-Quality Gate 判断静态结果不可信时，才使用 Chromium 执行 JavaScript 并重新采集。
-两条路径最终复用同一套 Structured Blocks 解析。本任务不判断广告、Cookie 提示或
-动态推荐等非确定性噪声，这些内容仍可能出现在最终结果中。
+当前实现默认用 requests 获取服务器 HTML；当静态请求出现可恢复的网络失败、Quality
+Gate 判断结果不可信，或静态 DOM 有明确 Tab 交互信号时，使用 Chromium 重新采集默认
+可见状态。两条路径最终复用同一套 Structured Blocks 解析。本任务不判断广告、Cookie
+提示或动态推荐等非确定性噪声，这些内容仍可能出现在最终结果中。
 """
 
 from __future__ import annotations
@@ -64,6 +64,9 @@ BROWSER_ACQUISITION_METHOD = "browser"
 # 只有静态网络采集已经实际尝试、但没有得到可用响应时才进入浏览器。输入格式和超时
 # 参数错误属于调用者输入问题，换一个采集工具也无法修复，因此不包含在这个集合中。
 RECOVERABLE_STATIC_ERROR_TYPES = {"timeout", "request_failed", "http_error"}
+INTERACTION_SIGNAL_ROLE_TABLIST = "role_tablist"
+INTERACTION_SIGNAL_ROLE_TAB = "role_tab"
+INTERACTION_SIGNAL_ARIA_SELECTED = "aria_selected"
 
 
 class PageReadError(Exception):
@@ -122,6 +125,40 @@ def validate_url(url: str) -> str:
     return cleaned_url
 
 
+def detect_static_interaction_signals(html: bytes) -> list[str]:
+    """从静态 HTML 中识别需要浏览器补充采集的通用 Tab 交互信号。
+
+    输入：requests 返回的原始 HTML bytes。
+    处理：只检查标准 ARIA 语义 role=tablist、role=tab 和 aria-selected 属性；不读取
+    域名、class、产品名称，也不推测普通按钮是否属于 Tab。
+    输出：去重且顺序稳定的信号代码列表；空列表表示没有明确补充采集依据。
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    found_signals: set[str] = set()
+
+    for tag in soup.find_all(True):
+        role_value = tag.get("role", "")
+        if isinstance(role_value, list):
+            role_tokens = {str(role).casefold() for role in role_value}
+        else:
+            role_tokens = {
+                token.casefold() for token in str(role_value).split() if token
+            }
+        if "tablist" in role_tokens:
+            found_signals.add(INTERACTION_SIGNAL_ROLE_TABLIST)
+        if "tab" in role_tokens:
+            found_signals.add(INTERACTION_SIGNAL_ROLE_TAB)
+        if tag.has_attr("aria-selected"):
+            found_signals.add(INTERACTION_SIGNAL_ARIA_SELECTED)
+
+    signal_order = (
+        INTERACTION_SIGNAL_ROLE_TABLIST,
+        INTERACTION_SIGNAL_ROLE_TAB,
+        INTERACTION_SIGNAL_ARIA_SELECTED,
+    )
+    return [signal for signal in signal_order if signal in found_signals]
+
+
 def fetch_html(
     url: str, timeout: float = DEFAULT_TIMEOUT_SECONDS
 ) -> tuple[int, bytes, str]:
@@ -175,15 +212,15 @@ def extract_page_data_with_blocks(
     """从 HTML 一次提取标题、Structured Blocks 和兼容 content。
 
     在整个链路中的职责：这是 Stage 1 V0.2-1 的结构化解析入口。它先建立页面树并读取
-    title，再删除确定性噪声，从剩余 DOM 直接提取五类 Block，最后由 Block 稳定生成
-    content。这样表格、列表和代码结构不会在第一步就退化成无法恢复的一段纯文本。
+    title，再删除确定性噪声，从剩余 DOM 提取基础 Block 和可确认的 group/card，最后
+    稳定生成 content。这样表格、列表、代码和重复卡片归属不会先退化成一段纯文本。
 
     输入：服务器返回的原始 HTML bytes（字节）。
     处理：BeautifulSoup 解析、title 提取、噪声删除、Block 提取和 content 序列化。
     输出：``(title, content, blocks)``；解析失败时抛出 PageReadError。
 
-    业务边界：这里只读取服务器 HTML，不执行 JavaScript；第一版只支持 heading、
-    paragraph、list、table、code，不进行主内容识别或网站专用解析。
+    业务边界：静态路径只读取服务器 HTML，不执行 JavaScript；结构类型包括 heading、
+    paragraph、list、table、code、group/card，不进行主内容识别或网站专用解析。
     """
     try:
         soup = BeautifulSoup(html, "html.parser")
@@ -221,7 +258,7 @@ def build_structured_content(
     所有调用方都不会先丢失 HTML 结构再尝试恢复表格、列表或代码。
 
     输入：由 BeautifulSoup 解析完成、仍然保留 HTML 标签结构的页面树。
-    处理：删除 script、style、noscript、nav、footer，再提取五类 Block 并序列化。
+    处理：删除 script、style、noscript、nav、footer，再提取基础 Block、group/card 并序列化。
     输出：``(blocks, content)``；blocks 保留结构，content 兼容现有字符串链路。
 
     业务边界：这里只删除能够确定为结构噪声的标签。main、header、aside、a 和 button
@@ -282,14 +319,20 @@ def _build_page_result(
     }
 
 
-def read_page(url: str, timeout: float = DEFAULT_TIMEOUT_SECONDS) -> dict[str, Any]:
+def read_page(
+    url: str,
+    timeout: float = DEFAULT_TIMEOUT_SECONDS,
+    *,
+    include_interaction_signals: bool = False,
+) -> dict[str, Any]:
     """串联 URL 校验、网页请求和 HTML 解析，生成一次完整的网页读取结果。
 
     在整个链路中的职责：作为 Task 1 的业务入口，按固定顺序组织三个步骤，确保调用者
     不会漏掉 URL 校验或状态码检查，也让命令行和未来的其他调用方复用相同行为。
 
-    输入：URL 字符串和可选的超时秒数。
-    处理：先检查 timeout，再校验 URL、获取 HTML、提取标题、blocks 和兼容页面文本。
+    输入：URL、可选超时，以及仅供采集编排使用的交互信号开关。
+    处理：先检查 timeout，再校验 URL、获取 HTML、提取标题、blocks 和兼容页面文本；
+    开关启用时额外检查原始静态 DOM 的标准 ARIA Tab 信号。
     输出：页面原有字段，以及 requested_url、final_url、acquisition_method 审计字段。
     该字典仍是 Python 对象，最终由 main 中的 json.dumps 转换成 JSON 字符串。
     """
@@ -300,13 +343,18 @@ def read_page(url: str, timeout: float = DEFAULT_TIMEOUT_SECONDS) -> dict[str, A
     # 三步各自只负责一种工作；在这里串联后，数据依次从 URL 变为 HTML，再变为结构化字典。
     validated_url = validate_url(url)
     status_code, html, final_url = fetch_html(validated_url, timeout)
-    return _build_page_result(
+    page_result = _build_page_result(
         requested_url=validated_url,
         final_url=final_url,
         status_code=status_code,
         html=html,
         acquisition_method=STATIC_ACQUISITION_METHOD,
     )
+    if include_interaction_signals:
+        # 下划线字段只在 acquire_page_with_browser_fallback 内部短暂使用并立即移除，默认
+        # read_page 输出及 Snapshot 结构不会因此变化。
+        page_result["_interaction_signals"] = detect_static_interaction_signals(html)
+    return page_result
 
 
 def acquire_page_with_browser_fallback(
@@ -315,9 +363,9 @@ def acquire_page_with_browser_fallback(
     """执行“静态优先、质量不合格时浏览器兜底”的完整采集决策。
 
     输入：用户指定 URL 和静态 HTTP 请求超时。
-    处理：先调用 read_page。静态内容 PASS 时立即返回；质量 WARNING/FAIL，或静态请求
-    出现可恢复的 timeout、request_failed、http_error 时，改用 browser_reader 获取渲染
-    DOM，复用同一 Structured Blocks 入口，再运行一次 Quality Gate。
+    处理：先调用 read_page。静态内容 PASS 且没有明确交互信号时立即返回；质量
+    WARNING/FAIL、可恢复的静态请求错误，或 PASS 页面出现标准 Tab 信号时，改用
+    browser_reader 获取默认可见 DOM，复用同一 Structured Blocks 和 Quality Gate。
     输出：选中的 page_data、最终 quality_gate、静态/浏览器质量结果，以及可选的静态
     采集错误审计信息。
 
@@ -326,9 +374,13 @@ def acquire_page_with_browser_fallback(
     """
     static_quality: dict[str, Any] | None = None
     static_acquisition_error: dict[str, str] | None = None
+    static_interaction_signals: list[str] = []
+    browser_trigger_reason: str | None = None
 
     try:
-        static_page_data = read_page(url, timeout)
+        static_page_data = read_page(
+            url, timeout, include_interaction_signals=True
+        )
     except PageReadError as exc:
         if exc.error_type not in RECOVERABLE_STATIC_ERROR_TYPES:
             # invalid_url、invalid_timeout 和 parse_error 不属于浏览器能够合理修复的网络
@@ -338,22 +390,36 @@ def acquire_page_with_browser_fallback(
             "type": exc.error_type,
             "message": str(exc),
         }
+        browser_trigger_reason = "static_acquisition_error"
         # 能进入此分支说明 read_page 已成功完成 URL 校验并在后续网络步骤失败。再次调用
         # validate_url 只为取得去除首尾空白后的稳定 requested_url，不会发起网络请求。
         requested_url = validate_url(url)
     else:
+        raw_signals = static_page_data.pop("_interaction_signals", [])
+        if isinstance(raw_signals, list):
+            static_interaction_signals = [str(signal) for signal in raw_signals]
         requested_url = static_page_data["requested_url"]
         static_quality = evaluate_content_quality(
             static_page_data["content"], static_page_data["blocks"]
         )
-        if static_quality["downstream_allowed"]:
+        if (
+            static_quality["downstream_allowed"]
+            and not static_interaction_signals
+        ):
             return {
                 "page_data": static_page_data,
                 "quality_gate": static_quality,
                 "static_quality_gate": static_quality,
                 "browser_quality_gate": None,
                 "static_acquisition_error": None,
+                "static_interaction_signals": [],
+                "browser_trigger_reason": None,
             }
+        browser_trigger_reason = (
+            "interactive_structure"
+            if static_quality["downstream_allowed"]
+            else "static_quality_gate"
+        )
 
     try:
         browser_capture = read_browser_page(requested_url)
@@ -361,6 +427,8 @@ def acquire_page_with_browser_fallback(
         # 浏览器错误仍由 main 按原有方式输出。若此前静态请求也失败，把该事实附在异常上，
         # 让最终错误 JSON 能同时说明两次采集都未成功，而无需引入复杂 tracing 系统。
         exc.static_acquisition_error = static_acquisition_error
+        exc.static_interaction_signals = static_interaction_signals
+        exc.browser_trigger_reason = browser_trigger_reason
         raise
 
     browser_page_data = _build_page_result(
@@ -380,6 +448,8 @@ def acquire_page_with_browser_fallback(
         "static_quality_gate": static_quality,
         "browser_quality_gate": browser_quality,
         "static_acquisition_error": static_acquisition_error,
+        "static_interaction_signals": static_interaction_signals,
+        "browser_trigger_reason": browser_trigger_reason,
     }
 
 
@@ -437,6 +507,12 @@ def main(argv: list[str] | None = None) -> int:
                 "static_acquisition_error": acquisition_result[
                     "static_acquisition_error"
                 ],
+                "static_interaction_signals": acquisition_result[
+                    "static_interaction_signals"
+                ],
+                "browser_trigger_reason": acquisition_result[
+                    "browser_trigger_reason"
+                ],
             }
             print(json.dumps(rejected_result, ensure_ascii=False, indent=2))
             return 1
@@ -451,6 +527,12 @@ def main(argv: list[str] | None = None) -> int:
         result["browser_quality_gate"] = acquisition_result["browser_quality_gate"]
         result["static_acquisition_error"] = acquisition_result[
             "static_acquisition_error"
+        ]
+        result["static_interaction_signals"] = acquisition_result[
+            "static_interaction_signals"
+        ]
+        result["browser_trigger_reason"] = acquisition_result[
+            "browser_trigger_reason"
         ]
         # 成功输出虽然已经保留完整 current_snapshot，但把三个采集审计字段放在顶层，
         # 可以让命令行调用者无需理解历史结构就直接看出正文来源和重定向结果。
@@ -474,6 +556,14 @@ def main(argv: list[str] | None = None) -> int:
         static_acquisition_error = getattr(exc, "static_acquisition_error", None)
         if static_acquisition_error is not None:
             error_result["static_acquisition_error"] = static_acquisition_error
+        static_interaction_signals = getattr(
+            exc, "static_interaction_signals", None
+        )
+        if static_interaction_signals is not None:
+            error_result["static_interaction_signals"] = static_interaction_signals
+        browser_trigger_reason = getattr(exc, "browser_trigger_reason", None)
+        if browser_trigger_reason is not None:
+            error_result["browser_trigger_reason"] = browser_trigger_reason
         # ensure_ascii=False 让中文保持可读；stderr 与退出码 1 共同表明本次命令失败。
         print(json.dumps(error_result, ensure_ascii=False, indent=2), file=sys.stderr)
         return 1

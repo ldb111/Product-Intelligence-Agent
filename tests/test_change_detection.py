@@ -132,7 +132,7 @@ class ChangeDetectionTests(unittest.TestCase):
         previous_snapshot = self._snapshot(
             "a" * 64,
             captured_at="2026-09-02T11:00:00+08:00",
-            extraction_version="legacy_v1",
+            extraction_version="structured_blocks_v6_clipped_overlay_filter",
         )
         current_snapshot = self._snapshot(
             "b" * 64,
@@ -154,6 +154,10 @@ class ChangeDetectionTests(unittest.TestCase):
         )
         self.assertEqual(result["previous_content_hash"], "a" * 64)
         self.assertEqual(result["current_content_hash"], "b" * 64)
+        self.assertEqual(
+            current_snapshot["extraction_version"],
+            "structured_blocks_v7_detached_opacity_filter",
+        )
 
     def test_legacy_snapshot_without_version_skips_new_version_comparison(
         self,

@@ -152,6 +152,89 @@ class StructuredContentTests(unittest.TestCase):
         self.assertIn("Start Trial", content)
         self.assertTrue(all(block["type"] == "paragraph" for block in blocks))
 
+    def test_repeated_article_and_div_containers_form_generic_card_groups(self) -> None:
+        content, blocks = self._extract(
+            """
+            <main>
+              <section>
+                <article><h3>Alpha</h3><p>First body</p><a href="/a">Details</a></article>
+                <article><h3>Beta</h3><p>Second body</p><a href="/b">Details</a></article>
+              </section>
+              <section>
+                <div><h3>Basic</h3><p>For individuals</p></div>
+                <div><h3>Pro</h3><p><span>For</span> teams</p></div>
+              </section>
+            </main>
+            """
+        )
+
+        self.assertEqual([block["type"] for block in blocks], ["group", "group"])
+        article_cards = blocks[0]["cards"]
+        div_cards = blocks[1]["cards"]
+        self.assertEqual([card["title"] for card in article_cards], ["Alpha", "Beta"])
+        self.assertEqual([card["title"] for card in div_cards], ["Basic", "Pro"])
+        self.assertEqual(article_cards[0]["blocks"][1]["text"], "First body")
+        self.assertEqual(
+            article_cards[0]["links"], [{"text": "Details", "href": "/a"}]
+        )
+        # group 只增加结构，不应让 card 文本在兼容 content 中重复出现。
+        self.assertEqual(content.count("First body"), 1)
+        self.assertLess(content.index("Alpha"), content.index("Beta"))
+        self.assertLess(content.index("Basic"), content.index("Pro"))
+
+    def test_card_preserves_definition_list_key_value_relationships(self) -> None:
+        _, blocks = self._extract(
+            """
+            <section>
+              <div><h3>Starter</h3><dl><dt>Projects</dt><dd>20</dd><dt>Storage</dt><dd>10 GB</dd></dl></div>
+              <div><h3>Team</h3><dl><dt>Projects</dt><dd>100</dd><dt>Storage</dt><dd>50 GB</dd></dl></div>
+            </section>
+            """
+        )
+
+        cards = blocks[0]["cards"]
+        self.assertEqual(
+            cards[0]["key_values"],
+            [
+                {"key": "Projects", "value": "20"},
+                {"key": "Storage", "value": "10 GB"},
+            ],
+        )
+        self.assertEqual(cards[1]["key_values"][0], {"key": "Projects", "value": "100"})
+
+    def test_card_preserves_strikethrough_and_other_dom_text_marks(self) -> None:
+        _, blocks = self._extract(
+            """
+            <section>
+              <article><h3>Starter</h3><p><del>99</del> 49 <strong>Limited offer</strong></p></article>
+              <article><h3>Team</h3><p><del>199</del> 99 <strong>Best value</strong></p></article>
+            </section>
+            """
+        )
+
+        first_marks = blocks[0]["cards"][0]["text_marks"]
+        self.assertIn({"text": "99", "marks": ["strikethrough"]}, first_marks)
+        self.assertIn(
+            {"text": "Limited offer", "marks": ["strong"]}, first_marks
+        )
+
+    def test_repeated_layout_divs_without_card_title_remain_flat_blocks(self) -> None:
+        _, blocks = self._extract(
+            """
+            <section>
+              <div><p>普通布局区域 A</p></div>
+              <div><p>普通布局区域 B</p></div>
+              <div><p>普通布局区域 C</p></div>
+            </section>
+            """
+        )
+
+        self.assertEqual([block["type"] for block in blocks], ["paragraph"] * 3)
+        self.assertEqual(
+            [block["text"] for block in blocks],
+            ["普通布局区域 A", "普通布局区域 B", "普通布局区域 C"],
+        )
+
     def test_complete_repeated_sibling_sequence_keeps_first_copy(self) -> None:
         content, blocks = self._extract(
             """

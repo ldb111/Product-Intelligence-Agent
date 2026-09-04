@@ -4,12 +4,14 @@
 标签，也不处理 Snapshot、Change Detection 或 Diff。调用方应先删除已经确定的结构
 噪声，再把 BeautifulSoup 页面树传入 extract_structured_blocks。
 
-第一版只产生 heading、paragraph、list、table、code 五类 Block。BeautifulSoup 只处理
-服务器返回的 HTML，不执行 JavaScript，因此浏览器运行脚本后才出现的结构不在输入范围内。
+基础 Block 包括 heading、paragraph、list、table、code；结构相似的重复兄弟卡片会额外
+保留为 group/card。BeautifulSoup 本身不执行 JavaScript，因此动态结构必须先由浏览器
+采集模块取得渲染后 HTML，才能进入这里解析。
 """
 
 from __future__ import annotations
 
+import difflib
 from typing import Any, Iterable
 
 from bs4 import BeautifulSoup, Comment, Doctype, NavigableString, Tag
@@ -79,6 +81,26 @@ TEXT_BOUNDARY_TAG_NAMES = {
 # 至少包含两种不同子树，避免 6 个合法相同按钮被误认为 A B C / A B C 轮播副本。
 MIN_REPEATED_SEQUENCE_LENGTH = 3
 MIN_DISTINCT_SUBTREES_IN_SEQUENCE = 2
+
+# Group/Card 识别只把 article 和普通 div 当作候选，不依赖站点域名或 CSS class。
+# 至少两个相邻候选才能形成 group；结构相似阈值集中定义，避免规则散落在遍历代码中。
+CARD_CONTAINER_TAG_NAMES = {"article", "div"}
+MIN_CARD_GROUP_SIZE = 2
+CARD_STRUCTURE_SIMILARITY_THRESHOLD = 0.8
+
+# 这些标签自身带有明确文本语义。card 仍保留原始 blocks，同时额外记录标记文本，避免
+# 价格删除线等信息在转成普通字符串后丢失。多个标签可映射到同一种稳定业务标记。
+SEMANTIC_TEXT_MARKS = {
+    "del": "strikethrough",
+    "s": "strikethrough",
+    "strike": "strikethrough",
+    "strong": "strong",
+    "b": "strong",
+    "em": "emphasis",
+    "i": "emphasis",
+    "mark": "highlight",
+    "ins": "insertion",
+}
 
 
 def _normalize_inline_whitespace(text: str) -> str:
@@ -387,10 +409,178 @@ def _build_code(tag: Tag) -> StructuredBlock:
     return {"type": "code", "text": tag.get_text("", strip=False)}
 
 
+def _build_structure_tokens(tag: Tag) -> list[str]:
+    """把候选卡片子树转换成忽略文案和样式属性的 DOM 结构序列。
+
+    输入：article 或 div 候选容器。
+    处理：按 DOM 顺序记录开始/结束标签，不记录文字、class、id 等站点实现细节。
+    输出：供相似度比较的字符串序列；文案不同但模板接近的卡片仍可被归为一组。
+    """
+    tokens = [f"<{tag.name}>"]
+    for child in tag.children:
+        if isinstance(child, Tag):
+            tokens.extend(_build_structure_tokens(child))
+    tokens.append(f"</{tag.name}>")
+    return tokens
+
+
+def _card_structure_similarity(first: Tag, second: Tag) -> float:
+    """计算两个候选容器的通用 DOM 结构相似度，不比较具体业务文本。"""
+    return difflib.SequenceMatcher(
+        None,
+        _build_structure_tokens(first),
+        _build_structure_tokens(second),
+        autojunk=False,
+    ).ratio()
+
+
+def _find_card_title_tag(tag: Tag) -> Tag | None:
+    """返回候选卡片中的第一个标题标签；没有明确标题时不猜测。"""
+    return tag.find(list(HEADING_TAG_NAMES))
+
+
+def _is_card_candidate(tag: Tag) -> bool:
+    """保守判断一个 article/div 是否具备“标题 + 正文”的卡片基本证据。
+
+    仅有相似结构并不足以证明它是卡片，例如多个纯布局 div 也可能结构一致。因此这里
+    要求明确 heading，并要求标题之外仍有可见文字；没有证据时继续走原有扁平提取。
+    """
+    if tag.name not in CARD_CONTAINER_TAG_NAMES:
+        return False
+
+    title_tag = _find_card_title_tag(tag)
+    if title_tag is None:
+        return False
+
+    title = _extract_inline_text(title_tag.children)
+    whole_text = _extract_inline_text(tag.children)
+    return bool(title and whole_text and whole_text != title)
+
+
+def _find_card_group_runs(container: BeautifulSoup | Tag) -> list[list[Tag]]:
+    """查找同一父容器内连续、结构相似的 article/div 卡片序列。
+
+    输入：当前共同父容器。
+    处理：忽略兄弟之间的排版空白；有意义的直接文本或非候选元素会结束当前序列；
+    候选卡片与序列首项达到统一相似度阈值时才进入同一 group。
+    输出：每个至少包含两个卡片根节点的连续序列。
+    """
+    groups: list[list[Tag]] = []
+    current_run: list[Tag] = []
+
+    def finish_run() -> None:
+        if len(current_run) >= MIN_CARD_GROUP_SIZE:
+            groups.append(list(current_run))
+        current_run.clear()
+
+    for child in container.children:
+        if isinstance(child, (Comment, Doctype)):
+            continue
+        if isinstance(child, NavigableString):
+            if str(child).strip():
+                finish_run()
+            continue
+        if not isinstance(child, Tag) or not _is_card_candidate(child):
+            finish_run()
+            continue
+
+        if not current_run:
+            current_run.append(child)
+            continue
+
+        similarity = _card_structure_similarity(current_run[0], child)
+        if similarity >= CARD_STRUCTURE_SIMILARITY_THRESHOLD:
+            current_run.append(child)
+        else:
+            finish_run()
+            current_run.append(child)
+
+    finish_run()
+    return groups
+
+
+def _extract_definition_pairs(root: Tag) -> list[dict[str, str]]:
+    """从 card 内的 dl/dt/dd 直接保留 key-value 关系。
+
+    一个 dt 后连续出现的多个 dd 仍属于同一个 key，使用换行连接到 value；这比先压成
+    paragraph 再猜测字段关系可靠。嵌套 dl 各自处理，不会把内外层定义混在一起。
+    """
+    pairs: list[dict[str, str]] = []
+
+    for definition_list in root.find_all("dl"):
+        current_key: str | None = None
+        current_values: list[str] = []
+
+        def finish_pair() -> None:
+            if current_key and current_values:
+                pairs.append(
+                    {"key": current_key, "value": "\n".join(current_values)}
+                )
+
+        for definition_part in definition_list.find_all(["dt", "dd"]):
+            # 只处理最近 dl 就是当前 definition_list 的节点，避免外层重复读取嵌套 dl。
+            if definition_part.find_parent("dl") is not definition_list:
+                continue
+            text = _extract_inline_text(definition_part.children)
+            if definition_part.name == "dt":
+                finish_pair()
+                current_key = text
+                current_values = []
+            elif current_key is not None and text:
+                current_values.append(text)
+
+        finish_pair()
+
+    return pairs
+
+
+def _extract_text_marks(root: Tag) -> list[dict[str, Any]]:
+    """提取删除线、强调、插入等由 HTML 标签明确表达的文本语义。"""
+    marked_text: list[dict[str, Any]] = []
+    for marked_tag in root.find_all(list(SEMANTIC_TEXT_MARKS)):
+        text = _extract_inline_text(marked_tag.children)
+        if text:
+            marked_text.append(
+                {
+                    "text": text,
+                    "marks": [SEMANTIC_TEXT_MARKS[marked_tag.name]],
+                }
+            )
+    return marked_text
+
+
+def _build_card(tag: Tag) -> dict[str, Any]:
+    """把一个已确认的卡片容器转换为保留原有 Blocks 和附加语义的 card。"""
+    title_tag = _find_card_title_tag(tag)
+    assert title_tag is not None
+    return {
+        "type": "card",
+        "title": _extract_inline_text(title_tag.children),
+        # 原有 heading/paragraph/list/table/code 仍完整保存在 card.blocks 中，保证信息不丢失。
+        "blocks": _walk_container(tag),
+        "links": _extract_links(tag),
+        "key_values": _extract_definition_pairs(tag),
+        "text_marks": _extract_text_marks(tag),
+    }
+
+
+def _build_group(card_tags: list[Tag]) -> StructuredBlock:
+    """把同一父容器下的结构相似卡片组成一个 group Block。"""
+    return {
+        "type": "group",
+        "cards": [_build_card(card_tag) for card_tag in card_tags],
+    }
+
+
 def _walk_container(container: BeautifulSoup | Tag) -> list[StructuredBlock]:
-    """按 DOM 顺序遍历一个页面容器，并避免父子 Block 重复输出。"""
+    """按 DOM 顺序遍历容器，优先保留 group/card，再提取原有基础 Block。"""
     blocks: list[StructuredBlock] = []
     pending_inline_nodes: list[object] = []
+    card_groups = _find_card_group_runs(container)
+    group_by_first_card = {id(group[0]): group for group in card_groups}
+    grouped_card_ids = {
+        id(card_tag) for group in card_groups for card_tag in group
+    }
 
     def flush_inline_nodes() -> None:
         paragraph = _build_paragraph_from_nodes(pending_inline_nodes)
@@ -407,6 +597,15 @@ def _walk_container(container: BeautifulSoup | Tag) -> list[StructuredBlock]:
         if not isinstance(child, Tag):
             continue
         if child.name in IGNORED_CONTENT_TAG_NAMES:
+            continue
+
+        group = group_by_first_card.get(id(child))
+        if group is not None:
+            flush_inline_nodes()
+            blocks.append(_build_group(group))
+            continue
+        if id(child) in grouped_card_ids:
+            # 同组后续 card 已经由第一个兄弟节点一次构造，不能再扁平输出造成正文重复。
             continue
 
         if child.name in STRUCTURED_BLOCK_TAG_NAMES:
@@ -442,11 +641,11 @@ def _walk_container(container: BeautifulSoup | Tag) -> list[StructuredBlock]:
 
 
 def extract_structured_blocks(soup: BeautifulSoup) -> list[StructuredBlock]:
-    """从已删除噪声的 BeautifulSoup 页面树提取五类 Structured Blocks。
+    """从已删除噪声的页面树提取基础 Blocks，并保留可确认的 group/card。
 
     输入：仍保留 HTML 结构、但已由调用方删除确定性噪声标签的页面树。
-    处理：先保守删除同一父容器中的完整重复 DOM 序列，再按 DOM 顺序识别标题、段落、
-    列表、表格和代码；行内标签只贡献连续文字和链接信息。
+    处理：先保守删除同一父容器中的完整重复 DOM 序列，再识别结构相似的兄弟卡片；
+    非卡片区域继续按原有顺序提取标题、段落、列表、表格和代码。
     输出：顺序稳定、可直接 JSON 序列化的 Block 字典列表。
     """
     deduplicate_repeated_sibling_sequences(soup)
@@ -505,5 +704,14 @@ def serialize_blocks(blocks: list[StructuredBlock]) -> str:
             code_text = block["text"]
             closing_prefix = "" if code_text.endswith("\n") else "\n"
             sections.append(f"```\n{code_text}{closing_prefix}```")
+        elif block_type == "group":
+            # group/card 是新增结构层，不应让同一份正文重复进入 content。递归序列化每张
+            # card 中原样保留的基础 blocks，可以维持旧版扁平提取的文本顺序和格式。
+            card_contents = [
+                serialize_blocks(card.get("blocks", []))
+                for card in block.get("cards", [])
+                if isinstance(card, dict)
+            ]
+            sections.append("\n\n".join(content for content in card_contents if content))
 
     return "\n\n".join(section for section in sections if section)

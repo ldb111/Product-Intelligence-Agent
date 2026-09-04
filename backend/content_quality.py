@@ -23,7 +23,7 @@ DYNAMIC_PLACEHOLDER_MAX_BLOCK_COUNT = 5
 SPARSE_CONTENT_CHAR_THRESHOLD = 120
 SPARSE_BLOCK_COUNT_THRESHOLD = 3
 
-SUPPORTED_BLOCK_TYPES = ("heading", "paragraph", "list", "table", "code")
+SUPPORTED_BLOCK_TYPES = ("heading", "paragraph", "list", "table", "code", "group")
 DYNAMIC_PLACEHOLDER_PHRASES = (
     "加载中",
     "正在加载",
@@ -67,6 +67,22 @@ def _block_has_content(block: Any) -> bool:
             if isinstance(row, list)
             for cell in row
         )
+
+    if block_type == "group":
+        cards = block.get("cards", [])
+        if not isinstance(cards, list):
+            return False
+        for card in cards:
+            if not isinstance(card, dict):
+                continue
+            if str(card.get("title", "")).strip():
+                return True
+            child_blocks = card.get("blocks", [])
+            if isinstance(child_blocks, list) and any(
+                _block_has_content(child_block) for child_block in child_blocks
+            ):
+                return True
+        return False
 
     return False
 

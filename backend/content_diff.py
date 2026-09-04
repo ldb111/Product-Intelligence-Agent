@@ -1,14 +1,19 @@
-"""根据 Change Detection 结果生成标准化页面正文的行级文本差异。
+"""根据 Change Detection 结果生成行级 Diff 和带结构上下文的差异。
 
-本模块只负责 Task 7：消费 Task 6 已经给出的 changed 结论，并在确实发生变化时比较
-前后快照中已经保存的 content。它不会请求网页、查询历史、计算 Hash、重新判断是否
-变化，也不会解释文本变化是否具有产品或竞争意义。
+本模块消费 Task 6 已经给出的 changed 结论：原有 diff 继续比较前后 content，新增加的
+contextual_diff 使用 Snapshot 中的 Structured Blocks 补充标题、表格和列表上下文。它
+不会请求网页、查询历史、计算 Hash、重新判断变化或解释竞争意义。
 """
 
 from __future__ import annotations
 
 import difflib
 from typing import Any
+
+if __package__:
+    from .contextual_diff import build_contextual_diff
+else:
+    from contextual_diff import build_contextual_diff
 
 
 EXTRACTION_VERSION_CHANGED_REASON = "extraction_version_changed"
@@ -86,7 +91,8 @@ def build_diff_result(change_result: dict[str, Any]) -> dict[str, Any]:
 
     输入：包含 is_first_scan、changed、current_snapshot、previous_snapshot 的 Task 6 结果。
     处理：首次采集、抽取版本切换或无变化时设置 diff=None；有变化时生成行级 Diff。
-    输出：保留 Task 6 所有字段并新增 diff 的字典；None 序列化为 JSON 后对应 null。
+    输出：保留 Task 6 所有字段，并新增原有 diff 和 contextual_diff；不可比较或旧快照
+    缺少 blocks 时，contextual_diff 为 None，序列化为 JSON 后对应 null。
 
     业务规则：本函数信任 Task 6 的 changed 结论，不通过 content 或 Hash 再判断一次。
     这样可以保持职责边界，避免两个模块产生互相矛盾的变化结论。
@@ -111,6 +117,7 @@ def build_diff_result(change_result: dict[str, Any]) -> dict[str, Any]:
         )
 
     result = dict(change_result)
+    result["contextual_diff"] = None
 
     if is_first_scan:
         if changed is not None:
@@ -156,4 +163,9 @@ def build_diff_result(change_result: dict[str, Any]) -> dict[str, Any]:
     previous_content = _get_content(previous_snapshot, "previous_snapshot")
     current_content = _get_content(current_snapshot, "current_snapshot")
     result["diff"] = build_content_diff(previous_content, current_content)
+    # 行级 diff 保持原样；结构化差异只消费 Snapshot 已保存的 blocks。旧快照没有 blocks
+    # 时返回 None，不会让已经可靠完成的 Hash 变化判断和传统 Diff 因兼容问题失败。
+    result["contextual_diff"] = build_contextual_diff(
+        previous_snapshot, current_snapshot
+    )
     return result

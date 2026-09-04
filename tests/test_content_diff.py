@@ -48,6 +48,7 @@ class ContentDiffTests(unittest.TestCase):
             result = build_diff_result(change_result)
 
         self.assertIsNone(result["diff"])
+        self.assertIsNone(result["contextual_diff"])
         mocked_diff.assert_not_called()
 
     def test_unchanged_content_does_not_generate_diff(self) -> None:
@@ -62,6 +63,7 @@ class ContentDiffTests(unittest.TestCase):
             result = build_diff_result(change_result)
 
         self.assertIsNone(result["diff"])
+        self.assertIsNone(result["contextual_diff"])
         mocked_diff.assert_not_called()
 
     def test_extraction_version_change_does_not_generate_false_diff(self) -> None:
@@ -82,6 +84,7 @@ class ContentDiffTests(unittest.TestCase):
             result["comparison_skipped_reason"], "extraction_version_changed"
         )
         self.assertIsNone(result["diff"])
+        self.assertIsNone(result["contextual_diff"])
         mocked_diff.assert_not_called()
 
     def test_diff_shows_added_line(self) -> None:

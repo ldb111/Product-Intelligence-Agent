@@ -61,6 +61,13 @@ class SnapshotTests(unittest.TestCase):
             json.dumps(snapshot, ensure_ascii=False), encoding="utf-8"
         )
 
+    def test_extraction_version_identifies_detached_opacity_filter_schema(self) -> None:
+        """透明脱流过滤改变可信正文，必须升级版本避免新旧快照误比较。"""
+        self.assertEqual(
+            EXTRACTION_VERSION,
+            "structured_blocks_v7_detached_opacity_filter",
+        )
+
     def test_compute_content_hash_returns_standard_sha256_hex_digest(self) -> None:
         # "hello" 的 SHA-256 是公开、固定的测试值。与它直接比较可以同时验证算法、
         # UTF-8 编码和十六进制输出，而不是只检查字符串长度。

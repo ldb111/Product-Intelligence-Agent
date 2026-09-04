@@ -100,6 +100,36 @@ class ContentQualityTests(unittest.TestCase):
         self.assertEqual(result["metrics"]["list_count"], 1)
         self.assertEqual(result["metrics"]["table_count"], 1)
 
+    def test_group_card_content_is_still_valid_for_quality_gate(self) -> None:
+        card_body = "这是卡片中的完整产品能力说明，用于确认新增结构层不会被质量门槛当成空内容。" * 5
+        blocks = [
+            {
+                "type": "group",
+                "cards": [
+                    {
+                        "type": "card",
+                        "title": "产品 A",
+                        "blocks": [
+                            {
+                                "type": "paragraph",
+                                "text": card_body,
+                                "links": [],
+                            }
+                        ],
+                        "links": [],
+                        "key_values": [],
+                        "text_marks": [],
+                    }
+                ],
+            }
+        ]
+
+        result = evaluate_content_quality(card_body, blocks)
+
+        self.assertEqual(result["status"], "PASS")
+        self.assertEqual(result["metrics"]["valid_block_count"], 1)
+        self.assertEqual(result["metrics"]["group_count"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

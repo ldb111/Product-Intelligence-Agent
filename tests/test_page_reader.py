@@ -22,6 +22,7 @@ from backend.browser_reader import BrowserReadError
 from backend.page_reader import (
     PageReadError,
     acquire_page_with_browser_fallback,
+    detect_static_interaction_signals,
     extract_page_data,
     main,
     read_page,
@@ -121,6 +122,24 @@ class _TestPageHandler(BaseHTTPRequestHandler):
     <footer>Footer Noise</footer>
   </body>
 </html>"""
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(html)))
+            self.end_headers()
+            self.wfile.write(html)
+            return
+
+        if self.path == "/interactive":
+            html = b"""<!doctype html>
+<html><head><title>Interactive Product Page</title></head><body>
+  <h1>Membership plans</h1>
+  <div role="tablist">
+    <button role="tab" aria-selected="true">Personal</button>
+    <button role="tab" aria-selected="false">Team</button>
+  </div>
+  <p>This server response already contains a complete product overview, pricing,
+  usage limits, integrations, security details, and customer support information.</p>
+</body></html>"""
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(html)))
@@ -242,6 +261,24 @@ class PageReaderTests(unittest.TestCase):
         self.assertIn("\n", content)
         self.assertTrue(all(line == line.strip() for line in content.splitlines()))
 
+    def test_static_interaction_signals_use_standard_aria_semantics(self) -> None:
+        signals = detect_static_interaction_signals(
+            b"""
+            <div role="tablist">
+              <button role="tab" aria-selected="true">Overview</button>
+              <button role="tab" aria-selected="false">Team</button>
+            </div>
+            """
+        )
+
+        self.assertEqual(signals, ["role_tablist", "role_tab", "aria_selected"])
+        self.assertEqual(
+            detect_static_interaction_signals(
+                b'<div class="tabs"><button>Ordinary button</button></div>'
+            ),
+            [],
+        )
+
     def test_http_error_does_not_return_error_page_as_success(self) -> None:
         with self.assertRaises(PageReadError) as raised:
             read_page(f"{self.base_url}/missing")
@@ -330,8 +367,29 @@ class PageReaderTests(unittest.TestCase):
         self.assertEqual(output["final_url"], f"{self.base_url}/ok")
         self.assertIsNone(output["browser_quality_gate"])
         self.assertIsNone(output["static_acquisition_error"])
+        self.assertEqual(output["static_interaction_signals"], [])
+        self.assertIsNone(output["browser_trigger_reason"])
         mocked_browser.assert_not_called()
         self.assertEqual(len(snapshot_files), 1)
+
+    def test_static_pass_with_tab_signals_uses_browser_enrichment(self) -> None:
+        with patch(
+            "backend.page_reader.read_browser_page",
+            return_value=_trusted_browser_capture(),
+        ) as mocked_browser:
+            result = acquire_page_with_browser_fallback(
+                f"{self.base_url}/interactive"
+            )
+
+        self.assertEqual(result["static_quality_gate"]["status"], "PASS")
+        self.assertEqual(result["browser_quality_gate"]["status"], "PASS")
+        self.assertEqual(result["page_data"]["acquisition_method"], "browser")
+        self.assertEqual(
+            result["static_interaction_signals"],
+            ["role_tablist", "role_tab", "aria_selected"],
+        )
+        self.assertEqual(result["browser_trigger_reason"], "interactive_structure")
+        mocked_browser.assert_called_once_with(f"{self.base_url}/interactive")
 
     def test_static_fail_calls_browser_and_browser_fail_does_not_save(self) -> None:
         stdout = io.StringIO()
