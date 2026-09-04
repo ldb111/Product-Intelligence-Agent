@@ -61,11 +61,11 @@ class SnapshotTests(unittest.TestCase):
             json.dumps(snapshot, ensure_ascii=False), encoding="utf-8"
         )
 
-    def test_extraction_version_identifies_detached_opacity_filter_schema(self) -> None:
-        """透明脱流过滤改变可信正文，必须升级版本避免新旧快照误比较。"""
+    def test_extraction_version_identifies_computed_strikethrough_schema(self) -> None:
+        """computed 删除线进入 Blocks 后必须升级版本，避免新旧快照直接比较。"""
         self.assertEqual(
             EXTRACTION_VERSION,
-            "structured_blocks_v7_detached_opacity_filter",
+            "structured_blocks_v8_computed_strikethrough",
         )
 
     def test_compute_content_hash_returns_standard_sha256_hex_digest(self) -> None:

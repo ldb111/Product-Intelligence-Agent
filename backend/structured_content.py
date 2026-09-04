@@ -102,6 +102,12 @@ SEMANTIC_TEXT_MARKS = {
     "ins": "insertion",
 }
 
+# 浏览器路径会把 computed style 中确认的展示语义写到“抽取用 DOM 克隆”的这个内部属性。
+# 静态 HTML 解析器不计算 CSS；统一属性让全页 Browser Acquisition 和 Local Scope State
+# Capture 都能继续复用同一个 Structured Blocks 入口，而不需要网站或 CSS class 规则。
+COMPUTED_STYLE_TEXT_MARK_ATTRIBUTE = "data-pia-computed-text-mark"
+COMPUTED_STYLE_TEXT_MARKS = {"strikethrough"}
+
 
 def _normalize_inline_whitespace(text: str) -> str:
     """整理一个逻辑文本块内部的空白，同时保持行内节点连续。"""
@@ -535,15 +541,43 @@ def _extract_definition_pairs(root: Tag) -> list[dict[str, str]]:
 
 
 def _extract_text_marks(root: Tag) -> list[dict[str, Any]]:
-    """提取删除线、强调、插入等由 HTML 标签明确表达的文本语义。"""
+    """提取显式 HTML 标签及浏览器 computed style 保留的中性文本语义。
+
+    输入：一张 card 的根节点。
+    处理：按 DOM 顺序读取 del/s/strong/em/mark/ins 等显式标签，以及浏览器只写在抽取
+    克隆上的内部 computed-style 标记；使用“文本 + mark”去重，避免 del 自带删除线样式
+    时同时被显式标签和浏览器标记记录两次。
+    输出：中性的 text_marks 列表，不把 strikethrough 解释成价格或其他业务含义。
+    """
     marked_text: list[dict[str, Any]] = []
-    for marked_tag in root.find_all(list(SEMANTIC_TEXT_MARKS)):
+    seen_marks: set[tuple[str, str]] = set()
+
+    for marked_tag in root.find_all(True):
         text = _extract_inline_text(marked_tag.children)
-        if text:
+        if not text:
+            continue
+
+        marks: list[str] = []
+        explicit_mark = SEMANTIC_TEXT_MARKS.get(marked_tag.name)
+        if explicit_mark:
+            marks.append(explicit_mark)
+
+        computed_marks = str(
+            marked_tag.get(COMPUTED_STYLE_TEXT_MARK_ATTRIBUTE, "")
+        ).split()
+        marks.extend(
+            mark for mark in computed_marks if mark in COMPUTED_STYLE_TEXT_MARKS
+        )
+
+        for mark in marks:
+            identity = (text, mark)
+            if identity in seen_marks:
+                continue
+            seen_marks.add(identity)
             marked_text.append(
                 {
                     "text": text,
-                    "marks": [SEMANTIC_TEXT_MARKS[marked_tag.name]],
+                    "marks": [mark],
                 }
             )
     return marked_text

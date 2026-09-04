@@ -19,6 +19,8 @@ from backend.browser_reader import (
     BrowserReadError,
     read_browser_page,
 )
+from backend.page_reader import extract_page_data_with_blocks
+from backend.structured_content import COMPUTED_STYLE_TEXT_MARK_ATTRIBUTE
 
 
 class BrowserReaderTests(unittest.TestCase):
@@ -43,7 +45,14 @@ class BrowserReaderTests(unittest.TestCase):
             "hidden_element_count": 4,
         }
 
-        with patch("backend.browser_reader.sync_playwright", return_value=manager):
+        discovered_groups = [{"scope_path": ["Billing cycle"]}]
+        with (
+            patch("backend.browser_reader.sync_playwright", return_value=manager),
+            patch(
+                "backend.browser_reader.discover_safe_tab_groups",
+                return_value=discovered_groups,
+            ) as mocked_discovery,
+        ):
             result = read_browser_page(
                 "https://example.com", navigation_timeout_ms=12_345, render_wait_ms=678
             )
@@ -58,6 +67,7 @@ class BrowserReaderTests(unittest.TestCase):
             timeout=12_345,
         )
         page.wait_for_timeout.assert_called_once_with(678)
+        mocked_discovery.assert_called_once_with(page)
         page.evaluate.assert_called_once_with(VISIBLE_DOM_EXTRACTION_SCRIPT)
         page.click.assert_not_called()
         self.assertEqual(result["status_code"], 200)
@@ -65,6 +75,8 @@ class BrowserReaderTests(unittest.TestCase):
         self.assertEqual(result["title"], "Rendered title")
         self.assertIn(b"Rendered content", result["html"])
         self.assertEqual(result["hidden_element_count"], 4)
+        self.assertEqual(result["computed_text_mark_count"], 0)
+        self.assertEqual(result["interactive_tab_groups"], discovered_groups)
         browser.close.assert_called_once()
 
     def test_visible_dom_filter_uses_hidden_semantics_not_viewport_position(self) -> None:
@@ -132,6 +144,14 @@ class VisibleDomExtractionScriptTests(unittest.TestCase):
             return page.evaluate(VISIBLE_DOM_EXTRACTION_SCRIPT)
         finally:
             page.close()
+
+    def _extract_browser_blocks(self, html: str) -> list[dict[str, object]]:
+        """执行真实 computed style 标记，再交给现有 Structured Blocks 解析。"""
+        result = self._filter_local_html(html)
+        _, _, blocks = extract_page_data_with_blocks(
+            result["html"].encode("utf-8")
+        )
+        return blocks
 
     def test_absolute_opacity_zero_parent_removes_child_subtree(self) -> None:
         """透明绝对定位浮层无需额外裁剪证据，也应删除完整隐藏子树。"""
@@ -226,6 +246,97 @@ class VisibleDomExtractionScriptTests(unittest.TestCase):
             "ARIA_HIDDEN_CHILD",
         ):
             self.assertNotIn(hidden_text, result["html"])
+
+    def test_css_line_through_is_preserved_as_neutral_text_mark(self) -> None:
+        """普通 span 的浏览器删除线样式应进入 card.text_marks。"""
+        blocks = self._extract_browser_blocks(
+            """
+            <section>
+              <article><h3>Plan A</h3><p><span style="text-decoration-line:line-through">99</span></p></article>
+              <article><h3>Plan B</h3><p><span style="text-decoration-line:line-through">199</span></p></article>
+            </section>
+            """
+        )
+
+        self.assertEqual(blocks[0]["type"], "group")
+        self.assertIn(
+            {"text": "99", "marks": ["strikethrough"]},
+            blocks[0]["cards"][0]["text_marks"],
+        )
+
+    def test_plain_span_does_not_gain_strikethrough(self) -> None:
+        blocks = self._extract_browser_blocks(
+            """
+            <section>
+              <article><h3>Plan A</h3><p><span>99</span></p></article>
+              <article><h3>Plan B</h3><p><span>199</span></p></article>
+            </section>
+            """
+        )
+
+        self.assertEqual(blocks[0]["cards"][0]["text_marks"], [])
+
+    def test_explicit_and_computed_strikethrough_is_not_duplicated(self) -> None:
+        """del 自带浏览器删除线，显式语义和内部标记只能生成一条 mark。"""
+        blocks = self._extract_browser_blocks(
+            """
+            <section>
+              <article><h3>Plan A</h3><p><del>99</del><s>199</s></p></article>
+              <article><h3>Plan B</h3><p><del>299</del><s>399</s></p></article>
+            </section>
+            """
+        )
+
+        first_marks = blocks[0]["cards"][0]["text_marks"]
+        self.assertEqual(
+            first_marks.count({"text": "99", "marks": ["strikethrough"]}),
+            1,
+        )
+        self.assertEqual(
+            first_marks.count({"text": "199", "marks": ["strikethrough"]}),
+            1,
+        )
+
+    def test_css_class_name_does_not_affect_computed_semantic_blocks(self) -> None:
+        """class 名可变化；只要 computed style 相同，抽取结果就应完全一致。"""
+        first_blocks = self._extract_browser_blocks(
+            """
+            <style>.old-name { text-decoration-line: line-through; }</style>
+            <section>
+              <article><h3>Plan A</h3><p><span class="old-name">99</span></p></article>
+              <article><h3>Plan B</h3><p><span class="old-name">199</span></p></article>
+            </section>
+            """
+        )
+        renamed_blocks = self._extract_browser_blocks(
+            """
+            <style>.renamed-style { text-decoration-line: line-through; }</style>
+            <section>
+              <article><h3>Plan A</h3><p><span class="renamed-style">99</span></p></article>
+              <article><h3>Plan B</h3><p><span class="renamed-style">199</span></p></article>
+            </section>
+            """
+        )
+
+        self.assertEqual(first_blocks, renamed_blocks)
+
+    def test_rendered_semantic_annotation_only_modifies_clone(self) -> None:
+        """内部标记必须出现在抽取结果中，但不能写回真实页面 DOM。"""
+        page = self.browser.new_page()
+        try:
+            page.set_content(
+                '<span id="old" style="text-decoration-line:line-through">99</span>'
+            )
+            result = page.evaluate(VISIBLE_DOM_EXTRACTION_SCRIPT)
+
+            self.assertIn(COMPUTED_STYLE_TEXT_MARK_ATTRIBUTE, result["html"])
+            self.assertIsNone(
+                page.locator("#old").get_attribute(
+                    COMPUTED_STYLE_TEXT_MARK_ATTRIBUTE
+                )
+            )
+        finally:
+            page.close()
 
 
 if __name__ == "__main__":

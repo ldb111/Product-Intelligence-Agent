@@ -156,7 +156,7 @@ class ChangeDetectionTests(unittest.TestCase):
         self.assertEqual(result["current_content_hash"], "b" * 64)
         self.assertEqual(
             current_snapshot["extraction_version"],
-            "structured_blocks_v7_detached_opacity_filter",
+            "structured_blocks_v8_computed_strikethrough",
         )
 
     def test_legacy_snapshot_without_version_skips_new_version_comparison(
