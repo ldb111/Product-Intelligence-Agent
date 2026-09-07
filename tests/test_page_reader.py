@@ -27,17 +27,24 @@ from backend.page_reader import (
     main,
     read_page,
 )
-from backend.snapshot import EXTRACTION_VERSION
+from backend.snapshot import EXTRACTION_VERSION, INTERACTIVE_STATE_SCHEMA_VERSION
 
 
-def _browser_capture(html: str, final_url: str = "https://example.com/final") -> dict:
+def _browser_capture(
+    html: str,
+    final_url: str = "https://example.com/final",
+    traversal_result: dict | None = None,
+) -> dict:
     """构造可控浏览器结果，让 Fallback 测试不依赖真实 Chromium 或公网。"""
-    return {
+    result = {
         "status_code": 200,
         "final_url": final_url,
         "title": "Browser Rendered Page",
         "html": html.encode("utf-8"),
     }
+    if traversal_result is not None:
+        result["traversal_result"] = traversal_result
+    return result
 
 
 def _trusted_browser_capture() -> dict:
@@ -53,6 +60,36 @@ def _trusted_browser_capture() -> dict:
         """,
         final_url="https://www.example.com/rendered-final",
     )
+
+
+def _traversal_result(content_hash: str) -> dict:
+    """构造正式 Orchestrator 形状的结果，用于验证主扫描集成而非底层点击。"""
+    return {
+        "status": "complete",
+        "interactive_states": [
+            {
+                "state_key": "stable-state-key",
+                "scope_path": ["Membership"],
+                "state_path": ["Monthly"],
+                "is_default": True,
+                "blocks": [{"type": "paragraph", "text": content_hash}],
+                "content_hash": content_hash,
+                "captured_at": "2026-09-07T10:00:00+08:00",
+            }
+        ],
+        "groups_discovered": 1,
+        "groups_completed": 1,
+        "non_default_states_captured": 0,
+        "page_restored": True,
+        "errors": [],
+        "bounds": {
+            "max_depth": 2,
+            "max_actionable_options_per_group": 6,
+            "max_non_default_states_per_page": 12,
+        },
+        "truncations": [],
+        "skipped": [],
+    }
 
 
 class _TestPageHandler(BaseHTTPRequestHandler):
@@ -332,6 +369,9 @@ class PageReaderTests(unittest.TestCase):
                         exit_code = main([f"{self.base_url}/ok"])
 
                 snapshot_files = list(Path(temporary_directory).glob("*.json"))
+                saved_snapshot = json.loads(
+                    snapshot_files[0].read_text(encoding="utf-8")
+                )
 
         self.assertEqual(exit_code, 0)
         output = json.loads(stdout.getvalue())
@@ -369,8 +409,162 @@ class PageReaderTests(unittest.TestCase):
         self.assertIsNone(output["static_acquisition_error"])
         self.assertEqual(output["static_interaction_signals"], [])
         self.assertIsNone(output["browser_trigger_reason"])
+        self.assertEqual(
+            output["interactive_state_comparison"]["comparison_status"],
+            "baseline",
+        )
+        self.assertIsNone(output["interactive_state_comparison"]["changed"])
+        self.assertNotIn("interactive_state_schema_version", saved_snapshot)
+        self.assertNotIn("interactive_states", saved_snapshot)
+        self.assertNotIn("interactive_state_traversal", saved_snapshot)
         mocked_browser.assert_not_called()
         self.assertEqual(len(snapshot_files), 1)
+
+    def test_main_persists_and_matches_same_interactive_state_across_scans(self) -> None:
+        """正式入口应把 Traversal 写入历史，并在第二次扫描返回 unchanged。"""
+        url = f"{self.base_url}/interactive"
+        rendered_html = """
+        <html><body>
+          <h1>Membership plans</h1>
+          <p>This rendered membership page contains complete pricing, feature,
+          integration, security, support, and usage details for product research.</p>
+          <ul><li>Stable feature A</li><li>Stable feature B</li></ul>
+        </body></html>
+        """
+        browser_results = [
+            _browser_capture(
+                rendered_html,
+                traversal_result=_traversal_result("same-state-hash"),
+            ),
+            _browser_capture(
+                rendered_html,
+                traversal_result=_traversal_result("same-state-hash"),
+            ),
+        ]
+
+        with patch(
+            "backend.page_reader.read_browser_page", side_effect=browser_results
+        ):
+            with TemporaryDirectory() as temporary_directory:
+                with patch(
+                    "backend.snapshot.DEFAULT_SNAPSHOT_DIRECTORY",
+                    Path(temporary_directory),
+                ):
+                    first_stdout = io.StringIO()
+                    with redirect_stdout(first_stdout):
+                        first_exit_code = main([url])
+
+                    second_stdout = io.StringIO()
+                    with redirect_stdout(second_stdout):
+                        second_exit_code = main([url])
+
+                snapshot_files = list(Path(temporary_directory).glob("*.json"))
+                saved_snapshots = [
+                    json.loads(path.read_text(encoding="utf-8"))
+                    for path in snapshot_files
+                ]
+
+        first_output = json.loads(first_stdout.getvalue())
+        second_output = json.loads(second_stdout.getvalue())
+        self.assertEqual((first_exit_code, second_exit_code), (0, 0))
+        self.assertEqual(
+            first_output["interactive_state_comparison"]["comparison_status"],
+            "baseline",
+        )
+        self.assertIsNone(first_output["interactive_state_comparison"]["changed"])
+        self.assertEqual(
+            first_output["interactive_state_comparison"]["state_changes"], []
+        )
+        self.assertEqual(first_output["contextual_state_diff"], [])
+        self.assertFalse(second_output["interactive_state_comparison"]["changed"])
+        self.assertEqual(
+            second_output["interactive_state_comparison"]["state_changes"][0][
+                "change_type"
+            ],
+            "unchanged",
+        )
+        self.assertEqual(second_output["contextual_state_diff"], [])
+        self.assertEqual(len(saved_snapshots), 2)
+        for snapshot in saved_snapshots:
+            self.assertEqual(
+                snapshot["interactive_state_schema_version"],
+                INTERACTIVE_STATE_SCHEMA_VERSION,
+            )
+            self.assertEqual(
+                snapshot["interactive_states"][0]["content_hash"],
+                "same-state-hash",
+            )
+            self.assertEqual(
+                snapshot["interactive_state_traversal"]["status"], "complete"
+            )
+
+    def test_main_reports_modified_interactive_state_on_second_scan(self) -> None:
+        """页面级内容可保持相同，但一个交互状态 Hash 改变时应独立返回 modified。"""
+        url = f"{self.base_url}/interactive"
+        rendered_html = """
+        <html><body>
+          <h1>Membership plans</h1>
+          <p>This rendered membership page contains complete pricing, feature,
+          integration, security, support, and usage details for product research.</p>
+          <ul><li>Stable feature A</li><li>Stable feature B</li></ul>
+        </body></html>
+        """
+        browser_results = [
+            _browser_capture(
+                rendered_html,
+                traversal_result=_traversal_result("old-state-hash"),
+            ),
+            _browser_capture(
+                rendered_html,
+                traversal_result=_traversal_result("new-state-hash"),
+            ),
+        ]
+
+        with patch(
+            "backend.page_reader.read_browser_page", side_effect=browser_results
+        ):
+            with TemporaryDirectory() as temporary_directory:
+                with patch(
+                    "backend.snapshot.DEFAULT_SNAPSHOT_DIRECTORY",
+                    Path(temporary_directory),
+                ):
+                    with redirect_stdout(io.StringIO()):
+                        first_exit_code = main([url])
+                    second_stdout = io.StringIO()
+                    with redirect_stdout(second_stdout):
+                        second_exit_code = main([url])
+
+        second_output = json.loads(second_stdout.getvalue())
+        state_comparison = second_output["interactive_state_comparison"]
+        self.assertEqual((first_exit_code, second_exit_code), (0, 0))
+        self.assertTrue(state_comparison["changed"])
+        self.assertEqual(
+            state_comparison["state_changes"][0]["change_type"], "modified"
+        )
+        self.assertEqual(
+            state_comparison["state_changes"][0]["previous_content_hash"],
+            "old-state-hash",
+        )
+        self.assertEqual(
+            state_comparison["state_changes"][0]["current_content_hash"],
+            "new-state-hash",
+        )
+        self.assertEqual(len(second_output["contextual_state_diff"]), 1)
+        detailed_state_diff = second_output["contextual_state_diff"][0]
+        self.assertEqual(detailed_state_diff["state_key"], "stable-state-key")
+        self.assertEqual(detailed_state_diff["previous_hash"], "old-state-hash")
+        self.assertEqual(detailed_state_diff["current_hash"], "new-state-hash")
+        self.assertEqual(
+            detailed_state_diff["contextual_diff"][0]["previous"],
+            "old-state-hash",
+        )
+        self.assertEqual(
+            detailed_state_diff["contextual_diff"][0]["current"],
+            "new-state-hash",
+        )
+        # 新状态比较不会替换原有页面级 Change Detection / Diff。
+        self.assertFalse(second_output["changed"])
+        self.assertIsNone(second_output["diff"])
 
     def test_static_pass_with_tab_signals_uses_browser_enrichment(self) -> None:
         with patch(

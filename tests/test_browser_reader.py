@@ -46,12 +46,28 @@ class BrowserReaderTests(unittest.TestCase):
         }
 
         discovered_groups = [{"scope_path": ["Billing cycle"]}]
+        traversal_result = {
+            "status": "complete",
+            "interactive_states": [{"state_key": "quarterly"}],
+            "groups_discovered": 1,
+            "groups_completed": 1,
+            "non_default_states_captured": 1,
+            "page_restored": True,
+            "errors": [],
+            "bounds": {},
+            "truncations": [],
+            "skipped": [],
+        }
         with (
             patch("backend.browser_reader.sync_playwright", return_value=manager),
             patch(
                 "backend.browser_reader.discover_safe_tab_groups",
                 return_value=discovered_groups,
             ) as mocked_discovery,
+            patch(
+                "backend.interactive_traversal.traverse_top_level_interactive_states",
+                return_value=traversal_result,
+            ) as mocked_traversal,
         ):
             result = read_browser_page(
                 "https://example.com", navigation_timeout_ms=12_345, render_wait_ms=678
@@ -68,6 +84,7 @@ class BrowserReaderTests(unittest.TestCase):
         )
         page.wait_for_timeout.assert_called_once_with(678)
         mocked_discovery.assert_called_once_with(page)
+        mocked_traversal.assert_called_once_with(page)
         page.evaluate.assert_called_once_with(VISIBLE_DOM_EXTRACTION_SCRIPT)
         page.click.assert_not_called()
         self.assertEqual(result["status_code"], 200)
@@ -77,7 +94,31 @@ class BrowserReaderTests(unittest.TestCase):
         self.assertEqual(result["hidden_element_count"], 4)
         self.assertEqual(result["computed_text_mark_count"], 0)
         self.assertEqual(result["interactive_tab_groups"], discovered_groups)
+        self.assertEqual(result["traversal_result"], traversal_result)
         browser.close.assert_called_once()
+
+    def test_no_safe_tab_group_does_not_create_empty_traversal_history(self) -> None:
+        """没有安全交互组时不运行 Orchestrator，也不返回伪造的 complete/零状态结果。"""
+        manager, _, page, response = self._mock_playwright()
+        response.status = 200
+        page.url = "https://example.com"
+        page.title.return_value = "Static-like browser page"
+        page.evaluate.return_value = {
+            "html": "<html><body><p>Normal content</p></body></html>",
+            "hidden_element_count": 0,
+        }
+
+        with (
+            patch("backend.browser_reader.sync_playwright", return_value=manager),
+            patch("backend.browser_reader.discover_safe_tab_groups", return_value=[]),
+            patch(
+                "backend.interactive_traversal.traverse_top_level_interactive_states"
+            ) as mocked_traversal,
+        ):
+            result = read_browser_page("https://example.com")
+
+        self.assertIsNone(result["traversal_result"])
+        mocked_traversal.assert_not_called()
 
     def test_visible_dom_filter_uses_hidden_semantics_not_viewport_position(self) -> None:
         """过滤脚本应覆盖明确隐藏规则，但不能用坐标误删视口外正文。"""

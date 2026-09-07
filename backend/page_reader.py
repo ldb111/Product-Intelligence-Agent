@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from pathlib import Path
 from typing import Any
 
 # urlsplit 用于把 URL 拆分成协议、主机、端口、路径等部分，便于在请求前完成结构校验。
@@ -24,6 +25,14 @@ from urllib.parse import urlsplit
 import requests
 from bs4 import BeautifulSoup
 
+# 直接执行 ``python backend/page_reader.py`` 时，Python 默认只把 backend 目录加入
+# 模块搜索路径；而 Browser/Traversal 的正式模块使用 ``backend.*`` 包路径。把项目根
+# 目录补入搜索路径，只是维持现有 CLI 入口可用，不改变网页采集或比较业务逻辑。
+if not __package__:
+    project_root = str(Path(__file__).resolve().parent.parent)
+    if project_root not in sys.path:
+        sys.path.insert(0, project_root)
+
 # 兼容两种现有运行方式：测试通过 backend.page_reader 导入模块，而 README 使用
 # python backend/page_reader.py 直接运行文件。两种情况下都复用相同的历史查询和变化检测逻辑。
 if __package__:
@@ -31,24 +40,34 @@ if __package__:
     from .change_detection import ChangeDetectionError, detect_change
     from .content_quality import evaluate_content_quality
     from .content_diff import ContentDiffError, build_diff_result
+    from .contextual_state_diff import (
+        ContextualStateDiffError,
+        build_contextual_state_diff,
+    )
     from .snapshot import (
         SnapshotError,
         build_snapshot_history,
         create_snapshot,
         save_snapshot,
     )
+    from .state_matching import StateMatchingError, match_interactive_states
     from .structured_content import extract_structured_blocks, serialize_blocks
 else:
     from browser_reader import BrowserReadError, read_browser_page
     from change_detection import ChangeDetectionError, detect_change
     from content_quality import evaluate_content_quality
     from content_diff import ContentDiffError, build_diff_result
+    from contextual_state_diff import (
+        ContextualStateDiffError,
+        build_contextual_state_diff,
+    )
     from snapshot import (
         SnapshotError,
         build_snapshot_history,
         create_snapshot,
         save_snapshot,
     )
+    from state_matching import StateMatchingError, match_interactive_states
     from structured_content import extract_structured_blocks, serialize_blocks
 
 
@@ -414,6 +433,8 @@ def acquire_page_with_browser_fallback(
                 "static_acquisition_error": None,
                 "static_interaction_signals": [],
                 "browser_trigger_reason": None,
+                # 无浏览器安全交互就没有 Traversal；None 不会被写成零状态 schema。
+                "traversal_result": None,
             }
         browser_trigger_reason = (
             "interactive_structure"
@@ -450,6 +471,7 @@ def acquire_page_with_browser_fallback(
         "static_acquisition_error": static_acquisition_error,
         "static_interaction_signals": static_interaction_signals,
         "browser_trigger_reason": browser_trigger_reason,
+        "traversal_result": browser_capture.get("traversal_result"),
     }
 
 
@@ -482,10 +504,13 @@ def main(argv: list[str] | None = None) -> int:
     main 是命令行入口：它读取参数并执行“静态优先、浏览器兜底”的采集流程。最终
     Quality Gate 只有 PASS 才调用 create_snapshot 和 save_snapshot；WARNING/FAIL 会
     直接返回诊断结果，避免污染历史。保存成功后才查询 Previous Snapshot、比较
-    content_hash，并根据 changed 决定是否生成行级 Diff。
+    content_hash，并根据 changed 决定是否生成行级 Diff。若浏览器实际发现安全交互组，
+    还会把正式 Traversal Result 写入同一 Snapshot，独立执行 State Matching，并只为
+    4A 已确认 modified 的状态生成 Contextual State Diff。
 
     输入：可选的参数列表；为 None 时 argparse 使用真实命令行参数。
-    处理：读取并评估网页；可信时保存、查询历史、判断变化并按需生成 Diff。
+    处理：读取并评估网页；可信时保存页面和可选交互状态、查询历史，分别执行页面级
+    Change Detection 与状态级 State Matching，再按页面 changed 按需生成原有 Diff。
     输出：完整可信链路返回 0；请求错误或质量门槛拒绝下游时返回 1。
     """
     args = build_parser().parse_args(argv)
@@ -517,11 +542,21 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(rejected_result, ensure_ascii=False, indent=2))
             return 1
 
-        current_snapshot = create_snapshot(page_data)
+        traversal_result = acquisition_result["traversal_result"]
+        current_snapshot = create_snapshot(
+            page_data, traversal_result=traversal_result
+        )
         save_snapshot(current_snapshot)
         snapshot_history = build_snapshot_history(current_snapshot)
         change_result = detect_change(snapshot_history)
         result = build_diff_result(change_result)
+        # 状态比较与页面级 changed/diff 是两条并列输出。无交互、旧 schema、跨版本或
+        # 不完整遍历的三态语义全部交给 V0.3-4A matcher，不在主入口重复判断。
+        interactive_state_comparison = match_interactive_states(snapshot_history)
+        result["interactive_state_comparison"] = interactive_state_comparison
+        result["contextual_state_diff"] = build_contextual_state_diff(
+            snapshot_history, interactive_state_comparison
+        )
         result["quality_gate"] = quality_result
         result["static_quality_gate"] = acquisition_result["static_quality_gate"]
         result["browser_quality_gate"] = acquisition_result["browser_quality_gate"]
@@ -544,6 +579,8 @@ def main(argv: list[str] | None = None) -> int:
         BrowserReadError,
         SnapshotError,
         ChangeDetectionError,
+        StateMatchingError,
+        ContextualStateDiffError,
         ContentDiffError,
     ) as exc:
         error_result = {

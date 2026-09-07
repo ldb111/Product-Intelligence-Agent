@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -31,6 +32,20 @@ PAGE_DATA_FIELDS = (
 # 抽取算法升级可能在网页未变化时改变 content 格式。把稳定版本写进每份新快照，能够
 # 让 Change Detection 区分“网页变化”和“采集技术升级”，避免制造假 Diff。
 EXTRACTION_VERSION = "structured_blocks_v8_computed_strikethrough"
+# Interactive State 的结构和页面抽取版本是两条独立演进轴。只有真正附带 Traversal
+# Result 的新快照才写入该版本；旧快照或普通页面采集不会被伪装成“完整但零状态”。
+INTERACTIVE_STATE_SCHEMA_VERSION = "interactive_states_v1"
+TRAVERSAL_AUDIT_FIELDS = (
+    "status",
+    "groups_discovered",
+    "groups_completed",
+    "non_default_states_captured",
+    "page_restored",
+    "bounds",
+    "truncations",
+    "skipped",
+    "errors",
+)
 
 # Windows 文件名不能包含这些特殊字符和 ASCII 控制字符。URL 中常见的冒号、斜杠、
 # 问号正好属于该范围，所以生成文件名时必须替换。
@@ -73,16 +88,71 @@ def compute_content_hash(content: str) -> str:
     return hashlib.sha256(content_bytes).hexdigest()
 
 
-def create_snapshot(page_data: dict[str, Any]) -> dict[str, Any]:
+def _build_interactive_state_snapshot_data(
+    traversal_result: dict[str, Any],
+) -> dict[str, Any]:
+    """把 Traversal Result 转成 Snapshot 中稳定、可审计的状态数据。
+
+    输入：正式 Traversal Orchestrator 返回的结果。
+    处理：验证状态列表和最关键的完整性字段；保留状态原始字典，并复制有限的遍历审计
+    信息。运行时 DOM 定位不由本函数补造，也不会参与页面 content_hash。
+    输出：可合并进 Snapshot 的 schema version、interactive_states 和 traversal 元数据。
+    """
+    if not isinstance(traversal_result, dict):
+        raise SnapshotError(
+            "invalid_traversal_result", "Traversal result must be an object."
+        )
+    interactive_states = traversal_result.get("interactive_states")
+    traversal_status = traversal_result.get("status")
+    page_restored = traversal_result.get("page_restored")
+    if not isinstance(interactive_states, list):
+        raise SnapshotError(
+            "invalid_traversal_result",
+            "Traversal result must contain an interactive_states list.",
+        )
+    if traversal_status not in {"complete", "partial", "aborted"}:
+        raise SnapshotError(
+            "invalid_traversal_result",
+            "Traversal status must be complete, partial, or aborted.",
+        )
+    if not isinstance(page_restored, bool):
+        raise SnapshotError(
+            "invalid_traversal_result",
+            "Traversal result must contain a boolean page_restored field.",
+        )
+    if not all(isinstance(state, dict) for state in interactive_states):
+        raise SnapshotError(
+            "invalid_traversal_result",
+            "Every interactive state must be an object.",
+        )
+
+    traversal_audit = {
+        field: deepcopy(traversal_result[field])
+        for field in TRAVERSAL_AUDIT_FIELDS
+        if field in traversal_result
+    }
+    return {
+        "interactive_state_schema_version": INTERACTIVE_STATE_SCHEMA_VERSION,
+        "interactive_states": deepcopy(interactive_states),
+        "interactive_state_traversal": traversal_audit,
+    }
+
+
+def create_snapshot(
+    page_data: dict[str, Any],
+    traversal_result: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """为页面数据增加采集时间和内容哈希，组成完整 Snapshot（页面快照）。
 
     在业务链路中的职责：连接 Task 2 页面结果和 Task 3 文件保存，但不会修改传入的
     page_data，也不会重新请求 URL。
 
-    输入：包含 URL、状态码、标题、content、blocks 和 acquisition_method 的页面结果。
+    输入：包含 URL、状态码、标题、content、blocks 和 acquisition_method 的页面结果；
+    可选传入正式 Traversal Result。
     处理：确认必需字段存在，原样保留 blocks，生成带时区的 captured_at，只根据
     content 计算 SHA-256 content_hash，并写入当前 extraction_version。
-    输出：包含页面数据、captured_at、content_hash 和 extraction_version 的新快照字典。
+    输出：包含页面数据、captured_at、content_hash 和 extraction_version 的新快照字典；
+    提供 Traversal 时额外保存独立 schema version、interactive_states 和完整性审计信息。
     """
     missing_fields = [field for field in PAGE_DATA_FIELDS if field not in page_data]
     if missing_fields:
@@ -96,7 +166,7 @@ def create_snapshot(page_data: dict[str, Any]) -> dict[str, Any]:
     captured_at = datetime.now().astimezone().isoformat(timespec="microseconds")
     content_hash = compute_content_hash(page_data["content"])
 
-    return {
+    snapshot = {
         "url": page_data["url"],
         "requested_url": page_data["requested_url"],
         "final_url": page_data["final_url"],
@@ -112,6 +182,9 @@ def create_snapshot(page_data: dict[str, Any]) -> dict[str, Any]:
         "content_hash": content_hash,
         "extraction_version": EXTRACTION_VERSION,
     }
+    if traversal_result is not None:
+        snapshot.update(_build_interactive_state_snapshot_data(traversal_result))
+    return snapshot
 
 
 def build_snapshot_filename(snapshot: dict[str, Any]) -> str:

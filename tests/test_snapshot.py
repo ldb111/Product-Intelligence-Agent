@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 from backend.snapshot import (
     EXTRACTION_VERSION,
+    INTERACTIVE_STATE_SCHEMA_VERSION,
     build_snapshot_history,
     compute_content_hash,
     create_snapshot,
@@ -67,6 +68,85 @@ class SnapshotTests(unittest.TestCase):
             EXTRACTION_VERSION,
             "structured_blocks_v8_computed_strikethrough",
         )
+
+    def test_snapshot_persists_interactive_states_and_traversal_completeness(self) -> None:
+        """提供 Traversal Result 时，应原样保存状态和必要的完整性审计字段。"""
+        traversal_result = {
+            "status": "partial",
+            "interactive_states": [
+                {
+                    "state_key": "state-key",
+                    "scope_path": ["Token Plan"],
+                    "state_path": ["季度"],
+                    "is_default": False,
+                    "blocks": [{"type": "paragraph", "text": "季度内容"}],
+                    "content_hash": "state-hash",
+                    "captured_at": "2026-09-07T10:00:00+08:00",
+                }
+            ],
+            "groups_discovered": 2,
+            "groups_completed": 1,
+            "non_default_states_captured": 1,
+            "page_restored": True,
+            "bounds": {"max_depth": 2},
+            "truncations": [{"reason": "state_limit_reached"}],
+            "skipped": [],
+            "errors": [{"code": "example_error"}],
+        }
+
+        snapshot = create_snapshot(self.page_data, traversal_result=traversal_result)
+
+        with TemporaryDirectory() as temporary_directory:
+            saved_path = save_snapshot(snapshot, temporary_directory)
+            saved_snapshot = json.loads(saved_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(
+            snapshot["interactive_state_schema_version"],
+            INTERACTIVE_STATE_SCHEMA_VERSION,
+        )
+        self.assertEqual(
+            snapshot["interactive_states"], traversal_result["interactive_states"]
+        )
+        self.assertEqual(
+            snapshot["interactive_state_traversal"],
+            {
+                key: traversal_result[key]
+                for key in (
+                    "status",
+                    "groups_discovered",
+                    "groups_completed",
+                    "non_default_states_captured",
+                    "page_restored",
+                    "bounds",
+                    "truncations",
+                    "skipped",
+                    "errors",
+                )
+            },
+        )
+        self.assertEqual(
+            saved_snapshot["interactive_state_schema_version"],
+            INTERACTIVE_STATE_SCHEMA_VERSION,
+        )
+        self.assertEqual(saved_snapshot["interactive_states"], snapshot["interactive_states"])
+        self.assertEqual(
+            saved_snapshot["interactive_state_traversal"],
+            snapshot["interactive_state_traversal"],
+        )
+
+        # Snapshot 必须拥有独立副本；调用方后续整理遍历结果不能悄悄改写已创建的快照。
+        traversal_result["interactive_states"][0]["state_path"] = ["已修改"]
+        traversal_result["errors"].append({"code": "later_error"})
+        self.assertEqual(snapshot["interactive_states"][0]["state_path"], ["季度"])
+        self.assertEqual(len(snapshot["interactive_state_traversal"]["errors"]), 1)
+
+    def test_snapshot_without_traversal_does_not_claim_state_schema(self) -> None:
+        """普通页面快照不写空 State schema，避免被误解为完整遍历但零状态。"""
+        snapshot = create_snapshot(self.page_data)
+
+        self.assertNotIn("interactive_state_schema_version", snapshot)
+        self.assertNotIn("interactive_states", snapshot)
+        self.assertNotIn("interactive_state_traversal", snapshot)
 
     def test_compute_content_hash_returns_standard_sha256_hex_digest(self) -> None:
         # "hello" 的 SHA-256 是公开、固定的测试值。与它直接比较可以同时验证算法、

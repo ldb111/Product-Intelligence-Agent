@@ -288,8 +288,9 @@ def read_browser_page(
     处理：无界面启动 Chromium；等待 DOMContentLoaded；固定等待有限渲染时间；删除
     display:none、visibility:hidden/collapse、hidden、aria-hidden=true 元素；opacity:0 只有
     同时满足 absolute/fixed 时才删除。不会点击 Tab，也不会根据尺寸或视口位置删除。
-    输出：包含状态码、最终 URL、标题、可见 DOM HTML 和隐藏元素计数；失败时抛出
-    BrowserReadError。浏览器总会在 finally 中关闭，避免异常后残留进程。
+    输出：包含状态码、最终 URL、标题、可见 DOM HTML、隐藏元素计数，以及仅在实际
+    发现安全 Tab Group 时生成的 Traversal Result；失败时抛出 BrowserReadError。
+    浏览器总会在 finally 中关闭，避免异常后残留进程。
     """
     if navigation_timeout_ms <= 0 or render_wait_ms < 0:
         raise BrowserReadError(
@@ -327,6 +328,7 @@ def read_browser_page(
                 # 标题在清理 DOM 前读取，因为浏览器计算样式可能把 head/title 视为不展示
                 # 元素；正文 HTML 则必须来自清理后的默认可见状态。
                 page_title = page.title()
+                page_final_url = page.url
                 # Tab Group 必须在过滤 DOM 之前发现，才能记录隐藏或禁用 Tab 的状态；该
                 # 函数只读当前默认状态，不会点击或触发页面交互。
                 interactive_tab_groups = discover_safe_tab_groups(page)
@@ -340,9 +342,23 @@ def read_browser_page(
                         "Browser did not return a valid visible DOM HTML result.",
                     )
 
+                traversal_result = None
+                if interactive_tab_groups:
+                    # Traversal 必须在浏览器关闭前执行。这里只负责编排调用，安全发现、
+                    # 点击、Local Scope、State Capture 和 Restore 仍全部复用已经冻结的
+                    # Orchestrator。无安全组时保持 None，不能伪造“完整遍历但零状态”。
+                    # 局部导入可避免 state_capture -> browser_reader 的模块循环依赖。
+                    from backend.interactive_traversal import (
+                        traverse_top_level_interactive_states,
+                    )
+
+                    traversal_result = traverse_top_level_interactive_states(page)
+
                 return {
                     "status_code": response.status,
-                    "final_url": page.url,
+                    # URL 和默认页面 HTML 都在交互前记录。即使 Traversal 因风险中止，
+                    # 页面快照仍对应最初成功采集的页面，状态完整性由 traversal status 表达。
+                    "final_url": page_final_url,
                     "title": page_title,
                     # evaluate 返回已经排除明确隐藏节点的默认 DOM。转成 UTF-8 bytes 后
                     # 继续复用 BeautifulSoup、Structured Blocks 和 Group/Card 抽取逻辑。
@@ -354,6 +370,7 @@ def read_browser_page(
                         visible_dom.get("computed_text_mark_count", 0)
                     ),
                     "interactive_tab_groups": interactive_tab_groups,
+                    "traversal_result": traversal_result,
                 }
             finally:
                 browser.close()
