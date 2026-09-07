@@ -1,4 +1,4 @@
-"""Stage 1 V0.3-3A～3C-2 人工浏览器验收入口。
+"""Stage 1 V0.3-3A～3D-1 人工浏览器验收入口。
 
 本脚本只负责编排阿里云真实页面的人工观察流程。Safe Tab Group Discovery、点击安全
 校验、Local Scope Resolver 和 State Capture 全部调用 backend 中已经实现的生产能力；
@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import sys
 from typing import Any, Callable
@@ -15,6 +16,7 @@ from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import sync_playwright
 
 from backend.interactive_state import discover_safe_tab_groups
+from backend.interactive_traversal import traverse_top_level_interactive_states
 from backend.local_scope import capture_local_scope_baseline, resolve_local_scope
 from backend.state_capture import capture_interactive_state
 from backend.structured_content import serialize_blocks
@@ -24,6 +26,23 @@ from backend.tab_interaction import click_safe_tab, restore_default_tab
 TARGET_URL = "https://www.aliyun.com/benefit?utm_content=m_20000000458"
 INITIAL_RENDER_WAIT_MS = 5_000
 NAVIGATION_TIMEOUT_MS = 30_000
+
+
+def _parse_args() -> argparse.Namespace:
+    """解析人工验收模式，默认直接进入 3D-1 整页自动遍历。"""
+    parser = argparse.ArgumentParser(
+        description="Stage 1 V0.3-3 浏览器人工验收入口。"
+    )
+    parser.add_argument(
+        "--mode",
+        choices=("state-capture", "traversal"),
+        default="traversal",
+        help=(
+            "traversal（默认）直接运行正式 3D-1 Traversal Orchestrator；"
+            "state-capture 仅保留旧版逐步人工诊断入口。"
+        ),
+    )
+    return parser.parse_args()
 
 
 def _configure_utf8_output() -> None:
@@ -226,6 +245,111 @@ def _print_state_capture(
     print(readable_blocks or "（没有可读 Block 内容）")
 
 
+def _print_traversal_result(result: dict[str, Any]) -> None:
+    """完整展示 Traversal Result 摘要和按采集顺序排列的状态内容。
+
+    输入：正式 Traversal Orchestrator 返回的原始结果。
+    处理：摘要字段和 errors 原样输出；每个 Interactive State 继续使用生产
+    ``serialize_blocks`` 生成可读文本，并额外列出 card 的原始 text_marks。
+    输出：只打印到终端，不修改结果、不保存 Snapshot，也不判断是否通过验收。
+    """
+    _print_json(
+        "V0.3-3D-1 Traversal Result",
+        {
+            "status": result.get("status"),
+            "groups_discovered": result.get("groups_discovered"),
+            "groups_completed": result.get("groups_completed"),
+            "non_default_states_captured": result.get(
+                "non_default_states_captured"
+            ),
+            "page_restored": result.get("page_restored"),
+            "errors": result.get("errors"),
+        },
+    )
+
+    states = result.get("interactive_states")
+    if not isinstance(states, list):
+        states = []
+    print(f"\n共采集 Interactive State：{len(states)} 个")
+    for state_index, state in enumerate(states, start=1):
+        if not isinstance(state, dict):
+            _print_json(f"Interactive State #{state_index}", state)
+            continue
+        blocks = state.get("blocks")
+        readable_blocks = (
+            serialize_blocks(blocks) if isinstance(blocks, list) else ""
+        )
+        text_marks = (
+            _collect_card_text_marks(blocks) if isinstance(blocks, list) else []
+        )
+        _print_json(
+            f"Interactive State #{state_index}",
+            {
+                "state_key": state.get("state_key"),
+                "scope_path": state.get("scope_path"),
+                "state_path": state.get("state_path"),
+                "is_default": state.get("is_default"),
+                "content_hash": state.get("content_hash"),
+                "captured_at": state.get("captured_at"),
+                "text_marks": text_marks,
+            },
+        )
+        print(f"\n----- Interactive State #{state_index}｜blocks 可读文本 -----")
+        print(readable_blocks or "（没有可读 Block 内容）")
+
+
+def _run_traversal_acceptance() -> int:
+    """显示真实浏览器并把整页交给正式 Traversal Orchestrator 自动遍历。
+
+    本模式不在实验脚本中选择或点击具体 Tab。所有发现顺序、点击、局部范围解析、状态
+    采集和默认态恢复均由 backend 的 3D-1 编排器决定；脚本只负责打开目标页和展示结果。
+    """
+    _configure_utf8_output()
+    playwright = None
+    browser = None
+    context = None
+    exit_code = 0
+
+    try:
+        playwright = sync_playwright().start()
+        browser = playwright.chromium.launch(headless=False)
+        context = browser.new_context()
+        page = context.new_page()
+        response = page.goto(
+            TARGET_URL,
+            wait_until="domcontentloaded",
+            timeout=NAVIGATION_TIMEOUT_MS,
+        )
+        page.wait_for_timeout(INITIAL_RENDER_WAIT_MS)
+        print(f"已打开：{page.url}")
+        print(f"HTTP 状态码：{response.status if response else '无响应'}")
+        print("\n正式 Traversal Orchestrator 正在自动遍历顶层安全 Tab Group……")
+
+        traversal_result = traverse_top_level_interactive_states(page)
+        _print_traversal_result(traversal_result)
+    except (PlaywrightError, RuntimeError) as exc:
+        exit_code = 1
+        print(f"\nTraversal 人工验收流程中断：{exc}", file=sys.stderr)
+    except KeyboardInterrupt:
+        exit_code = 1
+        print("\n用户中断了 Traversal 人工验收。", file=sys.stderr)
+    finally:
+        # 无论完成或中断，都让用户先核对浏览器最终状态和终端结果，再关闭窗口。
+        if browser is not None:
+            try:
+                input("\n人工观察完成后，请按 Enter 关闭浏览器并退出：")
+            except EOFError:
+                pass
+        if context is not None:
+            context.close()
+        if browser is not None:
+            browser.close()
+        if playwright is not None:
+            playwright.stop()
+
+    return exit_code
+
+
 def _resolve_and_capture(
     page: Any,
     group: dict[str, Any],
@@ -342,6 +466,10 @@ def main() -> int:
     输出：发现、交互、Local Scope、Interactive State 和 Hash 对照打印到终端；退出码
     只说明脚本是否执行完，不自动代表项目验收结论。
     """
+    args = _parse_args()
+    if args.mode == "traversal":
+        return _run_traversal_acceptance()
+
     _configure_utf8_output()
     playwright = None
     browser = None

@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>V0.3-3D-2 Nested Traversal Fixture</title>
+  <style>
+    body {
+      margin: 0;
+      padding: 32px;
+      background: #f4f6fb;
+      color: #172033;
+      font: 16px/1.5 system-ui, sans-serif;
+    }
+    main { max-width: 900px; margin: 0 auto; }
+    section {
+      margin: 24px 0;
+      padding: 24px;
+      border: 1px solid #ccd4e2;
+      border-radius: 14px;
+      background: white;
+    }
+    [role="tablist"] { display: flex; gap: 10px; margin-bottom: 18px; }
+    [role="tab"] {
+      padding: 8px 16px;
+      border: 1px solid #8794aa;
+      border-radius: 999px;
+      background: white;
+      cursor: pointer;
+    }
+    [role="tab"][aria-selected="true"] {
+      border-color: #315efb;
+      background: #315efb;
+      color: white;
+    }
+    [role="tabpanel"] {
+      padding: 18px;
+      border-radius: 10px;
+      background: #eef3ff;
+    }
+    [role="tabpanel"] [role="tabpanel"] { background: white; }
+    #interaction-log { color: #44516a; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Nested Interactive State Traversal</h1>
+  <p id="interaction-log" aria-live="polite">Current state: Personal / Monthly; Independent / A</p>
+
+  <section aria-labelledby="edition-heading">
+    <h2 id="edition-heading">Edition</h2>
+    <div role="tablist" aria-label="Edition">
+      <button id="edition-personal-tab" role="tab" aria-selected="true"
+              aria-controls="edition-personal-panel">Personal</button>
+      <button id="edition-team-tab" role="tab" aria-selected="false"
+              aria-controls="edition-team-panel">Team</button>
+    </div>
+
+    <div id="edition-personal-panel" role="tabpanel"
+         aria-labelledby="edition-personal-tab">
+      <h3>Personal plans</h3>
+      <div role="tablist" aria-label="Personal billing cycle">
+        <button id="personal-monthly-tab" role="tab" aria-selected="true"
+                aria-controls="personal-monthly-panel">Monthly</button>
+        <button id="personal-quarterly-tab" role="tab" aria-selected="false"
+                aria-controls="personal-quarterly-panel">Quarterly</button>
+        <button id="personal-yearly-tab" role="tab" aria-selected="false"
+                aria-controls="personal-yearly-panel">Yearly</button>
+      </div>
+      <div id="personal-monthly-panel" role="tabpanel"
+           aria-labelledby="personal-monthly-tab">
+        <h4>Personal Monthly</h4><p>Price 10; Credits 1,000.</p>
+      </div>
+      <div id="personal-quarterly-panel" role="tabpanel"
+           aria-labelledby="personal-quarterly-tab" hidden>
+        <h4>Personal Quarterly</h4><p>Price 27; Credits 3,300.</p>
+      </div>
+      <div id="personal-yearly-panel" role="tabpanel"
+           aria-labelledby="personal-yearly-tab" hidden>
+        <h4>Personal Yearly</h4><p>Price 100; Credits 15,000.</p>
+      </div>
+    </div>
+
+    <div id="edition-team-panel" role="tabpanel"
+         aria-labelledby="edition-team-tab" hidden>
+      <h3>Team plans</h3>
+      <div role="tablist" aria-label="Team billing cycle">
+        <button id="team-monthly-tab" role="tab" aria-selected="true"
+                aria-controls="team-monthly-panel">Monthly</button>
+        <button id="team-yearly-tab" role="tab" aria-selected="false"
+                aria-controls="team-yearly-panel">Yearly</button>
+      </div>
+      <div id="team-monthly-panel" role="tabpanel"
+           aria-labelledby="team-monthly-tab">
+        <h4>Team Monthly</h4><p>Price 50; Seats 5.</p>
+      </div>
+      <div id="team-yearly-panel" role="tabpanel"
+           aria-labelledby="team-yearly-tab" hidden>
+        <h4>Team Yearly</h4><p>Price 500; Seats 8.</p>
+      </div>
+    </div>
+  </section>
+
+  <section aria-labelledby="independent-heading">
+    <h2 id="independent-heading">Independent mode</h2>
+    <div role="tablist" aria-label="Independent mode">
+      <button id="independent-a-tab" role="tab" aria-selected="true"
+              aria-controls="independent-a-panel">A</button>
+      <button id="independent-b-tab" role="tab" aria-selected="false"
+              aria-controls="independent-b-panel">B</button>
+    </div>
+    <div id="independent-a-panel" role="tabpanel"
+         aria-labelledby="independent-a-tab">
+      <h3>Independent A</h3><p>This content does not belong to Personal or Team.</p>
+    </div>
+    <div id="independent-b-panel" role="tabpanel"
+         aria-labelledby="independent-b-tab" hidden>
+      <h3>Independent B</h3><p>This remains a separate top-level state.</p>
+    </div>
+  </section>
+</main>
+
+<script>
+  function selectTab(target) {
+    const tablist = target.closest('[role="tablist"]');
+    const tabs = Array.from(tablist.querySelectorAll(':scope > [role="tab"]'));
+    tabs.forEach((tab) => {
+      const selected = tab === target;
+      tab.setAttribute('aria-selected', selected ? 'true' : 'false');
+      const panel = document.getElementById(tab.getAttribute('aria-controls'));
+      if (panel) panel.hidden = !selected;
+    });
+    document.getElementById('interaction-log').textContent =
+      `Last real DOM switch: ${target.textContent.trim()}`;
+  }
+
+  document.querySelectorAll('[role="tab"]').forEach((tab) => {
+    tab.addEventListener('click', () => selectTab(tab));
+  });
+</script>
+</body>
+</html>
