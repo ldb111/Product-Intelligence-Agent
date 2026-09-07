@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>V0.3-4A State Matching E2E Fixture</title>
+  <style>
+    body {
+      margin: 0;
+      padding: 32px;
+      background: #f4f6fb;
+      color: #172033;
+      font: 16px/1.5 system-ui, sans-serif;
+    }
+    main { max-width: 760px; margin: 0 auto; }
+    section {
+      margin: 24px 0;
+      padding: 24px;
+      border: 1px solid #ccd4e2;
+      border-radius: 14px;
+      background: white;
+    }
+    [role="tablist"] { display: flex; gap: 10px; margin: 12px 0 18px; }
+    [role="tab"] {
+      padding: 8px 16px;
+      border: 1px solid #8794aa;
+      border-radius: 999px;
+      background: white;
+      cursor: pointer;
+    }
+    [role="tab"][aria-selected="true"] {
+      border-color: #315efb;
+      background: #315efb;
+      color: white;
+    }
+    [role="tabpanel"] {
+      padding: 18px;
+      border-radius: 10px;
+      background: #eef3ff;
+    }
+    [role="tabpanel"] [role="tabpanel"] { background: white; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Interactive Membership Fixture</h1>
+  <p>
+    This controlled local page provides stable product details, pricing periods,
+    account scope, usage guidance, support information, and security notes for a
+    repeatable Stage 1 acquisition and history comparison exercise.
+  </p>
+
+  <section aria-labelledby="account-heading">
+    <h2 id="account-heading">Account scope</h2>
+    <div role="tablist" aria-label="Account scope">
+      <button id="personal-tab" role="tab" aria-selected="true"
+              aria-controls="personal-panel">Personal</button>
+      <button id="reference-tab" role="tab" aria-selected="false"
+              aria-controls="reference-panel">Reference</button>
+    </div>
+
+    <div id="personal-panel" role="tabpanel" aria-labelledby="personal-tab">
+      <h3>Personal plans</h3>
+      <div role="tablist" aria-label="Personal billing cycle">
+        <button id="monthly-tab" role="tab" aria-selected="true"
+                aria-controls="monthly-panel">Monthly</button>
+        <button id="yearly-tab" role="tab" aria-selected="false"
+                aria-controls="yearly-panel">Yearly</button>
+      </div>
+
+      <div id="monthly-panel" role="tabpanel" aria-labelledby="monthly-tab">
+        <h4>Personal Monthly</h4>
+        <p>Price __MONTHLY_PRICE__. Includes monthly usage credits and standard support.</p>
+      </div>
+      <div id="yearly-panel" role="tabpanel" aria-labelledby="yearly-tab" hidden>
+        <h4>Personal Yearly</h4>
+        <p>Price __YEARLY_PRICE__. Includes yearly usage credits and standard support.</p>
+      </div>
+    </div>
+
+    <div id="reference-panel" role="tabpanel" aria-labelledby="reference-tab" hidden>
+      <h3>Reference information</h3>
+      <p>This stable comparison section is independent from the Personal billing states.</p>
+    </div>
+  </section>
+
+  <p>All prices in this fixture are controlled test observations, not product claims.</p>
+</main>
+
+<script>
+  function selectTab(target) {
+    const tablist = target.closest('[role="tablist"]');
+    const tabs = Array.from(tablist.querySelectorAll(':scope > [role="tab"]'));
+    tabs.forEach((tab) => {
+      const selected = tab === target;
+      tab.setAttribute('aria-selected', selected ? 'true' : 'false');
+      const panel = document.getElementById(tab.getAttribute('aria-controls'));
+      if (panel) panel.hidden = !selected;
+    });
+  }
+
+  document.querySelectorAll('[role="tab"]').forEach((tab) => {
+    tab.addEventListener('click', () => selectTab(tab));
+  });
+</script>
+</body>
+</html>
