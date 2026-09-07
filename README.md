@@ -17,7 +17,7 @@ Deep Research（深入研究）
 这件事到底意味着什么？
 ```
 
-当前仓库主要完成了 Monitoring 的数据基础：静态与浏览器网页采集、内容质量判断、结构化内容抽取、页面快照与历史比较，以及经过安全校验的 Interactive State Traversal（交互状态遍历）。State-aware Change Detection（状态感知变化检测）、竞争事件识别、证据管理、Triage 和 Deep Research 等上层能力尚未实现。
+当前仓库已经完成 Stage 1（阶段一）的 Monitoring 数据基础：静态与浏览器网页采集、内容质量判断、结构化内容抽取、页面与交互状态快照、历史状态匹配、State-aware Change Detection（状态感知变化检测）和上下文差异。LLM Event Detection（大语言模型事件检测）、证据管理、Triage 和 Deep Research 等上层能力尚未实现。
 
 ## 为什么需要专门的竞争情报工作流
 
@@ -166,14 +166,16 @@ flowchart LR
     D --> G[Snapshot / Interactive State<br/>快照 / 交互状态]
     G --> H[Content Hash & Previous Snapshot<br/>内容哈希与历史快照]
     H --> I[Page Change Detection / Contextual Diff<br/>页面变化检测 / 上下文差异]
-    I -. 尚未实现 .-> J[State-aware Change Detection<br/>状态感知变化检测]
-    J -. 后续阶段 .-> K[Event Detection & Evidence<br/>事件识别与证据]
+    G --> J[Interactive State Snapshot & Matching<br/>交互状态快照与匹配]
+    J --> M[State-aware Change Detection / Contextual State Diff<br/>状态感知变化检测 / 上下文状态差异]
+    I -. 后续输入 .-> K[Event Detection & Evidence<br/>事件识别与证据]
+    M -. 后续输入 .-> K
     K -.-> L[Triage & Deep Research<br/>分诊 / 深入研究]
 ```
 
 当前采集链路采用 Fail Closed（失败时关闭下游）：只有通过质量门槛的内容才能进入可信 Snapshot 和页面变化检测。交互页面还需要确认控件可见、状态可验证且没有导航、下载或新窗口等副作用，再从其实际控制的局部范围采集状态。
 
-Interactive State Traversal 已能够自动编排安全 Tab 状态并形成父→子语义路径，但这些 Interactive States 尚未写入正式 Snapshot，也尚未进入 State-aware Change Detection。
+Interactive State Traversal 已能够自动编排安全 Tab 状态并形成父→子语义路径。可比较状态及遍历完整性信息会写入正式 Snapshot，并通过精确 `state_key` 匹配进入 State-aware Change Detection 和 Contextual State Diff；这些结果仍是网页交互状态的观察变化，不等同于后续的 Product State（产品状态）或 Competition Event（竞争事件）。
 
 ## 当前已实现能力
 
@@ -216,6 +218,10 @@ Interactive State Traversal 已能够自动编排安全 Tab 状态并形成父�
 - Traversal Bounds（遍历边界）：限制嵌套深度、单组可操作选项和单页非默认状态数量，并记录截断、跳过和恢复结果。
 - Nested State Content Ownership（嵌套状态内容归属）：子状态独立拥有其 Local Scope 内容；父节点排除已建模子范围，没有独立内容时明确标记为不可比较的导航节点。
 - Restore & Failure Isolation（恢复与失败隔离）：退出子层后先恢复子组，再恢复父组；关键恢复失败或出现导航、窗口、下载风险时中止整页遍历。
+- Interactive State Snapshot（交互状态快照）：将可比较的 Interactive States 及 Traversal（遍历）完整性信息保存进正式 Snapshot，并使用独立 Schema Version（结构版本）保护历史兼容性。
+- State Matching（状态匹配）：V1 按完全相同的 `state_key` 精确匹配前后状态，不对语义标题改名进行模糊推断。
+- State-aware Change Detection（状态感知变化检测）：结合状态哈希、`comparison_eligible` 和前后遍历完整性，区分 baseline、unchanged、modified、current-only、previous-only 及不确定状态。
+- Contextual State Diff（上下文状态差异）：仅对可比较且已修改的同一状态生成详细差异，保留状态路径、卡片标题、段落、列表、表格和文本标记等结构上下文。
 
 ### 质量保障
 
@@ -227,12 +233,11 @@ Interactive State Traversal 已能够自动编排安全 Tab 状态并形成父�
 
 以下模块属于已确定的产品方向，但不能视为当前仓库已经完成：
 
-- State-aware Change Detection（状态感知变化检测）及 Interactive State 历史持久化
 - 长期 Source Health（来源健康监控）与采集调度
 - Product Profile（产品画像）与 Current Focus（当前关注重点）
 - Public Search（公开搜索补漏与新来源发现）
 - LLM Event Detection（大语言模型竞争事件识别）
-- Evidence 数据模型、证据聚合、冲突处理与核验
+- Evidence Verification（证据核验），包括证据数据模型、聚合、冲突处理与核验
 - 跨页面 Content Deduplication（内容去重）
 - Event Deduplication（事件去重）
 - Ranking / Triage（排序 / 分诊）
@@ -309,11 +314,11 @@ python backend/page_reader.py "https://example.com"
 python backend/page_reader.py "https://example.com" --timeout 5
 ```
 
-程序优先进行静态采集，并在符合条件时使用浏览器兜底或补充采集。质量检查通过后，会在 `data/snapshots/` 保存 UTF-8 JSON Snapshot，并输出当前快照、上一快照、内容哈希、页面变化状态和 Diff。
+程序优先进行静态采集，并在符合条件时使用浏览器兜底或补充采集。质量检查通过后，会在 `data/snapshots/` 保存 UTF-8 JSON Snapshot，并输出当前快照、上一快照、内容哈希、页面变化状态和 Diff。对于通过安全规则发现的交互页面，正式链路还会保存 Interactive States，并独立输出状态匹配、State-aware Change Detection 和 Contextual State Diff 结果。
 
 首次采集没有可比较历史，`changed` 为 `null`；抽取版本变化时也会跳过直接比较并返回明确原因。采集失败时，程序向标准错误输出结构化错误并返回非零退出码。
 
-`backend/page_reader.py` 是当前 Monitoring 页面链路的命令行入口，不代表完整产品的最终交互形态；Interactive State Traversal 当前是独立生产能力，尚未接入正式 Snapshot 和状态感知变化检测。
+`backend/page_reader.py` 是当前 Monitoring 页面链路的命令行入口，不代表完整产品的最终交互形态。Interactive State Traversal、Snapshot、State Matching 和 State-aware Change Detection 已接入该正式扫描链路。
 
 ### 4. 运行自动化测试
 
@@ -355,6 +360,7 @@ docs/         开发路线图和当前迭代文档
 
 - [Development Roadmap（开发路线图）](docs/development-roadmap.md)
 - [Current Sprint（当前迭代）](docs/current-sprint.md)
+- [Stage 1 Final Acceptance Record（阶段一最终验收记录）](docs/stage1_acceptance.md)
 - [AGENTS.md（项目开发规范）](AGENTS.md)
 
 ## 当前边界
@@ -362,7 +368,7 @@ docs/         开发路线图和当前迭代文档
 - 当前系统处理公开网页来源，不绕过登录、权限、验证码或站点访问限制。
 - 浏览器交互只覆盖可发现、可验证、可恢复且无明显副作用的标准安全 Tab 场景，不执行表单提交、购买、下载或不可逆操作。
 - Interactive State Traversal 当前最多处理两层嵌套，并限制单组可操作选项和单页非默认状态数量；达到边界会明确记录截断，不把未遍历状态解释为缺失。
-- 当前 Change Detection 仍以标准化页面内容为基础；Interactive State 尚未持久化，也尚未形成 State-aware Change Detection、Product State 或 Competition Event。
+- 当前已同时支持页面级变化检测和 Interactive State 的状态感知变化检测；后者仍是基于精确 `state_key`、内容哈希与遍历完整性的网页观察比较，不等同于 Product State、State Transition 或 Competition Event 的业务判断。
 - 当前命令行输出服务于 Monitoring 链路开发和验证，尚未提供完整产品界面、事件中心或研究工作台。
 
 项目现阶段先建立可靠、可追溯、可比较的 Monitoring 数据基础，再在其上实现可评测的事件识别、Triage 和 Deep Research，避免模型直接在不完整或不可验证的输入上生成竞争结论。
