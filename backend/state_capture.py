@@ -109,11 +109,15 @@ def capture_interactive_state(
     tab_group: dict[str, Any],
     safe_click_result: dict[str, Any],
     local_scope_result: dict[str, Any],
+    *,
+    excluded_runtime_paths: list[list[str]] | None = None,
+    allow_empty_blocks: bool = False,
 ) -> dict[str, Any]:
     """采集一次已验证交互状态的 Local Scope，生成可信 Interactive State。
 
     输入：当前 Playwright Page、点击前由 3A 发现的 Tab Group、3B 安全点击成功结果，
-    以及 3C-1 Local Scope 成功结果。
+    以及 3C-1 Local Scope 成功结果。Nested Traversal 可以额外传入已经由子 State 拥有
+    的 Local Scope 路径；普通 3C-2 调用无需提供。
     处理：再次用 3A 确认当前语义状态；只读取 Local Scope 的渲染可见 DOM；复用现有
     噪声清理、Structured Blocks、Group/Card 和 DOM 去重；最后对规范 blocks JSON 计算
     SHA-256，并生成带时区采集时间。
@@ -169,7 +173,11 @@ def capture_interactive_state(
         )
 
     try:
-        visible_scope = extract_visible_scope_html(page, runtime_dom_path)
+        visible_scope = extract_visible_scope_html(
+            page,
+            runtime_dom_path,
+            excluded_runtime_paths=excluded_runtime_paths,
+        )
         soup = BeautifulSoup(visible_scope["html"], "html.parser")
         blocks, _ = build_structured_content(soup)
     except BrowserReadError as exc:
@@ -181,7 +189,7 @@ def capture_interactive_state(
             f"Could not extract Structured Blocks from Local Scope: {exc}",
         )
 
-    if not blocks:
+    if not blocks and not allow_empty_blocks:
         return _failure(
             "state_blocks_unavailable",
             "Local Scope did not produce any usable Structured Blocks.",
@@ -211,6 +219,7 @@ def capture_interactive_state(
             "computed_text_mark_count": visible_scope[
                 "computed_text_mark_count"
             ],
+            "excluded_scope_count": visible_scope.get("excluded_scope_count", 0),
             "block_count": len(blocks),
         },
     }

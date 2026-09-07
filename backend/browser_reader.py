@@ -130,7 +130,7 @@ VISIBLE_DOM_EXTRACTION_SCRIPT = """
 # State Capture 只需要 Local Scope，而不是全页 HTML。这里在内存中克隆已经解析出的局部
 # 子树，再从克隆中删除隐藏节点；真实页面 DOM 不会被改写，因此不会影响后续安全交互。
 VISIBLE_SCOPE_EXTRACTION_SCRIPT = """
-({ scopeDomPath }) => {
+({ scopeDomPath, excludedDomPaths }) => {
 """ + _RENDERED_VISIBILITY_HELPERS_SCRIPT + """
     if (!Array.isArray(scopeDomPath) || scopeDomPath.length === 0) {
         return { error: "local_scope_runtime_locator_invalid" };
@@ -152,11 +152,32 @@ VISIBLE_SCOPE_EXTRACTION_SCRIPT = """
     const clonedElements = [clone, ...clone.querySelectorAll("*")];
     const enrichment = enrichRenderedClone(sourceElements, clonedElements);
 
+    // Nested Traversal 只把已经由子 State 独立建模的 Local Scope 从父范围克隆中移除。
+    // 路径必须真实位于父 scope 内；页面其他区域或无效路径不会影响父内容。删除仍只作用
+    // 于 clone，不会改变浏览器真实 DOM，也不会干扰后续 Restore。
+    let excludedScopeCount = 0;
+    (Array.isArray(excludedDomPaths) ? excludedDomPaths : []).forEach((path) => {
+        if (!Array.isArray(path) || path.length === 0) {
+            return;
+        }
+        const excludedSource = document.querySelector(path.join(" > "));
+        if (!excludedSource || excludedSource === scope || !scope.contains(excludedSource)) {
+            return;
+        }
+        const sourceIndex = sourceElements.indexOf(excludedSource);
+        const excludedClone = sourceIndex >= 0 ? clonedElements[sourceIndex] : null;
+        if (excludedClone && excludedClone.parentNode) {
+            excludedClone.remove();
+            excludedScopeCount += 1;
+        }
+    });
+
     return {
         error: null,
         html: clone.outerHTML,
         hidden_element_count: enrichment.hiddenElementCount,
         computed_text_mark_count: enrichment.computedTextMarkCount,
+        excluded_scope_count: excludedScopeCount,
     };
 }
 """
@@ -179,15 +200,20 @@ class BrowserReadError(Exception):
 
 
 def extract_visible_scope_html(
-    page: Any, runtime_dom_path: list[str]
+    page: Any,
+    runtime_dom_path: list[str],
+    *,
+    excluded_runtime_paths: list[list[str]] | None = None,
 ) -> dict[str, Any]:
     """读取 Local Scope 当前可见 DOM，同时保持真实页面不变。
 
     在业务链路中的职责：为 State Capture 提供与浏览器全页采集一致的可见性过滤结果，
     但只返回 Local Scope，不把页面其他区域交给 Structured Blocks。
 
-    输入：当前 Playwright Page，以及 3C-1 Resolver 返回的运行时 DOM 分段路径。
-    处理：在浏览器内定位范围、克隆子树，并复用全页采集的隐藏节点规则清理克隆。
+    输入：当前 Playwright Page、3C-1 Resolver 返回的运行时 DOM 分段路径，以及可选的
+    已由嵌套子 State 独立拥有的 Local Scope 路径。
+    处理：在浏览器内定位范围、克隆子树，复用全页可见性规则清理克隆；随后仅从克隆中
+    排除确认位于父范围内的子范围。
     输出：UTF-8 HTML bytes 和隐藏节点计数；定位无效或浏览器执行失败时抛出稳定的
     BrowserReadError。DOM 路径只用于本次定位，不进入返回 HTML 或内容身份。
     """
@@ -199,10 +225,25 @@ def extract_visible_scope_html(
             "Local Scope runtime DOM path must be a non-empty string list.",
         )
 
+    excluded_paths = excluded_runtime_paths or []
+    if not isinstance(excluded_paths, list) or any(
+        not isinstance(path, list)
+        or not path
+        or not all(isinstance(part, str) and part for part in path)
+        for path in excluded_paths
+    ):
+        raise BrowserReadError(
+            "excluded_scope_runtime_locator_invalid",
+            "Excluded Local Scope paths must be non-empty string lists.",
+        )
+
     try:
         result = page.evaluate(
             VISIBLE_SCOPE_EXTRACTION_SCRIPT,
-            {"scopeDomPath": list(runtime_dom_path)},
+            {
+                "scopeDomPath": list(runtime_dom_path),
+                "excludedDomPaths": [list(path) for path in excluded_paths],
+            },
         )
     except (PlaywrightError, OSError) as exc:
         raise BrowserReadError(
@@ -232,6 +273,7 @@ def extract_visible_scope_html(
         "computed_text_mark_count": int(
             result.get("computed_text_mark_count", 0)
         ),
+        "excluded_scope_count": int(result.get("excluded_scope_count", 0)),
     }
 
 
