@@ -45,6 +45,45 @@ class McpServerTests(unittest.IsolatedAsyncioTestCase):
             },
         )
 
+    async def test_tool_descriptions_keep_implementation_details_out_of_model_context(
+        self,
+    ) -> None:
+        """工具描述属于模型输入，只保留模型选择工具所需的业务语义。"""
+        async with Client(mcp, raise_exceptions=True) as client:
+            response = await client.list_tools()
+
+        tools = {tool.name: tool for tool in response.tools}
+        search_description = tools["web_search"].description or ""
+        page_description = tools["read_page"].description or ""
+
+        for implementation_detail in (
+            "WSA_API_KEY",
+            ".env",
+            "Bearer",
+            "腾讯云",
+            "Tencent",
+            "WSA",
+            "Provider",
+            "供应商",
+        ):
+            self.assertNotIn(implementation_detail.casefold(), search_description.casefold())
+
+        for business_term in ("搜索", "网址", "摘要", "read_page"):
+            self.assertIn(business_term.casefold(), search_description.casefold())
+
+        for implementation_detail in (
+            "Stage 1",
+            "backend",
+            "page_reader",
+            "acquire_page_with_browser_fallback",
+            "Playwright",
+            "BeautifulSoup",
+        ):
+            self.assertNotIn(implementation_detail.casefold(), page_description.casefold())
+
+        for business_term in ("读取", "URL", "主要文本", "质量状态"):
+            self.assertIn(business_term.casefold(), page_description.casefold())
+
     async def test_web_search_tool_call_uses_provider_contract(self) -> None:
         with patch("source_discovery.mcp_server._search_provider", _MockSearchProvider()):
             async with Client(mcp, raise_exceptions=True) as client:

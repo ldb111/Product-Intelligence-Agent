@@ -17,10 +17,10 @@ _search_provider: SearchProvider = TencentWsaSearchProvider()
 
 @mcp.tool()
 def web_search(query: str, limit: int = 5) -> SearchResponse:
-    """搜索公开网页并返回标题、网址和摘要。
+    """搜索公开网页，发现与查询词相关的候选页面。
 
-    输入为搜索词和最大结果数；返回供应商无关的结构化结果。当前供应商需要配置
-    ``WSA_API_KEY``，且最多返回 50 条；本工具只搜索，不读取结果页面正文。
+    输入为搜索词和最大结果数；返回每个候选页面的标题、网址和摘要。本工具只负责
+    搜索和发现页面，不读取页面正文；需要查看某个结果的完整内容时，应使用 read_page。
     """
     try:
         return _search_provider.search(query, limit)
@@ -32,8 +32,8 @@ def web_search(query: str, limit: int = 5) -> SearchResponse:
 def read_page(url: str) -> ReadPageResult:
     """读取一个公开网页并返回可信的主要文本与标题。
 
-    输入为 HTTP/HTTPS URL；返回 Stage 1 采集方式、质量状态和精简页面内容。工具复用
-    已冻结的 Stage 1，可能启动浏览器；不会保存 Snapshot，也不会执行历史变化比较。
+    输入为一个明确的 HTTP/HTTPS URL；返回请求网址、最终网址、标题、主要文本、页面
+    标题列表、采集方式和质量状态。本工具只读取指定页面，不负责搜索其他候选页面。
     """
     try:
         return read_page_for_discovery(url)
