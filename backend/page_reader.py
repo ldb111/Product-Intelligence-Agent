@@ -343,13 +343,14 @@ def read_page(
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
     *,
     include_interaction_signals: bool = False,
+    include_source_html: bool = False,
 ) -> dict[str, Any]:
     """串联 URL 校验、网页请求和 HTML 解析，生成一次完整的网页读取结果。
 
     在整个链路中的职责：作为 Task 1 的业务入口，按固定顺序组织三个步骤，确保调用者
     不会漏掉 URL 校验或状态码检查，也让命令行和未来的其他调用方复用相同行为。
 
-    输入：URL、可选超时，以及仅供采集编排使用的交互信号开关。
+    输入：URL、可选超时，以及仅供采集编排使用的交互信号和原始 HTML 开关。
     处理：先检查 timeout，再校验 URL、获取 HTML、提取标题、blocks 和兼容页面文本；
     开关启用时额外检查原始静态 DOM 的标准 ARIA Tab 信号。
     输出：页面原有字段，以及 requested_url、final_url、acquisition_method 审计字段。
@@ -373,11 +374,18 @@ def read_page(
         # 下划线字段只在 acquire_page_with_browser_fallback 内部短暂使用并立即移除，默认
         # read_page 输出及 Snapshot 结构不会因此变化。
         page_result["_interaction_signals"] = detect_static_interaction_signals(html)
+    if include_source_html:
+        # Source Discovery 需要从同一次真实采集的 DOM 补充 nav/footer 链接。该私有字段
+        # 只在 acquire_page_with_browser_fallback 内部传递，默认 read_page 输出不变。
+        page_result["_source_html"] = html
     return page_result
 
 
 def acquire_page_with_browser_fallback(
-    url: str, timeout: float = DEFAULT_TIMEOUT_SECONDS
+    url: str,
+    timeout: float = DEFAULT_TIMEOUT_SECONDS,
+    *,
+    include_source_html: bool = False,
 ) -> dict[str, Any]:
     """执行“静态优先、质量不合格时浏览器兜底”的完整采集决策。
 
@@ -386,7 +394,8 @@ def acquire_page_with_browser_fallback(
     WARNING/FAIL、可恢复的静态请求错误，或 PASS 页面出现标准 Tab 信号时，改用
     browser_reader 获取默认可见 DOM，复用同一 Structured Blocks 和 Quality Gate。
     输出：选中的 page_data、最终 quality_gate、静态/浏览器质量结果，以及可选的静态
-    采集错误审计信息。
+    采集错误审计信息。Source Discovery 显式请求时，额外返回同一次采集的 source_html；
+    默认调用没有该字段，不改变正式扫描和 Snapshot 数据。
 
     本函数只选择可信采集结果，不创建或保存 Snapshot。浏览器结果仍不合格时也会返回，
     由 main 在 create_snapshot 之前统一 Fail Closed。
@@ -398,7 +407,10 @@ def acquire_page_with_browser_fallback(
 
     try:
         static_page_data = read_page(
-            url, timeout, include_interaction_signals=True
+            url,
+            timeout,
+            include_interaction_signals=True,
+            include_source_html=include_source_html,
         )
     except PageReadError as exc:
         if exc.error_type not in RECOVERABLE_STATIC_ERROR_TYPES:
@@ -415,6 +427,7 @@ def acquire_page_with_browser_fallback(
         requested_url = validate_url(url)
     else:
         raw_signals = static_page_data.pop("_interaction_signals", [])
+        source_html = static_page_data.pop("_source_html", None)
         if isinstance(raw_signals, list):
             static_interaction_signals = [str(signal) for signal in raw_signals]
         requested_url = static_page_data["requested_url"]
@@ -425,7 +438,7 @@ def acquire_page_with_browser_fallback(
             static_quality["downstream_allowed"]
             and not static_interaction_signals
         ):
-            return {
+            result = {
                 "page_data": static_page_data,
                 "quality_gate": static_quality,
                 "static_quality_gate": static_quality,
@@ -436,6 +449,9 @@ def acquire_page_with_browser_fallback(
                 # 无浏览器安全交互就没有 Traversal；None 不会被写成零状态 schema。
                 "traversal_result": None,
             }
+            if include_source_html and isinstance(source_html, bytes):
+                result["source_html"] = source_html
+            return result
         browser_trigger_reason = (
             "interactive_structure"
             if static_quality["downstream_allowed"]
@@ -463,7 +479,7 @@ def acquire_page_with_browser_fallback(
     browser_quality = evaluate_content_quality(
         browser_page_data["content"], browser_page_data["blocks"]
     )
-    return {
+    result = {
         "page_data": browser_page_data,
         "quality_gate": browser_quality,
         "static_quality_gate": static_quality,
@@ -473,6 +489,9 @@ def acquire_page_with_browser_fallback(
         "browser_trigger_reason": browser_trigger_reason,
         "traversal_result": browser_capture.get("traversal_result"),
     }
+    if include_source_html:
+        result["source_html"] = browser_capture["html"]
+    return result
 
 
 def build_parser() -> argparse.ArgumentParser:

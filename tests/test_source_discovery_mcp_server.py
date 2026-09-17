@@ -40,6 +40,7 @@ class McpServerTests(unittest.IsolatedAsyncioTestCase):
                 "title",
                 "main_content",
                 "headings",
+                "links",
                 "acquisition_method",
                 "quality_status",
             },
@@ -104,6 +105,7 @@ class McpServerTests(unittest.IsolatedAsyncioTestCase):
             "title": "Example",
             "main_content": "Product information",
             "headings": ["Overview"],
+            "links": [{"anchor_text": "Pricing", "href": "/pricing"}],
             "acquisition_method": "static",
             "quality_status": "PASS",
         }
