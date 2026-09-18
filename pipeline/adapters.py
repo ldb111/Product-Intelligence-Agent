@@ -1,0 +1,152 @@
+"""真实模块的薄适配：没有新模型、提示词、检索算法或事件判定规则。"""
+
+from dataclasses import asdict
+from pathlib import Path
+from urllib.parse import urlsplit
+
+from backend.page_reader import acquire_page_with_browser_fallback
+from backend.snapshot import create_snapshot
+from backend.state_matching import match_interactive_states
+from event_core import deduplicate_event, detect_event
+from event_core.inputs import build_explicit_statement_input, build_state_comparison_input
+from knowledge import KnowledgeIngestor, KnowledgeRetriever, KnowledgeStore
+from knowledge.inputs import event_documents, own_product_file
+from llm.retrieval_models import get_embedding, get_rerank
+from memory import MemoryRetriever, MemoryStore, MemoryWriter
+from memory.policy import contains_secret
+from research.agent import ResearchAgent
+from research.tools import ResearchTools
+from source_discovery.agent import run_source_discovery
+from source_discovery.search.tencent_wsa import TencentWsaSearchProvider
+from triage.workflow import TriageWorkflow
+
+from .store import identity
+
+
+class ModuleAdapters:
+    """只提供与真实公共函数一一对应的操作，测试可替换外部调用。"""
+
+    def __init__(self, directory: str | Path, product):
+        self.directory = Path(directory)
+        self.product = product
+        self.product_id = identity(product.workspace_id)
+        self.competitor_id = identity([product.workspace_id, product.competitor_name])
+        self.knowledge_path = self.directory / (self.product_id + ".knowledge.sqlite3")
+        self.memory_path = self.directory / (self.product_id + ".memory.sqlite3")
+
+    @property
+    def scope(self):
+        return dict(product_id=self.product_id, competitor_id=self.competitor_id,
+                    memory_scope="workspace", memory_scope_id=self.product.workspace_id)
+
+    def store_references(self) -> dict:
+        """两知识域共用冻结的分域知识库，Memory 独立；地址仅存内部状态。"""
+        return {"own_product_knowledge": str(self.knowledge_path), "competitor_knowledge": str(self.knowledge_path),
+                "memory": str(self.memory_path)}
+
+    async def discover(self):
+        return await run_source_discovery(self.product.competitor_name, self.product.official_url,
+                                          self.product.additional_urls)
+
+    def scan(self, url: str) -> dict:
+        """真实采集并执行冻结 Quality Gate，通过后才调用正式快照构造器。"""
+        result = acquire_page_with_browser_fallback(url)
+        if not result["quality_gate"]["downstream_allowed"]:
+            raise ValueError("页面质量不允许进入后续流程。")
+        return create_snapshot(result["page_data"], traversal_result=result.get("traversal_result"))
+
+    def detection_inputs(self, history: dict, source: dict) -> list:
+        """复用页面及交互状态适配器；首次扫描由上层跳过，不让模型决定基线资格。"""
+        final_host = urlsplit(history["current_snapshot"]["final_url"]).hostname
+        official_hosts = source.get("official_domains", [urlsplit(source["url"]).hostname])
+        credibility = "official" if source["credibility"] == "official" and final_host in official_hosts else "unverified"
+        args = dict(competitor=self.product.competitor_name, source_type=source["source_type"],
+                    source_credibility=credibility)
+        page = build_state_comparison_input(history, **args)
+        inputs = [] if page.state_context.comparison_status == "unchanged" else [page]
+        states = match_interactive_states(history)
+        for change in states["state_changes"]:
+            if change["change_type"] != "unchanged":
+                inputs.append(build_state_comparison_input(history, state_key=change["state_key"], **args))
+        return inputs
+
+    def detect(self, data):
+        return detect_event(data)
+
+    def deduplicate(self, candidate, existing):
+        return deduplicate_event(candidate, existing)
+
+    def ingest_own(self) -> dict:
+        """仅接收明确提供的文件，通过原入库入口处理；空列表不创建模型请求。"""
+        results, runtime = [], []
+        if not self.product.own_product_documents:
+            return {"results": results, "runtime": runtime}
+        ingestor = KnowledgeIngestor(KnowledgeStore(self.knowledge_path), get_embedding())
+        for path in self.product.own_product_documents:
+            document = own_product_file(path, document_id="own:" + identity([self.product_id, str(Path(path).resolve())]),
+                                        product_id=self.product_id, title="自身产品资料：" + Path(path).name,
+                                        source_type="product_document")
+            if contains_secret(document.content):
+                raise ValueError("产品资料含认证信息。")
+            results.append(ingestor.ingest(document).model_dump(mode="json"))
+            runtime.extend(asdict(r) for r in ingestor.last_runtime)
+        return {"results": results, "runtime": runtime}
+
+    def ingest_event(self, event) -> dict:
+        """仅将正式确认的原始 Event/Evidence 交给已有知识入口；研究结果不具备此入口。"""
+        ingestor = KnowledgeIngestor(KnowledgeStore(self.knowledge_path), get_embedding())
+        results, runtime = [], []
+        for document in event_documents(event, competitor_id=self.competitor_id,
+                                         source_reference="event:" + event.candidate_id):
+            results.append(ingestor.ingest(document).model_dump(mode="json"))
+            runtime.extend(asdict(r) for r in ingestor.last_runtime)
+        return {"results": results, "runtime": runtime}
+
+    def readers(self):
+        """每个调用复用既有角色入口和正式检索器；没有第二套 RAG 或 Memory 算法。"""
+        embedding = get_embedding()
+        return (KnowledgeRetriever(KnowledgeStore(self.knowledge_path), embedding, get_rerank()),
+                MemoryRetriever(MemoryStore(self.memory_path), embedding))
+
+    def triage(self, event):
+        knowledge, memory = self.readers()
+        output = TriageWorkflow(knowledge=knowledge, memory=memory, **self.scope).run(
+            event, product_profile=self.product.product_profile, current_focus=self.product.current_focus)
+        return {**output, "result": output["result"].model_dump()}
+
+    def research(self, event, mode, triage_result, official_hosts):
+        knowledge, memory = self.readers()
+        tools = ResearchTools(knowledge=knowledge, memory=memory, search=TencentWsaSearchProvider(),
+                              official_hosts=frozenset(official_hosts), **self.scope)
+        return ResearchAgent(tools).run(event, mode=mode, triage_result=triage_result,
+                                        current_focus=self.product.current_focus)
+
+    def verification_inputs(self, candidate, verification) -> list:
+        """把核验的新官方原文送回 Event Core，绝不把 decision 字符串直接改成 confirmed Event。
+
+        新证据必须有真实观察时间。每条引用仍属于一个来源；不拼接跨页正文，不复用
+        Research 的 reason 作为产品事实。正式检测若未确认，上层保留原候选等待处理。
+        """
+        citations = {c["result_id"]: c for c in verification["citations"]}
+        inputs = []
+        for support in verification["result"]["support"]:
+            item = citations[support["result_id"]]
+            if item["credibility"] != "official":
+                continue
+            if not item.get("url") or not item.get("observed_at"):
+                raise ValueError("核验证据缺少正式事件入口需要的来源或观察时间。")
+            snapshot = {"content": item["content"], "final_url": item["url"], "title": item["title"],
+                        "captured_at": item["observed_at"]}
+            inputs.append(build_explicit_statement_input(snapshot, support["excerpt"],
+                competitor=candidate.competitor, source_type="verified_statement", source_credibility="official"))
+        if not inputs:
+            raise ValueError("没有可交给 Event Core 的官方新原文。")
+        return inputs
+
+    def remember_explicit(self, text: str) -> dict:
+        """只有调用方另行明确要求记住时使用；普通 current_focus 和 Research 输出不会调用。"""
+        writer = MemoryWriter(MemoryStore(self.memory_path), get_embedding())
+        result = writer.remember_explicit(scope="workspace", scope_id=self.product.workspace_id,
+            memory_type="focus", memory_key="research_focus", content=text, source_text=text,
+            source_reference="user:" + identity([self.product.workspace_id, text]))
+        return {"result": result.model_dump(mode="json"), "runtime": [asdict(r) for r in writer.last_runtime]}
