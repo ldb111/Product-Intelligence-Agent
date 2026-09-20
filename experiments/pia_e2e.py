@@ -55,7 +55,7 @@ async def run(args, public: dict, audit: dict) -> None:
     """只执行规定的两个案例；不把历史回放冒充完整重新发现/扫描产生的新事件。
 
     Baseline 页面通过已有 FixtureHandler 提供，真实走冻结采集器和质量门槛。
-    Case B 复用已 PASS 的官方 Event，所有检索、分诊和研究模型请求均为本轮真实调用。
+    Case B 复用已 PASS 的官方 Event；先完成分诊 recommendation，再模拟用户显式研究。
     关注记忆的写入是明确的模拟用户操作，研究结果不会触发写入。
     """
     pipeline = ProductPipeline(args.state_dir)
@@ -111,24 +111,43 @@ async def run_main(args, pipeline, public, audit):
     audit["stage"] = "confirmed_event_to_product_result"
     save_json(args.audit, audit)
     output = await pipeline.run_events(config, [event], provenance="archived-event:" + content_hash(raw))
-    finish_main(output, public, audit)
+    finish_main(output, public, audit, pipeline, config)
 
 
-def finish_main(output, public, audit):
-    """检查实际路由和调用资格；分诊未选 research 时明确验收未满足，不强制改路由。"""
+def finish_main(output, public, audit, pipeline, config):
+    """分三阶段验收 recommendation、显式 Research 和 completed 幂等复用。"""
     product = output["product"]
+    event_id = product["detected_events"][0]["event_id"] if product["detected_events"] else None
+    phase_a = (product["status"] == "complete" and event_id is not None
+               and any(t["result"]["decision"] == "research" for t in product["triage_results"])
+               and product["research_actions"] and product["research_actions"][0]["status"] == "not_started"
+               and not product["research_results"])
+    explicit = pipeline.start_research(config, event_id) if event_id else {"product": {"accepted": False}, "audit": {}}
+    phase_b = (explicit["product"].get("accepted") is True
+               and explicit["product"]["research"]["status"] == "completed"
+               and bool(explicit["product"]["research"].get("result")))
+    repeated = pipeline.start_research(config, event_id) if event_id else {"product": {"accepted": False}, "audit": {}}
+    phase_c = (repeated["product"].get("accepted") is True
+               and repeated["product"]["research"]["status"] == "completed"
+               and repeated["audit"].get("reused") is True)
     public.update({"competitor": product["competitor"], "event": product["detected_events"],
-                   "triage": product["triage_results"], "research": product["research_results"],
+                   "triage": product["triage_results"], "research_recommendation": product["research_actions"],
+                   "research": explicit["product"].get("research"),
                    "citations": product["citations"], "uncertainties": product["uncertainties"],
-                   "pipeline_stages": product["pipeline_stages"], "product": product})
+                   "phases": {"recommendation": phase_a, "explicit_start": phase_b,
+                              "completed_reuse": phase_c}, "product": product})
     audit["main"] = {"run_id": output["run_id"], **output["audit"]}
-    audit["metrics"] = runtime_metrics(output["audit"])
+    if explicit["audit"].get("artifact") or "explicit_research" not in audit:
+        audit["explicit_research"] = explicit["audit"]
+    metric_audit = {"steps": output["audit"]["steps"], "artifacts": dict(output["audit"]["artifacts"])}
+    if audit["explicit_research"].get("artifact"):
+        metric_audit["artifacts"]["explicit_research"] = audit["explicit_research"]["artifact"]
+    audit["metrics"] = runtime_metrics(metric_audit)
     artifacts = output["audit"]["artifacts"]
     triage = next((v for k, v in artifacts.items() if k.startswith("triage:")), None)
     context = triage.get("context", {}) if triage else {}
     knowledge = context.get("knowledge_context", {})
-    passed = (product["status"] == "complete" and bool(product["research_results"])
-              and any(t["result"]["decision"] == "research" for t in product["triage_results"])
+    passed = (phase_a and phase_b and phase_c
               and knowledge.get("own_product", {}).get("results") and knowledge.get("competitor", {}).get("results")
               and context.get("memory_context", {}).get("results")
               and {"reasoning", "research", "embedding", "rerank"} <= set(audit["metrics"]["roles"]))
@@ -170,7 +189,8 @@ async def main() -> int:
                 identity([baseline_config.workspace_id, baseline_config.competitor_name]), None).model_dump()
             if args.resume_run:
                 result = await pipeline.resume(args.resume_run)
-                finish_main(result, public, audit)
+                run_config = ProductInput.model_validate(pipeline.store.get("runs", args.resume_run)["product"])
+                finish_main(result, public, audit, pipeline, run_config)
             else:
                 baseline = public.get("baseline", {})
                 if baseline.get("status") != "complete" or not baseline.get("baseline_created"):

@@ -14,7 +14,8 @@
 ```text
 ProductInput → 配置 → Source Discovery / 已确认来源
   → Stage 1 → Snapshot → 首次 Baseline / 后续 Contextual Diff
-  → Event Core → confirmed: Triage → research / monitor / no_action
+  → Event Core → confirmed: Triage → recommendation / monitor / no_action
+                               → 用户显式 start_research → Deep Research
                → uncertain: Verification → 正式检测 / 结束 / Pending
   → ProductResult + 独立 Audit
 ```
@@ -29,10 +30,10 @@ ProductInput → 配置 → Source Discovery / 已确认来源
 | `pipeline/schemas.py` | 统一输入、产品结果、受控错误类别 |
 | `pipeline/store.py` | SQLite 状态及原子快照历史 |
 | `pipeline/adapters.py` | 冻结模块的薄适配 |
-| `pipeline/orchestrator.py` | 显式流程、路由、恢复、任务级去重 |
-| `pipeline/output.py` | 用户字段投影、引用命名空间、内部信息隔离 |
-| `tests/test_pipeline.py` | 36 项集成控制测试 |
-| `experiments/pia_e2e.py` | 一条 Baseline + 一条真实事件后半链路及恢复入口 |
+| `pipeline/orchestrator.py` | 显式流程、路由、恢复、任务级去重及用户触发 Research 生命周期 |
+| `pipeline/output.py` | 产品级 Event 标识、用户字段投影、引用命名空间、内部信息隔离 |
+| `tests/test_pipeline.py` | 51 项集成控制测试 |
+| `experiments/pia_e2e.py` | Baseline + 真实事件 recommendation / 显式 Research / 幂等复用验收入口 |
 | `docs/final_integration_v0.1.md` | 本实现报告 |
 
 `experiments/output/` 中的真实运行 JSON、审计和数据库是本地验收产物，受既有忽略规则保护，不属于交付文件。
@@ -41,7 +42,7 @@ ProductInput → 配置 → Source Discovery / 已确认来源
 
 `ProductInput` 支持 workspace_id、competitor_name、可选 official_url / additional_urls / product_profile / current_focus / own_product_documents。无需填写 event_id、candidate_id、chunk_id 或 memory_id。
 
-工作区保存配置及三个 store 引用；来源保存已确认 URL 与官方域资格；快照保存当前及上一份引用；事件、Pending、分诊与研究分别保存；运行记录关联本次产物。内部键由程序生成。
+工作区保存配置及三个 store 引用；来源保存已确认 URL 与官方域资格；快照保存 observed/processed 引用；事件、Pending、分诊与研究生命周期分别保存。产品使用由 confirmed Event 业务事实生成的稳定 `evt_...` 标识；内部 candidate、artifact 和 SQLite 键不进入产品结果。
 
 最小调用入口：
 
@@ -70,25 +71,32 @@ developer_audit = output["audit"]
 
 `run_events()` 是已有正式 Event/Evidence 的回放入口，要求标注 provenance；阶段中明确说明没有重新发现或采集。本轮真实 E2E 使用此入口，不冒充从零重新采集产生的新事件。
 
+Triage 的 `research` 只创建 `not_started` recommendation，主 Pipeline 正常完成且不会调用 Research Agent。用户另行调用 `start_research(product, event_id)` 后，程序从 SQLite 恢复同一 confirmed Event 与对应 Triage，才执行现有 `deep_research`。客户端不能指定模型、Prompt、工具轨迹或内部 candidate / artifact 键。
+
 ## 6. Baseline / Subsequent Scan
 
-扫描通过冻结 Quality Gate 后调用 `create_snapshot()`。快照和 latest 指针同事务保存，首次标记由程序确定；首次直接返回空候选，绝不调用 Event Detection。
+扫描通过冻结 Quality Gate 后调用 `create_snapshot()`。Snapshot 是不可回滚的真实观察历史：当前观察和 `observed_latest` 会立即保存；`processed_latest` 只表示最近已经完成事件判断、可安全用于下一次 State Comparison 的 Snapshot。每一组 previous/current 引用及处理状态保存在 `comparisons:<workspace>`，不需要修改冻结的 Stage 1 Snapshot Schema。
 
-后续复用 `build_state_comparison_input()` 和 `match_interactive_states()`，页面及变化的交互状态分别进入正式 Event Core。无变化不调用检测模型。重试同一次扫描复用原来的历史对，避免把当前快照当成自身历史。
+首次普通扫描仍只建立 Baseline，不调用 Event Detection，并原子推进 processed baseline。后续复用 `build_state_comparison_input()` 和 `match_interactive_states()`，页面及变化的交互状态分别进入正式 Event Core；unchanged 由 Event Core 的确定性边界生成 `no_event`，不会调用 LLM。只有 Event Core 完整返回 `event`、`no_event` 或 `uncertain` 后才推进 processed watermark；`uncertain` 会先保存 Pending Candidate。
+
+Event Detection 构造、调用或解析失败时，当前 Snapshot 仍保留在 observed history，comparison 保持 pending，processed baseline 保持 Previous。恢复同一 run 会复用原 Snapshot 和历史对；创建新 run 时仍以 processed baseline 比较当前页面，因此页面保持不变也会重新处理原来的 A → B。成功后 B 成为新 baseline，下一次 C 正确比较 B → C。
 
 ## 7. Event Routing
 
 | 输入/结果 | 后续行为 |
 | --- | --- |
 | confirmed event | 正式去重 → 原始证据入库 → Triage |
-| research | Deep Research，保存结果引用 |
+| research | 保存 recommendation 和 `not_started` 状态；不自动调用 Deep Research |
 | monitor / no_action | 保存分诊，不调用 Deep Research |
+| 用户显式 start_research | 校验 confirmed Event + research Triage 后执行单 Event Deep Research |
 | uncertain | Research Agent verification |
 | still_pending | 保留 Pending |
-| no_event | 结束该候选，保存已解决状态 |
-| verification event | 用新增官方引用原文和观察时间构造正式输入，重新调用 Event Core；仅正式 confirmed 事件进入后续链路 |
+| verification event / no_event | 都只代表核验证据方向；用新增官方引用原文和观察时间构造正式输入，重新调用 Event Core |
+| Event Core event | Candidate 标记 `resolved_event`，正式 Event 进入后续链路 |
+| Event Core no_event | Candidate 标记 `resolved_no_event`，不生成 Event |
+| Event Core uncertain / 正式输入不足 | Candidate 保持 Pending，不伪造否定结论 |
 
-核验结论不能直接改写候选状态。若正式检测未确认，则保留 Pending；不会循环核验直到成功。事件事实已确认但语义去重给出同一性 UNCERTAIN 时单独保留待处理，不把它伪装成事实不确定候选。
+Verification Agent / Research Agent 的自然语言 decision 不能直接改写正式 Event Truth。event 与 no_event 都必须携新官方原文进入 Event Core；只有 Event Core 的正式结果能解决 Candidate。证据不足、无法构造 DetectionInput 或正式结果仍 uncertain 时保留 Pending，且不会循环核验直到成功。事件事实已确认但语义去重给出同一性 UNCERTAIN 时单独保留待处理，不把它伪装成事实不确定候选。
 
 ## 8. Knowledge / Memory Integration
 
@@ -102,7 +110,9 @@ Structured State、Knowledge、Memory 分开。两知识域复用冻结 Knowledg
 
 简单 SQLite records 表保存命名空间、键与 JSON；每次操作提交并关闭连接。结构化运行、步骤、事件、产物引用可重新打开读取。
 
-成功步骤跳过，失败步骤可恢复；已完成运行直接返回保存结果。同一候选及相同输入上下文复用事件与研究产物。Knowledge 文档去重继续由冻结入库层负责，Integration 不新增入库规则。
+Snapshot 持久化区分 `observed_latest:<workspace>`、`processed_latest:<workspace>` 和 `comparisons:<workspace>`。Event Detection 失败后，observed Snapshot、未完成 comparison 和旧 processed baseline 都可在进程重启后恢复；Pending verification 继续保存在 `pending:<workspace>`。旧数据库无需修改 records 表：首次读取旧 `latest` 时结合既有 comparison/detection 检查点确定安全 baseline；旧格式 history 在恢复完成时补齐 comparison 元数据，不删除或回滚真实 Snapshot。
+
+成功步骤跳过，失败步骤可恢复；已完成运行直接返回保存结果。同一个 run 恢复不会重新扫描或重复创建 Snapshot，新 run 能恢复尚未处理的变化。Research 使用 `research_status:<workspace>` 独立持久化 `not_started/running/completed/failed`；completed 重复启动直接复用结果，failed 只有显式 retry 才重试。进程重启后遇到旧 process token 的 running 会标记为 `research_interrupted`，再由用户 retry。Knowledge 文档去重继续由冻结入库层负责，Integration 不新增入库规则。
 
 这是本地单进程任务级保护；不提供跨数据库事务或供应商请求的 exactly-once。外部请求完成而本地检查点尚未保存时崩溃，恢复可能再次请求。
 
@@ -110,21 +120,21 @@ Structured State、Knowledge、Memory 分开。两知识域复用冻结 Knowledg
 
 区分 configuration_error、source_discovery_error、scan_error、event_detection_error、retrieval_error、triage_error、research_error。配置和检索异常在相关步骤识别；失败保存阶段、异常类别和尝试次数，产品结果只给受控错误说明。
 
-已完成快照、事件、分诊保留，失败后不生成后续成功结果。多来源部分扫描失败时返回 partial。底层异常正文不进入产品输出。
+已完成快照、事件、分诊保留，失败后不生成后续成功结果。多来源部分扫描失败时返回 partial。用户触发的 Deep Research 失败只把独立 Research action 标为 failed，主 Pipeline、confirmed Event 和 Triage 继续保持 complete；底层异常正文不进入产品输出。
 
 ## 11. Product Output vs Audit
 
-ProductResult 包含 competitor、monitoring_sources、scan_status、baseline_created、detected_events、pending_candidates、triage_results、research_results、verification_results、citations、current_focus、uncertainties、pipeline_stages、status / error。
+ProductResult 包含 competitor、monitoring_sources、scan_status、baseline_created、带产品级 `event_id` 的 detected_events、带独立 `pending_id` 的 pending_candidates、triage_results、research_actions、completed research_results、verification_results、citations、current_focus、uncertainties、status / error。
 
-用户 JSON 投影允许的业务字段，排除 Provider、运行配置、SQLite 地址、源文件引用和原始工具轨迹；明显凭据及本机路径再做保守遮蔽。不同产物的局部引用 ID 加命名空间，避免合并后串引用。
+用户 JSON 排除 candidate_id、pipeline checkpoint、内部 artifact key、Provider、模型运行配置、SQLite 地址、源文件引用和原始工具轨迹；明显凭据及本机路径再做保守遮蔽。产品级 citation/result reference 保留，并使用产品 Event 或稳定展示分组限定命名空间，避免合并后串引用。
 
 审计单独保存真实步骤、模型运行数据和工具轨迹；不直接用作用户 Demo 数据。
 
 ## 12. Targeted Tests
 
-`python -X utf8 -m unittest tests.test_pipeline -q`：**36/36 PASS**，5.804 秒。
+`python -X utf8 -m unittest tests.test_pipeline -q`：**51/51 PASS**，12.666 秒。覆盖 Repair A 的全部 47 项语义，并加入 Repair B recommendation、显式启动、生命周期、幂等、失败重试和产品输出边界。
 
-覆盖首次/后续/无变化扫描；三态分诊；uncertain 核验三种出口及正式检测回流；知识与记忆分离；自身资料不足；研究不写库；七类错误；失败恢复；重复任务与快照历史；工作区边界；引用命名空间；官方来源身份与重定向；配置失败记录；部分扫描保留结果；公开 URL 与本机路径的区分。
+Repair B 新增覆盖 research recommendation 不自动执行、not_started/running/completed/failed 持久化、running/completed 幂等、interrupted recovery、failed retry、monitor/no_action 拒绝启动、Research failure 不污染主 Pipeline，以及产品 Event/Pending 标识、citation 与 Developer Audit 分离。Repair A 的 watermark、Event persistence 故障边界、下游恢复和 Verification Event Core re-entry 全部继续通过。
 
 控制测试使用脚本替身隔离真实模型副作用，并复用正式差异与事件构造接口；只证明控制流和边界，不代表模型语义质量评测。首次运行一项新增测试因测试数据未以 JSON 模式序列化日期失败，修复的是新增测试数据，未改冻结测试或业务规则。
 
@@ -153,6 +163,8 @@ Case B 复用 `event_core_v01_live_02.json` 中已验收的公开官方 Case B�
 
 人工检查产品 JSON 时发现 Integration 的路径正则会误遮蔽 HTTPS 地址；已最小修复并新增回归测试。Baseline 只从已保存原始状态重新投影显示字段，未重新采集；最终公开 URL 误遮蔽数为 0。
 
+Repair B 没有重新消耗真实 Research 调用。既有真实 Agent E2E 继续证明 ResearchAgent 能完成真实工具链；更新后的 `pia_e2e.py` 把集成验收拆为 Phase A recommendation/not_started、Phase B 用户显式启动/completed、Phase C completed 结果复用。另以无网络控制 E2E 实际验证三阶段均 PASS。
+
 首次运行命令：`python -X utf8 experiments/pia_e2e.py --output experiments/output/pia_v01_live_01.json`。已存在状态目录应走恢复入口；创建新的演示需要自行选择新的 output 路径，不清理旧验收数据。
 
 恢复入口：准备阶段用 `--resume-setup` 复用已通过 Baseline；主链开始后用 `--resume-run <已保存的 run_id>`。不通过新建状态目录反复重跑成功步骤。
@@ -177,7 +189,7 @@ Case B 复用 `event_core_v01_live_02.json` 中已验收的公开官方 Case B�
 
 ## 15. Full Regression
 
-`python -X utf8 -m unittest discover -s tests -q`：**450/450 PASS**，47.978 秒，等于冻结基线 414 项加新增 36 项。该次运行覆盖最终 URL 修复。原模块测试无退化，已有测试文件未修改。日志中的存储/响应故障警告来自负向测试，最终结果为 OK。
+`python -X utf8 -m unittest discover -s tests -q`：**502/502 PASS**，89.314 秒。原模块及 Repair A 测试无退化；日志中的无效 PDF、存储/响应故障和工具失败警告来自既有负向测试，最终结果为 OK。
 
 ## 16. Code Quality
 
@@ -193,10 +205,13 @@ Case B 复用 `event_core_v01_live_02.json` 中已验收的公开官方 Case B�
 - 真实模型可能返回无效结构或引用；保留失败而不修改结果，也不自动无限重试。已用于开发的 Fixture 不构成独立、无污染的质量 Evaluation；本轮不创建 Gold Set。
 - 正式报告包含模型推论，引用存在不等于推论已被证明。不同产品“积分”的单位价值和消耗规则尚未归一化，不能仅凭 2,000 与 500 推定真实获客或留存优势；模拟自身资料也不能代表用户实际产品。
 - 跨运行产物复用键涵盖事件、产品配置与自身文件内容，但未包含整库知识及 Memory 版本。相同输入下更新历史库后不会自动重新分诊；当前不提供知识刷新、调度或自动重评能力。
+- Research V1 只支持首次显式启动和 failed retry；completed 后不能重新研究，也不保存 Research Run 1/2/3 历史。monitor/no_action 不支持人工 override。
+- running 使用本地进程 token 区分同进程重复调用与重启中断；这是单进程幂等边界，不是分布式租约或跨主机任务锁。
 - 仅限可信本地调用方与单进程运行；scope 过滤不等于用户鉴权，没有并发任务锁、商业多租户隔离或分布式事务。数据库自身不可写时无法保证失败记录也能落盘。
 - 沿用正式来源身份；重定向到未确认官方域不会继承官方资格。冻结采集器的 DNS、浏览器子资源和网络行为未更改，本实现不构成完整 SSRF 防护。
 - Own Product Knowledge 可能包含内部 PRD、Roadmap、Pricing 等；检索和推理会把必要原文交给配置的外部模型。生产应按数据分级、企业安全策略及供应商合规要求评估外发，考虑敏感字段脱敏、企业协议、租户隔离或私有模型。本轮只沿用既有边界，没有实现这些能力。
 - 部分步骤失败后没有完整模型用量可回收；持久化指标只代表可观察调用，不能当作账单总额。已确认来源会被复用，没有本轮范围外的自动来源刷新。
+- 旧版本若只保留 `latest` 而对应运行检查点也已被外部删除，系统无法法证式判断该历史 Snapshot 是否曾处理完成，只能沿用旧指针；正常 PipelineStore 数据会保留检查点并自动选择安全 baseline。本轮不回滚或重建历史 Snapshot。
 - E2E 依赖本地已验收的事件归档和既有配置；新克隆需提供真实归档，不能凭空生成替代。后续仍需用户实际运行、验收和解释核心代码。
 
 ## 18. Git Status

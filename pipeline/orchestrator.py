@@ -14,9 +14,12 @@ from source_discovery.schemas import SourceDiscoveryResult
 from triage.schemas import TriageResult
 
 from .adapters import ModuleAdapters
-from .output import build_product_result
+from .output import build_product_result, present_research_action
 from .schemas import PipelineFailure, ProductInput
-from .store import PipelineStore, identity
+from .store import PipelineStore, identity, product_event_id
+
+
+_PROCESS_TOKEN = str(uuid4())
 
 
 class ProductPipeline:
@@ -105,7 +108,7 @@ class ProductPipeline:
         return self.store.get(namespace, key)
 
     def run_monitoring_scan(self, run_id, workspace, adapter, source):
-        """一个已确认来源一次扫描；先保存快照历史，再根据首次标记决定是否检测。"""
+        """保存观察并完成一次状态比较；只有 Event Core 正式终态才推进处理水位。"""
         key = identity([run_id, source["url"]])
 
         def scan():
@@ -114,7 +117,12 @@ class ProductPipeline:
 
         history = self._step(run_id, "scan:" + key, "Stage 1 扫描与快照", "scan_error", scan)
         if history["is_first_scan"]:
-            self._step(run_id, "baseline:" + key, "首次扫描建立基线", "scan_error", lambda: {"event_detection_skipped": True})
+            self._step(
+                run_id, "baseline:" + key, "首次扫描建立基线", "scan_error",
+                lambda: {"event_detection_skipped": True, **self.store.mark_comparison_processed(
+                    workspace, source["url"], history, ["baseline"]
+                )},
+            )
             return []
         inputs = self._step(run_id, "comparison:" + key, "状态比较与 Contextual Diff", "event_detection_error",
                             lambda: [i.model_dump(mode="json") for i in adapter.detection_inputs(history, source)])
@@ -123,22 +131,75 @@ class ProductPipeline:
             result = self._step(run_id, f"detection:{key}:{index}", "Event Detection", "event_detection_error",
                                 lambda data=data: adapter.detect(DetectionInput.model_validate(data)).model_dump(mode="json"))
             candidates.extend(EventCandidate.model_validate(c) for c in result["candidates"])
+        outcomes = [candidate.decision for candidate in candidates]
+        for candidate in candidates:
+            if candidate.decision == "uncertain":
+                self._step(
+                    run_id, "pending:" + candidate.candidate_id, "保存待核验候选", "event_detection_error",
+                    lambda candidate=candidate: self._save_pending_detection(workspace, candidate),
+                )
+            elif candidate.decision == "event":
+                # confirmed candidate 必须先完成 Dedup 并持久化 Event（或 Dedup Pending），
+                # 才能推进 comparison watermark。Triage 等下游动作不属于这个安全边界。
+                self._step(
+                    run_id, "event_outcome:" + candidate.candidate_id, "持久化正式事件与去重结果",
+                    "event_detection_error",
+                    lambda candidate=candidate: self._persist_event_outcome(run_id, workspace, adapter, candidate),
+                )
+        self._step(
+            run_id, "processed:" + key, "完成事件判断并推进比较水位", "event_detection_error",
+            lambda: self.store.mark_comparison_processed(workspace, source["url"], history, outcomes),
+        )
         return candidates
 
-    def _confirmed_event(self, run_id, workspace, product, adapter, candidate):
-        """正式事件先复用语义去重，再入库和分诊；只有 research 路由执行深度研究。"""
+    def _save_pending_detection(self, workspace, candidate):
+        """在推进比较水位前持久化 uncertain，避免崩溃后既无变化也无 Pending。"""
+        self._pending(workspace, candidate, candidate.uncertainty_reason)
+        return {"candidate_id": candidate.candidate_id, "status": "pending"}
+
+    def _persist_event_outcome(self, run_id, workspace, adapter, candidate):
+        """完成 Event/Dedup 的可恢复持久化，但不执行 Knowledge、Triage 或 Research。
+
+        输入是 Event Core 已确认的 candidate。方法先复用或执行正式 Dedup；模糊结果写入
+        Pending，明确结果写入 workspace Event、当前 run Event 和 downstream action。
+        这些记录成功后 comparison 才有资格推进。输出是可供后续动作恢复的持久化结果。
+        """
         existing = self.store.items("events:" + workspace)
         if candidate.candidate_id in existing and candidate.model_dump(mode="json") == existing[candidate.candidate_id]:
             event = candidate
         else:
-            verdict = self._step(run_id, "dedup:" + candidate.candidate_id, "事件去重", "event_detection_error",
-                lambda: adapter.deduplicate(candidate, [EventCandidate.model_validate(c) for c in existing.values()]).model_dump(mode="json"))
+            verdict = self._step(
+                run_id, "dedup:" + candidate.candidate_id, "事件去重", "event_detection_error",
+                lambda: adapter.deduplicate(
+                    candidate, [EventCandidate.model_validate(c) for c in existing.values()]
+                ).model_dump(mode="json"),
+            )
             if verdict["decision"] == "UNCERTAIN":
                 self._pending(workspace, candidate, "事件事实已确认，但与历史事件的同一性仍待核验。")
-                return
+                return {"status": "pending_dedup", "candidate_id": candidate.candidate_id}
             event = EventCandidate.model_validate(verdict["event"])
-        self.store.put("events:" + workspace, event.candidate_id, event.model_dump(mode="json"))
-        self.store.put("run_events:" + run_id, event.candidate_id, event.model_dump(mode="json"))
+
+        event_data = event.model_dump(mode="json")
+        self.store.put("events:" + workspace, event.candidate_id, event_data)
+        self.store.put("run_events:" + run_id, event.candidate_id, event_data)
+        action_namespace = "event_actions:" + workspace
+        action = self.store.get(action_namespace, event.candidate_id)
+        if action is None or action.get("event") != event_data:
+            self.store.put(action_namespace, event.candidate_id, {
+                "status": "pending", "event": event_data, "originating_run_id": run_id,
+            })
+        return {"status": "event_persisted", "event": event_data}
+
+    def _confirmed_event(self, run_id, workspace, product, adapter, candidate):
+        """复用已持久化的正式 Event，再执行可独立恢复的下游动作。"""
+        outcome = self._step(
+            run_id, "event_outcome:" + candidate.candidate_id, "持久化正式事件与去重结果",
+            "event_detection_error",
+            lambda: self._persist_event_outcome(run_id, workspace, adapter, candidate),
+        )
+        if outcome["status"] != "event_persisted":
+            return
+        event = EventCandidate.model_validate(outcome["event"])
         self._step(run_id, "admit:" + identity(event.model_dump(mode="json")), "确认原始证据进入竞品知识", "retrieval_error",
                     lambda: adapter.ingest_event(event))
         context = {"event": event.model_dump(mode="json"), "product": product.model_dump()}
@@ -147,9 +208,106 @@ class ProductPipeline:
         key = identity(context)
         triage = self._artifact(run_id, workspace, "triage", key, "triage_error", lambda: adapter.triage(event))
         decision = TriageResult.model_validate(triage["result"])
-        if decision.decision == "research":
-            self._artifact(run_id, workspace, "research", key, "research_error",
-                lambda: adapter.research(event, "deep_research", decision, self._official_hosts(workspace, event)))
+        self._ensure_research_state(workspace, event, key, decision)
+        action = self.store.get("event_actions:" + workspace, event.candidate_id, {"event": outcome["event"]})
+        self.store.put("event_actions:" + workspace, event.candidate_id,
+                       {**action, "status": "complete", "completed_run_id": run_id})
+
+    def _resume_event_actions(self, run_id, workspace, product, adapter):
+        """新 run 恢复已经持久化、但 Knowledge/Triage/Research 尚未完成的 Event 动作。"""
+        for action in self.store.items("event_actions:" + workspace).values():
+            if action["status"] != "complete":
+                self._confirmed_event(run_id, workspace, product, adapter,
+                                      EventCandidate.model_validate(action["event"]))
+
+    def _ensure_research_state(self, workspace, event, triage_key, decision):
+        """为 research 推荐建立独立 not_started 状态；monitor/no_action 不创建任务。"""
+        if decision.decision != "research":
+            return None
+        event_data = event.model_dump(mode="json")
+        event_id = product_event_id(event_data)
+        namespace = "research_status:" + workspace
+        state = self.store.get(namespace, event_id)
+        if state is not None:
+            return state
+        artifact = self.store.get("research:" + workspace, triage_key)
+        state = {
+            "event_id": event_id, "event_candidate_id": event.candidate_id,
+            "triage": {"namespace": "triage:" + workspace, "key": triage_key},
+            "status": "completed" if artifact is not None else "not_started", "attempts": 0,
+        }
+        if artifact is not None:
+            state["artifact"] = {"namespace": "research:" + workspace, "key": triage_key}
+        self.store.put(namespace, event_id, state)
+        return state
+
+    def _research_context(self, workspace, event):
+        """读取或从既有 Triage artifact 恢复 Event 对应的 research 推荐状态。"""
+        event_id = product_event_id(event)
+        state = self.store.get("research_status:" + workspace, event_id)
+        if state is not None:
+            reference = state["triage"]
+            artifact = self.store.get(reference["namespace"], reference["key"])
+            return state, TriageResult.model_validate(artifact["result"]) if artifact else None
+        for triage_key, artifact in reversed(list(self.store.items("triage:" + workspace).items())):
+            result = TriageResult.model_validate(artifact["result"])
+            if result.event_id == event.candidate_id and result.decision == "research":
+                return self._ensure_research_state(workspace, event, triage_key, result), result
+        return None, None
+
+    def start_research(self, product: ProductInput, event_id: str, *, retry: bool = False) -> dict:
+        """用户显式启动单个 confirmed Event 的 Deep Research。
+
+        输入只有产品配置、产品级 event_id 和明确 retry 标志；程序从持久化 Event 与
+        Triage 恢复真实内部对象。not_started/failed-retry 才会调用现有 Research Agent，
+        running/completed 均幂等返回。Research 失败只更新独立 action，不修改主 Pipeline。
+        """
+        workspace, adapter = self.configure_competitor(product)
+        event = next((EventCandidate.model_validate(value)
+                      for value in self.store.items("events:" + workspace).values()
+                      if product_event_id(value) == event_id), None)
+        if event is None:
+            return {"product": {"accepted": False, "reason": "confirmed_event_not_found"}, "audit": {}}
+        state, triage = self._research_context(workspace, event)
+        if state is None or triage is None or triage.decision != "research":
+            return {"product": {"accepted": False, "event_id": event_id,
+                                "reason": "research_not_recommended"}, "audit": {}}
+
+        namespace = "research_status:" + workspace
+        # 状态判断与 running 写入必须在同一个 SQLite 事务中完成；这里不能复用上方
+        # 为恢复 Triage 而读取的 state，否则两个请求可能同时依据 not_started 启动 Agent。
+        claim = self.store.claim_research(workspace, event_id, _PROCESS_TOKEN, retry=retry)
+        state = claim["state"]
+        if state is None:
+            return {"product": {"accepted": False, "reason": "research_state_not_found"}, "audit": {}}
+        if not claim["claimed"] and state["status"] == "completed":
+            return {"product": {"accepted": True, "research": present_research_action(self.store, workspace, state)},
+                    "audit": {"status": "completed", "reused": True}}
+        if not claim["claimed"] and state["status"] == "running":
+            return {"product": {"accepted": True, "research": present_research_action(self.store, workspace, state)},
+                    "audit": {"status": "running", "reused": True}}
+        if not claim["claimed"] and state["status"] == "failed":
+            return {"product": {"accepted": True, "research": present_research_action(self.store, workspace, state)},
+                    "audit": {"status": "failed", "retry_required": True}}
+        running = state
+        try:
+            artifact = adapter.research(event, "deep_research", triage, self._official_hosts(workspace, event))
+        except Exception as exc:
+            failed = {**running, "status": "failed", "error_type": "research_error",
+                      "exception_type": type(exc).__name__}
+            failed.pop("process_token", None)
+            self.store.put(namespace, event_id, failed)
+            return {"product": {"accepted": True, "research": present_research_action(self.store, workspace, failed)},
+                    "audit": {"status": "failed", "exception_type": type(exc).__name__}}
+
+        artifact_key = running["triage"]["key"]
+        artifact_reference = {"namespace": "research:" + workspace, "key": artifact_key}
+        self.store.put(artifact_reference["namespace"], artifact_key, artifact)
+        completed = {**running, "status": "completed", "artifact": artifact_reference}
+        completed.pop("process_token", None)
+        self.store.put(namespace, event_id, completed)
+        return {"product": {"accepted": True, "research": present_research_action(self.store, workspace, completed)},
+                "audit": {"status": "completed", "artifact": artifact}}
 
     def _official_hosts(self, workspace, candidate):
         """沿用正式发现或上游 Evidence 已确认的来源身份；回放事件也保留同一信任边界。"""
@@ -163,7 +321,7 @@ class ProductPipeline:
                        {"status": "pending", "reason": reason, "candidate": candidate.model_dump(mode="json")})
 
     def _verify(self, run_id, workspace, product, adapter, candidate):
-        """核验最多一轮；支持确认时经 Event Core 再构造正式事件，不能循环自我确认。"""
+        """核验最多一轮；event/no_event 都必须携正式新证据重新进入 Event Core。"""
         resolved = self.store.get("resolved:" + workspace, candidate.candidate_id)
         if resolved:
             for data in resolved.get("events", []):
@@ -177,22 +335,35 @@ class ProductPipeline:
         if decision == "still_pending":
             self._pending(workspace, candidate, verification["result"]["reason"])
             return
-        confirmed = []
-        if decision == "event":
-            inputs = self._step(run_id, "verification_inputs:" + key, "核验原文适配", "event_detection_error",
-                lambda: [i.model_dump(mode="json") for i in adapter.verification_inputs(candidate, verification)])
-            for index, data in enumerate(inputs):
-                output = self._step(run_id, f"redetect:{key}:{index}", "核验后正式事件检测", "event_detection_error",
-                    lambda data=data: adapter.detect(DetectionInput.model_validate(data)).model_dump(mode="json"))
-                confirmed.extend(c for c in output["candidates"] if c["decision"] == "event")
-            if not confirmed:
-                self._pending(workspace, candidate, "核验倾向确认，但正式事件检测未生成确认事件，保留待处理。")
-                return
+        inputs = self._step(
+            run_id, "verification_inputs:" + key, "核验原文适配", "event_detection_error",
+            lambda: [i.model_dump(mode="json") for i in adapter.verification_inputs(candidate, verification)],
+        )
+        if not inputs:
+            self._pending(workspace, candidate, "核验没有形成可交给 Event Core 的充分官方新证据，保留待处理。")
+            return
+        formal = []
+        for index, data in enumerate(inputs):
+            output = self._step(run_id, f"redetect:{key}:{index}", "核验后正式事件检测", "event_detection_error",
+                lambda data=data: adapter.detect(DetectionInput.model_validate(data)).model_dump(mode="json"))
+            formal.extend(output["candidates"])
+        confirmed = [item for item in formal if item["decision"] == "event"]
+        uncertain = [item for item in formal if item["decision"] == "uncertain"]
+        if not confirmed and uncertain:
+            self._pending(workspace, candidate, "Event Core 仍为 uncertain，保留待处理。")
+            return
+        if not confirmed and (not formal or any(item["decision"] != "no_event" for item in formal)):
+            self._pending(workspace, candidate, "Event Core 未形成可解决候选的正式结论，保留待处理。")
+            return
         for data in confirmed:
             self._confirmed_event(run_id, workspace, product, adapter, EventCandidate.model_validate(data))
-        self.store.put("resolved:" + workspace, candidate.candidate_id, {"decision": decision, "events": confirmed})
+        formal_decision = "event" if confirmed else "no_event"
+        resolved_status = "resolved_event" if confirmed else "resolved_no_event"
+        self.store.put("resolved:" + workspace, candidate.candidate_id,
+                       {"decision": formal_decision, "status": resolved_status, "events": confirmed})
         self.store.put("pending:" + workspace, candidate.candidate_id,
-                       {"status": "resolved", "candidate": candidate.model_dump(mode="json"), "reason": verification["result"]["reason"]})
+                       {"status": resolved_status, "candidate": candidate.model_dump(mode="json"),
+                        "reason": verification["result"]["reason"]})
 
     def process_event_candidates(self, run_id, workspace, product, adapter, candidates):
         """按正式候选状态分流；no_event 结束，uncertain 核验，event 进入确认链路。"""
@@ -254,6 +425,8 @@ class ProductPipeline:
                     def no_sources():
                         raise PipelineFailure("source_discovery_error")
                     self._step(run_id, "source_availability", "检查可监控来源", "source_discovery_error", no_sources)
+                # Event 已持久化后，Triage 等失败由独立 action 恢复；不要求再次制造 A → B。
+                self._resume_event_actions(run_id, workspace, product, adapter)
                 for source in sources["sources"]:
                     candidates = self.run_monitoring_scan(run_id, workspace, adapter, source)
                     self.process_event_candidates(run_id, workspace, product, adapter, candidates)

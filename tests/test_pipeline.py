@@ -3,19 +3,21 @@
 import json
 import asyncio
 import tempfile
+import threading
 import unittest
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from event_core.schemas import DedupResult, EventCandidate
+from event_core.schemas import DedupResult, EventCandidate, EventDecision
 from llm.config import LLMConfigurationError
 from llm.retrieval_models import EmbeddingAPIError
 from pipeline.adapters import ModuleAdapters
 from pipeline.orchestrator import ProductPipeline
 from pipeline.output import present_artifact, public_text
 from pipeline.schemas import ProductInput
-from pipeline.store import PipelineStore, identity
+from pipeline.store import PipelineStore, identity, product_event_id
 from source_discovery.schemas import SourceDiscoveryResult
 from tests.test_event_core import data, detect_with_mock, snapshot
 from triage.schemas import TriageResult
@@ -23,6 +25,22 @@ from triage.schemas import TriageResult
 
 def fixture_event(uncertain=False):
     return detect_with_mock(data(old=None) if uncertain else data())[0].candidates[0]
+
+
+def second_fixture_event():
+    """构造同一竞品下另一条业务事实不同的 confirmed Event。"""
+    value = fixture_event().model_dump(mode="json")
+    value.update(
+        candidate_id=identity("second-event"),
+        event_subject="API",
+        change_action="增加批量 API",
+        change_items=[{
+            "item": "API",
+            "previous_state": "Only single-item API requests are supported.",
+            "current_state": "Batch API requests are supported.",
+        }],
+    )
+    return EventCandidate.model_validate(value)
 
 
 def discovery():
@@ -39,6 +57,8 @@ class ScriptedAdapters(ModuleAdapters):
     verification = "still_pending"
     versions = ["Export supports CSV only.", "Export supports CSV and PDF."]
     dedup_ambiguous = False
+    detection_decision = "event"
+    detection_statuses = []
 
     def hit(self, name):
         self.calls[name] += 1
@@ -52,11 +72,18 @@ class ScriptedAdapters(ModuleAdapters):
     def scan(self, url):
         self.hit("scan")
         index = min(self.calls["scan"] - 1, len(self.versions) - 1)
-        return snapshot(self.versions[index], f"2026-09-{index + 1:02d}T10:00:00+08:00")
+        return snapshot(self.versions[index], f"2026-09-{self.calls['scan']:02d}T10:00:00+08:00")
 
     def detect(self, value):
         self.hit("detect")
-        return detect_with_mock(value)[0]
+        self.detection_statuses.append(value.state_context.comparison_status)
+        decision = None
+        if self.detection_decision == "no_event":
+            decision = EventDecision(decision="no_event", decision_reason="正式检测未发现产品状态变化。")
+        elif self.detection_decision == "uncertain":
+            decision = EventDecision(decision="uncertain", decision_reason="正式证据仍不足。",
+                                     uncertainty_reason="正式证据仍不足。")
+        return detect_with_mock(value, decision)[0]
 
     def deduplicate(self, candidate, existing):
         self.hit("dedup")
@@ -86,7 +113,8 @@ class ScriptedAdapters(ModuleAdapters):
     def research(self, event, mode, triage_result, official_hosts):
         self.hit(mode)
         if mode == "verification":
-            content = "We released PDF export in public beta."
+            content = ("PDF export is not available; CSV remains the only export format."
+                       if self.verification == "no_event" else "We released PDF export in public beta.")
             citations = [{"result_id": "research_evidence_001", "url": "https://example.com/news", "title": "News",
                           "content": content, "credibility": "official", "source": "page", "domain": "competitor",
                           "observed_at": "2026-09-03T10:00:00+08:00"}]
@@ -115,16 +143,24 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.product = ProductInput(workspace_id="w", competitor_name="Example", official_url="https://example.com")
+        self.source_url = "https://example.com/product"
         ScriptedAdapters.calls = Counter()
         ScriptedAdapters.failures = {}
         ScriptedAdapters.route = "research"
         ScriptedAdapters.verification = "still_pending"
         ScriptedAdapters.versions = ["Export supports CSV only.", "Export supports CSV and PDF."]
         ScriptedAdapters.dedup_ambiguous = False
+        ScriptedAdapters.detection_decision = "event"
+        ScriptedAdapters.detection_statuses = []
         self.pipeline = ProductPipeline(self.root, adapter_type=ScriptedAdapters)
 
     async def replay(self, uncertain=False):
         return await self.pipeline.run_events(self.product, [fixture_event(uncertain)], provenance="controlled-test")
+
+    async def recommendation(self):
+        """生成一条 confirmed Event + research 推荐，并返回产品级 Event 标识。"""
+        output = await self.replay()
+        return output, output["product"]["detected_events"][0]["event_id"]
 
     async def test_first_scan_only_creates_baseline(self):
         result = await self.pipeline.run(self.product)
@@ -141,38 +177,54 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(result["product"]["detected_events"]), 1)
         self.assertEqual(ScriptedAdapters.calls["detect"], 1)
 
-    async def test_unchanged_scan_does_not_call_event_model(self):
+    async def test_unchanged_scan_gets_deterministic_no_event(self):
         ScriptedAdapters.versions = ["Export supports CSV only."] * 2
         await self.pipeline.run(self.product)
         result = await self.pipeline.run(self.product)
         self.assertFalse(result["product"]["baseline_created"])
-        self.assertEqual(ScriptedAdapters.calls["detect"], 0)
+        self.assertEqual(ScriptedAdapters.calls["detect"], 1)
+        self.assertEqual(result["product"]["detected_events"], [])
 
     async def test_confirmed_event_routes_through_triage(self):
         output = await self.replay()
         self.assertEqual(len(output["product"]["triage_results"]), 1)
         self.assertEqual(ScriptedAdapters.calls["admit"], 1)
 
-    async def test_research_route_calls_deep_research(self):
-        await self.replay()
-        self.assertEqual(ScriptedAdapters.calls["deep_research"], 1)
+    async def test_research_route_creates_not_started_recommendation_without_agent_call(self):
+        output, _ = await self.recommendation()
+        self.assertEqual(output["product"]["status"], "complete")
+        self.assertEqual(ScriptedAdapters.calls["deep_research"], 0)
         self.assertEqual(ScriptedAdapters.calls["verification"], 0)
+        self.assertEqual(output["product"]["research_actions"][0]["status"], "not_started")
+        self.assertEqual(output["product"]["research_results"], [])
 
     async def test_monitor_does_not_research(self):
         ScriptedAdapters.route = "monitor"
         result = await self.replay()
         self.assertEqual(result["product"]["research_results"], [])
+        self.assertEqual(result["product"]["research_actions"], [])
+        self.assertEqual(ScriptedAdapters.calls["deep_research"], 0)
+        event_id = result["product"]["detected_events"][0]["event_id"]
+        rejected = self.pipeline.start_research(self.product, event_id)
+        self.assertFalse(rejected["product"]["accepted"])
         self.assertEqual(ScriptedAdapters.calls["deep_research"], 0)
 
     async def test_no_action_does_not_research(self):
         ScriptedAdapters.route = "no_action"
-        await self.replay()
+        result = await self.replay()
+        self.assertEqual(ScriptedAdapters.calls["deep_research"], 0)
+        self.assertEqual(result["product"]["research_actions"], [])
+        event_id = result["product"]["detected_events"][0]["event_id"]
+        rejected = self.pipeline.start_research(self.product, event_id)
+        self.assertEqual(rejected["product"]["reason"], "research_not_recommended")
         self.assertEqual(ScriptedAdapters.calls["deep_research"], 0)
 
     async def test_uncertain_routes_to_verification_and_remains_pending(self):
         result = await self.replay(True)
         self.assertEqual(result["product"]["status"], "pending")
         self.assertEqual(len(result["product"]["pending_candidates"]), 1)
+        self.assertIn("pending_id", result["product"]["pending_candidates"][0]["candidate"])
+        self.assertNotIn("candidate_id", json.dumps(result["product"]))
         self.assertEqual(ScriptedAdapters.calls["verification"], 1)
         self.assertEqual(ScriptedAdapters.calls["triage"], 0)
         self.assertEqual(ScriptedAdapters.calls["admit"], 0)
@@ -183,18 +235,25 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["product"]["status"], "complete")
         self.assertEqual(ScriptedAdapters.calls["detect"], 1)
         self.assertEqual(ScriptedAdapters.calls["triage"], 1)
-        self.assertEqual(ScriptedAdapters.calls["deep_research"], 1)
+        self.assertEqual(ScriptedAdapters.calls["deep_research"], 0)
         self.assertEqual(result["product"]["pending_candidates"], [])
 
-    async def test_verification_no_event_ends(self):
+    async def test_verification_no_event_reenters_event_core_before_resolution(self):
         ScriptedAdapters.verification = "no_event"
+        ScriptedAdapters.detection_decision = "no_event"
         result = await self.replay(True)
         self.assertEqual(result["product"]["pending_candidates"], [])
         self.assertEqual(result["product"]["detected_events"], [])
+        self.assertEqual(ScriptedAdapters.calls["detect"], 1)
         self.assertEqual(ScriptedAdapters.calls["triage"], 0)
+        workspace = identity([self.product.workspace_id, self.product.competitor_name])
+        candidate = fixture_event(True)
+        self.assertEqual(self.pipeline.store.get("resolved:" + workspace, candidate.candidate_id)["status"],
+                         "resolved_no_event")
 
     async def test_research_outputs_not_admitted_or_remembered(self):
-        await self.replay()
+        _, event_id = await self.recommendation()
+        self.pipeline.start_research(self.product, event_id)
         self.assertEqual(ScriptedAdapters.calls["admit"], 1)
         self.assertEqual(ScriptedAdapters.calls["write_memory"], 0)
 
@@ -206,9 +265,23 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
     async def test_product_and_audit_separated(self):
         result = await self.replay()
         public = json.dumps(result["product"])
-        for text in ("provider", "private-provider", "private-trace", "sqlite", "source_reference", "raw_tool_trace", "E:\\"):
+        for text in ("candidate_id", "pipeline_stages", "provider", "private-provider", "private-trace",
+                     "sqlite", "source_reference", "raw_tool_trace", "E:\\"):
             self.assertNotIn(text, public)
+        event = result["product"]["detected_events"][0]
+        self.assertTrue(event["event_id"].startswith("evt_"))
+        self.assertEqual(result["product"]["triage_results"][0]["result"]["event_id"], event["event_id"])
         self.assertIn("private-provider", json.dumps(result["audit"]))
+        self.assertTrue(result["audit"]["steps"])
+
+    async def test_internal_candidate_id_cannot_start_research(self):
+        await self.recommendation()
+        internal_id = fixture_event().candidate_id
+        rejected = self.pipeline.start_research(self.product, internal_id)
+        self.assertFalse(rejected["product"]["accepted"])
+        self.assertEqual(rejected["product"]["reason"], "confirmed_event_not_found")
+        self.assertNotIn(internal_id, json.dumps(rejected["product"]))
+        self.assertEqual(ScriptedAdapters.calls["deep_research"], 0)
 
     async def test_source_discovery_failure_stops_scan(self):
         ScriptedAdapters.failures["discover"] = RuntimeError("private failure")
@@ -224,11 +297,130 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_detection_failure_preserves_snapshot(self):
         await self.pipeline.run(self.product)
+        workspace = identity([self.product.workspace_id, self.product.competitor_name])
+        baseline = self.pipeline.store.get("processed_latest:" + workspace, self.source_url)
         ScriptedAdapters.failures["detect"] = RuntimeError("private failure")
         result = await self.pipeline.run(self.product)
         self.assertEqual(result["product"]["error"]["type"], "event_detection_error")
         self.assertEqual(len(self.pipeline.store.items("snapshots")), 2)
+        self.assertNotEqual(self.pipeline.store.get("observed_latest:" + workspace, self.source_url), baseline)
+        self.assertEqual(self.pipeline.store.get("processed_latest:" + workspace, self.source_url), baseline)
         self.assertEqual(ScriptedAdapters.calls["triage"], 0)
+
+    async def test_successful_detection_advances_processed_baseline(self):
+        await self.pipeline.run(self.product)
+        workspace = identity([self.product.workspace_id, self.product.competitor_name])
+        baseline = self.pipeline.store.get("processed_latest:" + workspace, self.source_url)
+        await self.pipeline.run(self.product)
+        processed = self.pipeline.store.get("processed_latest:" + workspace, self.source_url)
+        self.assertNotEqual(processed, baseline)
+        self.assertEqual(processed, self.pipeline.store.get("observed_latest:" + workspace, self.source_url))
+
+    async def test_new_run_recovers_unprocessed_comparison(self):
+        await self.pipeline.run(self.product)
+        workspace = identity([self.product.workspace_id, self.product.competitor_name])
+        baseline = self.pipeline.store.get("processed_latest:" + workspace, self.source_url)
+        ScriptedAdapters.failures["detect"] = RuntimeError("fail once")
+        failed = await self.pipeline.run(self.product)
+        self.assertEqual(failed["product"]["error"]["type"], "event_detection_error")
+        del ScriptedAdapters.failures["detect"]
+        recovered = await ProductPipeline(self.root, adapter_type=ScriptedAdapters).run(self.product)
+        processed = self.pipeline.store.get("processed_latest:" + workspace, self.source_url)
+        self.assertEqual(recovered["product"]["status"], "complete")
+        self.assertNotEqual(processed, baseline)
+        self.assertEqual(ScriptedAdapters.calls["detect"], 2)
+
+    async def test_same_run_resume_reuses_snapshot_and_comparison(self):
+        await self.pipeline.run(self.product)
+        workspace = identity([self.product.workspace_id, self.product.competitor_name])
+        ScriptedAdapters.failures["detect"] = RuntimeError("fail once")
+        failed = await self.pipeline.run(self.product)
+        snapshot_count = len(self.pipeline.store.items("snapshots"))
+        del ScriptedAdapters.failures["detect"]
+        recovered = await ProductPipeline(self.root, adapter_type=ScriptedAdapters).resume(failed["run_id"])
+        self.assertEqual(recovered["product"]["status"], "complete")
+        self.assertEqual(len(self.pipeline.store.items("snapshots")), snapshot_count)
+        self.assertEqual(ScriptedAdapters.calls["scan"], 2)
+        self.assertEqual(self.pipeline.store.get("processed_latest:" + workspace, self.source_url),
+                         self.pipeline.store.get("observed_latest:" + workspace, self.source_url))
+
+    async def test_no_event_advances_processed_baseline(self):
+        await self.pipeline.run(self.product)
+        workspace = identity([self.product.workspace_id, self.product.competitor_name])
+        baseline = self.pipeline.store.get("processed_latest:" + workspace, self.source_url)
+        ScriptedAdapters.detection_decision = "no_event"
+        await self.pipeline.run(self.product)
+        self.assertNotEqual(self.pipeline.store.get("processed_latest:" + workspace, self.source_url), baseline)
+        comparison = list(self.pipeline.store.items("comparisons:" + workspace).values())[-1]
+        self.assertEqual(comparison["status"], "processed")
+        self.assertEqual(comparison["event_core_outcomes"], ["no_event"])
+
+    async def test_uncertain_is_saved_before_processed_baseline_advances(self):
+        await self.pipeline.run(self.product)
+        workspace = identity([self.product.workspace_id, self.product.competitor_name])
+        baseline = self.pipeline.store.get("processed_latest:" + workspace, self.source_url)
+        ScriptedAdapters.detection_decision = "uncertain"
+        original = self.pipeline.store.mark_comparison_processed
+        pending_at_mark = []
+
+        def mark(*args, **kwargs):
+            pending_at_mark.append(bool(self.pipeline.store.items("pending:" + workspace)))
+            return original(*args, **kwargs)
+
+        with patch.object(self.pipeline.store, "mark_comparison_processed", side_effect=mark):
+            result = await self.pipeline.run(self.product)
+        self.assertEqual(result["product"]["status"], "pending")
+        self.assertTrue(self.pipeline.store.items("pending:" + workspace))
+        self.assertEqual(pending_at_mark, [True])
+        self.assertNotEqual(self.pipeline.store.get("processed_latest:" + workspace, self.source_url), baseline)
+
+    async def test_event_persistence_failure_keeps_baseline_and_new_run_recovers(self):
+        await self.pipeline.run(self.product)
+        workspace = identity([self.product.workspace_id, self.product.competitor_name])
+        baseline = self.pipeline.store.get("processed_latest:" + workspace, self.source_url)
+        ScriptedAdapters.failures["dedup"] = RuntimeError("controlled dedup failure")
+        failed = await self.pipeline.run(self.product)
+        self.assertEqual(failed["product"]["error"]["type"], "event_detection_error")
+        self.assertEqual(self.pipeline.store.get("processed_latest:" + workspace, self.source_url), baseline)
+        self.assertEqual(self.pipeline.store.items("events:" + workspace), {})
+        del ScriptedAdapters.failures["dedup"]
+
+        recovered = await ProductPipeline(self.root, adapter_type=ScriptedAdapters).run(self.product)
+        self.assertEqual(recovered["product"]["status"], "complete")
+        self.assertNotEqual(self.pipeline.store.get("processed_latest:" + workspace, self.source_url), baseline)
+        self.assertEqual(len(self.pipeline.store.items("events:" + workspace)), 1)
+        self.assertEqual(ScriptedAdapters.detection_statuses, ["comparable", "comparable"])
+
+    async def test_triage_failure_after_event_persistence_keeps_watermark_and_new_run_resumes_action(self):
+        await self.pipeline.run(self.product)
+        workspace = identity([self.product.workspace_id, self.product.competitor_name])
+        baseline = self.pipeline.store.get("processed_latest:" + workspace, self.source_url)
+        ScriptedAdapters.failures["triage"] = RuntimeError("controlled triage failure")
+        failed = await self.pipeline.run(self.product)
+        processed = self.pipeline.store.get("processed_latest:" + workspace, self.source_url)
+        self.assertEqual(failed["product"]["error"]["type"], "triage_error")
+        self.assertNotEqual(processed, baseline)
+        self.assertEqual(len(self.pipeline.store.items("events:" + workspace)), 1)
+        action = list(self.pipeline.store.items("event_actions:" + workspace).values())[0]
+        self.assertEqual(action["status"], "pending")
+        del ScriptedAdapters.failures["triage"]
+
+        recovered = await ProductPipeline(self.root, adapter_type=ScriptedAdapters).run(self.product)
+        self.assertEqual(recovered["product"]["status"], "complete")
+        self.assertEqual(len(self.pipeline.store.items("events:" + workspace)), 1)
+        self.assertEqual(ScriptedAdapters.calls["dedup"], 1)
+        self.assertEqual(ScriptedAdapters.calls["triage"], 2)
+        self.assertEqual(ScriptedAdapters.detection_statuses, ["comparable", "unchanged"])
+        action = list(self.pipeline.store.items("event_actions:" + workspace).values())[0]
+        self.assertEqual(action["status"], "complete")
+
+    async def test_next_change_uses_last_processed_snapshot(self):
+        ScriptedAdapters.versions = ["A", "B", "C"]
+        await self.pipeline.run(self.product)
+        await self.pipeline.run(self.product)
+        await self.pipeline.run(self.product)
+        histories = list(self.pipeline.store.items("snapshots").values())
+        self.assertEqual(histories[-1]["previous_snapshot"]["content"], histories[-2]["current_snapshot"]["content"])
 
     async def test_triage_failure_preserves_event_and_stops_research(self):
         ScriptedAdapters.failures["triage"] = RuntimeError("private failure")
@@ -242,12 +434,19 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         result = await self.replay()
         self.assertEqual(result["product"]["error"]["type"], "retrieval_error")
 
-    async def test_research_failure_preserves_triage(self):
+    async def test_research_failure_is_independent_and_retry_completes(self):
+        main, event_id = await self.recommendation()
         ScriptedAdapters.failures["deep_research"] = RuntimeError("private failure")
-        result = await self.replay()
-        self.assertEqual(result["product"]["error"]["type"], "research_error")
-        self.assertEqual(len(result["product"]["triage_results"]), 1)
-        self.assertNotIn("private failure", json.dumps(result["product"]))
+        failed = self.pipeline.start_research(self.product, event_id)
+        self.assertEqual(failed["product"]["research"]["status"], "failed")
+        self.assertEqual(main["product"]["status"], "complete")
+        self.assertEqual(len(main["product"]["detected_events"]), 1)
+        self.assertEqual(len(main["product"]["triage_results"]), 1)
+        self.assertNotIn("private failure", json.dumps(failed["product"]))
+        del ScriptedAdapters.failures["deep_research"]
+        retried = self.pipeline.start_research(self.product, event_id, retry=True)
+        self.assertEqual(retried["product"]["research"]["status"], "completed")
+        self.assertEqual(ScriptedAdapters.calls["deep_research"], 2)
 
     async def test_missing_model_config_is_configuration_error(self):
         ScriptedAdapters.failures["triage"] = LLMConfigurationError("missing configuration")
@@ -260,24 +459,180 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await reopened.resume(first["run_id"]), first)
         self.assertEqual(counts, ScriptedAdapters.calls)
 
-    async def test_failed_research_resume_does_not_repeat_triage(self):
-        ScriptedAdapters.failures["deep_research"] = RuntimeError("fail once")
-        first = await self.replay()
-        del ScriptedAdapters.failures["deep_research"]
-        result = await ProductPipeline(self.root, adapter_type=ScriptedAdapters).resume(first["run_id"])
-        self.assertEqual(result["product"]["status"], "complete")
+    async def test_explicit_research_success_persists_across_reopen(self):
+        _, event_id = await self.recommendation()
+        first = self.pipeline.start_research(self.product, event_id)
+        self.assertEqual(first["product"]["research"]["status"], "completed")
+        reopened = ProductPipeline(self.root, adapter_type=ScriptedAdapters)
+        second = reopened.start_research(self.product, event_id)
+        self.assertEqual(second["product"]["research"]["status"], "completed")
+        self.assertTrue(second["audit"]["reused"])
         self.assertEqual(ScriptedAdapters.calls["triage"], 1)
-        self.assertEqual(ScriptedAdapters.calls["admit"], 1)
+        self.assertEqual(ScriptedAdapters.calls["deep_research"], 1)
 
-    async def test_repeated_event_reuses_research_artifact(self):
-        event = fixture_event()
-        for _ in range(2):
-            await self.pipeline.run_events(self.product, [event], provenance="same-replay")
+    async def test_completed_research_is_idempotent_and_retry_cannot_rerun(self):
+        _, event_id = await self.recommendation()
+        first = self.pipeline.start_research(self.product, event_id)
+        second = self.pipeline.start_research(self.product, event_id)
+        retry = self.pipeline.start_research(self.product, event_id, retry=True)
+        self.assertEqual(first["product"]["research"], second["product"]["research"])
+        self.assertEqual(second["product"]["research"], retry["product"]["research"])
         self.assertEqual(ScriptedAdapters.calls["triage"], 1)
         self.assertEqual(ScriptedAdapters.calls["deep_research"], 1)
         workspace = identity([self.product.workspace_id, self.product.competitor_name])
-        self.assertEqual(len(self.pipeline.store.items("events:" + workspace)), 1)
         self.assertEqual(len(self.pipeline.store.items("research:" + workspace)), 1)
+
+    async def test_running_research_is_idempotent(self):
+        _, event_id = await self.recommendation()
+        workspace = identity([self.product.workspace_id, self.product.competitor_name])
+        namespace = "research_status:" + workspace
+        state = self.pipeline.store.get(namespace, event_id)
+        with patch("pipeline.orchestrator._PROCESS_TOKEN", "active-process"):
+            self.pipeline.store.put(namespace, event_id,
+                                    {**state, "status": "running", "process_token": "active-process"})
+            result = self.pipeline.start_research(self.product, event_id)
+        self.assertEqual(result["product"]["research"]["status"], "running")
+        self.assertEqual(ScriptedAdapters.calls["deep_research"], 0)
+
+    async def test_interrupted_running_becomes_failed_then_requires_retry(self):
+        _, event_id = await self.recommendation()
+        workspace = identity([self.product.workspace_id, self.product.competitor_name])
+        namespace = "research_status:" + workspace
+        state = self.pipeline.store.get(namespace, event_id)
+        self.pipeline.store.put(namespace, event_id, {**state, "status": "running", "process_token": "old-process"})
+        interrupted = self.pipeline.start_research(self.product, event_id)
+        self.assertEqual(interrupted["product"]["research"]["status"], "failed")
+        self.assertEqual(interrupted["product"]["research"]["error"]["type"], "research_interrupted")
+        self.assertEqual(ScriptedAdapters.calls["deep_research"], 0)
+        completed = self.pipeline.start_research(self.product, event_id, retry=True)
+        self.assertEqual(completed["product"]["research"]["status"], "completed")
+        self.assertEqual(ScriptedAdapters.calls["deep_research"], 1)
+
+    async def test_same_workspace_research_states_are_event_scoped_and_persisted(self):
+        """同一 workspace 的两个 Event 各自保存状态和结果，重开 Store 后仍不互相覆盖。"""
+        event_a, event_b = fixture_event(), second_fixture_event()
+        output = await self.pipeline.run_events(
+            self.product, [event_a, event_b], provenance="two-event-identity-test"
+        )
+        ids = {item["event_subject"]: item["event_id"] for item in output["product"]["detected_events"]}
+        workspace = identity([self.product.workspace_id, self.product.competitor_name])
+
+        completed_a = self.pipeline.start_research(self.product, ids["Export"])
+        self.assertEqual(completed_a["product"]["research"]["status"], "completed")
+        states = self.pipeline.store.items("research_status:" + workspace)
+        self.assertEqual(states[ids["Export"]]["status"], "completed")
+        self.assertEqual(states[ids["API"]]["status"], "not_started")
+        saved_a = states[ids["Export"]].copy()
+
+        completed_b = self.pipeline.start_research(self.product, ids["API"])
+        self.assertEqual(completed_b["product"]["research"]["status"], "completed")
+        states = self.pipeline.store.items("research_status:" + workspace)
+        self.assertEqual(states[ids["Export"]], saved_a)
+        self.assertEqual(states[ids["API"]]["status"], "completed")
+        self.assertEqual(ScriptedAdapters.calls["deep_research"], 2)
+
+        reopened = ProductPipeline(self.root, adapter_type=ScriptedAdapters)
+        reopened_states = reopened.store.items("research_status:" + workspace)
+        self.assertEqual(reopened_states, states)
+        self.assertEqual(reopened.start_research(self.product, ids["Export"])["product"]["research"]["status"],
+                         "completed")
+        self.assertEqual(reopened.start_research(self.product, ids["API"])["product"]["research"]["status"],
+                         "completed")
+        self.assertEqual(ScriptedAdapters.calls["deep_research"], 2)
+
+    async def test_product_event_id_is_stable_across_reopen_and_new_run(self):
+        """产品 Event ID 由业务事实确定，重开 Pipeline 和新 run 都返回同一标识。"""
+        event = fixture_event()
+        first = await self.pipeline.run_events(self.product, [event], provenance="stable-id-first")
+        first_id = first["product"]["detected_events"][0]["event_id"]
+        reopened = ProductPipeline(self.root, adapter_type=ScriptedAdapters)
+        second = await reopened.run_events(self.product, [event], provenance="stable-id-second")
+        second_id = second["product"]["detected_events"][0]["event_id"]
+
+        self.assertEqual(first_id, product_event_id(event))
+        self.assertEqual(first_id, second_id)
+        self.assertTrue(first_id.startswith("evt_"))
+        self.assertNotEqual(first_id, event.candidate_id)
+        self.assertNotIn(event.candidate_id, json.dumps(second["product"]))
+        self.assertEqual(reopened.start_research(self.product, first_id)["product"]["research"]["event_id"], first_id)
+
+    async def test_concurrent_not_started_claim_calls_research_once(self):
+        """两个同时启动请求只能有一个占用 not_started，第二个不会增加 Agent 调用。"""
+        _, event_id = await self.recommendation()
+        entered, release = threading.Event(), threading.Event()
+        original = ScriptedAdapters.research
+
+        def blocked(adapter, event, mode, triage_result, official_hosts):
+            if mode == "deep_research":
+                entered.set()
+                if not release.wait(5):
+                    raise TimeoutError("并发测试未释放 Research Agent。")
+            return original(adapter, event, mode, triage_result, official_hosts)
+
+        with patch.object(ScriptedAdapters, "research", new=blocked), ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(self.pipeline.start_research, self.product, event_id)
+            self.assertTrue(entered.wait(5))
+            second = ProductPipeline(self.root, adapter_type=ScriptedAdapters).start_research(self.product, event_id)
+            self.assertEqual(second["product"]["research"]["status"], "running")
+            self.assertEqual(ScriptedAdapters.calls["deep_research"], 0)
+            release.set()
+            self.assertEqual(first.result(timeout=5)["product"]["research"]["status"], "completed")
+        self.assertEqual(ScriptedAdapters.calls["deep_research"], 1)
+
+    async def test_concurrent_failed_retry_claim_calls_research_once(self):
+        """failed 的两个同时 retry 请求也只能产生一次新的 Research Agent 调用。"""
+        _, event_id = await self.recommendation()
+        ScriptedAdapters.failures["deep_research"] = RuntimeError("controlled failure")
+        self.assertEqual(self.pipeline.start_research(self.product, event_id)["product"]["research"]["status"],
+                         "failed")
+        del ScriptedAdapters.failures["deep_research"]
+        entered, release = threading.Event(), threading.Event()
+        original = ScriptedAdapters.research
+
+        def blocked(adapter, event, mode, triage_result, official_hosts):
+            if mode == "deep_research":
+                entered.set()
+                if not release.wait(5):
+                    raise TimeoutError("并发 retry 测试未释放 Research Agent。")
+            return original(adapter, event, mode, triage_result, official_hosts)
+
+        with patch.object(ScriptedAdapters, "research", new=blocked), ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(self.pipeline.start_research, self.product, event_id, retry=True)
+            self.assertTrue(entered.wait(5))
+            second = ProductPipeline(self.root, adapter_type=ScriptedAdapters).start_research(
+                self.product, event_id, retry=True
+            )
+            self.assertEqual(second["product"]["research"]["status"], "running")
+            self.assertEqual(ScriptedAdapters.calls["deep_research"], 1)
+            release.set()
+            self.assertEqual(first.result(timeout=5)["product"]["research"]["status"], "completed")
+        self.assertEqual(ScriptedAdapters.calls["deep_research"], 2)
+
+    async def test_different_events_can_start_while_one_is_running(self):
+        """占用粒度是 workspace + event；Event A running 不会锁住 Event B。"""
+        event_a, event_b = fixture_event(), second_fixture_event()
+        output = await self.pipeline.run_events(
+            self.product, [event_a, event_b], provenance="independent-event-claim-test"
+        )
+        ids = {item["event_subject"]: item["event_id"] for item in output["product"]["detected_events"]}
+        entered, release = threading.Event(), threading.Event()
+        original = ScriptedAdapters.research
+
+        def block_only_a(adapter, event, mode, triage_result, official_hosts):
+            if mode == "deep_research" and product_event_id(event) == ids["Export"]:
+                entered.set()
+                if not release.wait(5):
+                    raise TimeoutError("不同 Event 测试未释放 Research Agent。")
+            return original(adapter, event, mode, triage_result, official_hosts)
+
+        with patch.object(ScriptedAdapters, "research", new=block_only_a), ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(self.pipeline.start_research, self.product, ids["Export"])
+            self.assertTrue(entered.wait(5))
+            second = self.pipeline.start_research(self.product, ids["API"])
+            self.assertEqual(second["product"]["research"]["status"], "completed")
+            release.set()
+            self.assertEqual(first.result(timeout=5)["product"]["research"]["status"], "completed")
+        self.assertEqual(ScriptedAdapters.calls["deep_research"], 2)
 
     async def test_knowledge_and_memory_have_distinct_stores(self):
         await self.replay()
@@ -313,6 +668,25 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first, second)
         self.assertTrue(second["is_first_scan"])
 
+    async def test_legacy_failed_detection_recovers_previous_processed_baseline(self):
+        store = self.pipeline.store
+        url = self.source_url
+        previous = {"is_first_scan": True, "current_snapshot": snapshot("A"),
+                    "previous_snapshot": None, "snapshot_id": "legacy-a", "previous_snapshot_id": None}
+        failed = {"is_first_scan": False, "current_snapshot": snapshot("B", "2026-09-03T10:00:00+08:00"),
+                  "previous_snapshot": previous["current_snapshot"], "snapshot_id": "legacy-b",
+                  "previous_snapshot_id": "legacy-a"}
+        store.put("snapshots", "legacy-a", previous)
+        store.put("snapshots", "legacy-b", failed)
+        store.put("latest:legacy-workspace", url, "legacy-b")
+        store.put("steps:legacy-run", "scan:legacy-b", {"status": "complete", "data": failed})
+        store.put("steps:legacy-run", "comparison:legacy-b", {"status": "complete", "data": [{}]})
+        store.put("steps:legacy-run", "detection:legacy-b:0", {"status": "failed"})
+        recovered = store.record_scan("legacy-workspace", "new-run", url,
+                                      snapshot("B", "2026-09-04T10:00:00+08:00"))
+        self.assertEqual(recovered["previous_snapshot_id"], "legacy-a")
+        self.assertEqual(store.get("processed_latest:legacy-workspace", url), "legacy-a")
+
     async def test_product_input_has_no_internal_id_fields(self):
         self.assertFalse({"candidate_id", "event_id", "memory_id", "chunk_id"} & set(ProductInput.model_fields))
 
@@ -322,6 +696,19 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         left, right = present_artifact(artifact, "left"), present_artifact(artifact, "right")
         self.assertNotEqual(left["citations"][0]["result_id"], right["citations"][0]["result_id"])
         self.assertEqual(left["result"]["evidence_refs"], [left["citations"][0]["result_id"]])
+
+    async def test_product_citations_keep_references_without_internal_artifact_key(self):
+        output, event_id = await self.recommendation()
+        product = output["product"]
+        internal_keys = self.pipeline.store.items("triage:" + identity(
+            [self.product.workspace_id, self.product.competitor_name]
+        )).keys()
+        encoded = json.dumps(product)
+        self.assertTrue(product["citations"])
+        self.assertTrue(all(ref in {item["result_id"] for item in product["citations"]}
+                            for ref in product["triage_results"][0]["result"]["evidence_refs"]))
+        self.assertIn(event_id, product["triage_results"][0]["result"]["event_id"])
+        self.assertTrue(all(key not in encoded for key in internal_keys))
 
     async def test_public_urls_survive_local_path_filter(self):
         for url in ("https://example.com/changelog", "http://127.0.0.1:1234/product"):
@@ -347,18 +734,33 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         product = self.product.model_copy(update={"own_product_documents": [str(self.root / "missing.md")]})
         result = await self.pipeline.run(product)
         self.assertEqual(result["product"]["error"]["type"], "configuration_error")
-        self.assertEqual(result["product"]["pipeline_stages"][0]["status"], "failed")
+        self.assertNotIn("pipeline_stages", result["product"])
+        self.assertEqual(result["audit"]["steps"]["configuration"]["status"], "failed")
 
-    async def test_verification_claim_without_formal_event_stays_pending(self):
-        ScriptedAdapters.verification = "event"
-        no_event = fixture_event(True).model_dump(mode="json")
-        no_event.update(decision="no_event", uncertainty_reason=None)
-        result = Mock(model_dump=Mock(return_value={"candidates": [no_event], "runtime": None}))
-        with patch.object(ScriptedAdapters, "detect", return_value=result):
-            output = await self.replay(True)
+    async def test_verification_no_event_with_formal_uncertain_stays_pending(self):
+        ScriptedAdapters.verification = "no_event"
+        ScriptedAdapters.detection_decision = "uncertain"
+        output = await self.replay(True)
         self.assertEqual(output["product"]["status"], "pending")
         self.assertEqual(output["product"]["detected_events"], [])
         self.assertEqual(ScriptedAdapters.calls["triage"], 0)
+
+    async def test_verification_without_formal_input_stays_pending(self):
+        ScriptedAdapters.verification = "no_event"
+        with patch.object(ScriptedAdapters, "verification_inputs", return_value=[]):
+            output = await self.replay(True)
+        self.assertEqual(output["product"]["status"], "pending")
+        self.assertEqual(ScriptedAdapters.calls["detect"], 0)
+        workspace = identity([self.product.workspace_id, self.product.competitor_name])
+        self.assertIsNone(self.pipeline.store.get("resolved:" + workspace, fixture_event(True).candidate_id))
+
+    async def test_verification_decision_cannot_override_event_core(self):
+        ScriptedAdapters.verification = "no_event"
+        ScriptedAdapters.detection_decision = "event"
+        output = await self.replay(True)
+        self.assertEqual(len(output["product"]["detected_events"]), 1)
+        self.assertEqual(ScriptedAdapters.calls["detect"], 1)
+        self.assertEqual(ScriptedAdapters.calls["triage"], 1)
 
     async def test_partial_scan_retains_completed_source_baseline(self):
         value = discovery().model_dump()

@@ -62,8 +62,10 @@ class ModuleAdapters:
         credibility = "official" if source["credibility"] == "official" and final_host in official_hosts else "unverified"
         args = dict(competitor=self.product.competitor_name, source_type=source["source_type"],
                     source_credibility=credibility)
+        # unchanged 也交给 Event Core 的确定性边界，得到正式 no_event 后才能推进
+        # processed watermark；该分支不会调用 LLM。
         page = build_state_comparison_input(history, **args)
-        inputs = [] if page.state_context.comparison_status == "unchanged" else [page]
+        inputs = [page]
         states = match_interactive_states(history)
         for change in states["state_changes"]:
             if change["change_type"] != "unchanged":
@@ -130,17 +132,22 @@ class ModuleAdapters:
         citations = {c["result_id"]: c for c in verification["citations"]}
         inputs = []
         for support in verification["result"]["support"]:
-            item = citations[support["result_id"]]
-            if item["credibility"] != "official":
+            item = citations.get(support["result_id"])
+            if not item or item.get("credibility") != "official":
                 continue
             if not item.get("url") or not item.get("observed_at"):
-                raise ValueError("核验证据缺少正式事件入口需要的来源或观察时间。")
+                continue
             snapshot = {"content": item["content"], "final_url": item["url"], "title": item["title"],
                         "captured_at": item["observed_at"]}
-            inputs.append(build_explicit_statement_input(snapshot, support["excerpt"],
-                competitor=candidate.competitor, source_type="verified_statement", source_credibility="official"))
-        if not inputs:
-            raise ValueError("没有可交给 Event Core 的官方新原文。")
+            try:
+                inputs.append(build_explicit_statement_input(
+                    snapshot, support["excerpt"], competitor=candidate.competitor,
+                    source_type="verified_statement", source_credibility="official",
+                ))
+            except (KeyError, TypeError, ValueError):
+                # Research 的结论不能弥补缺失或不一致的正式原文；无法构造输入时由
+                # orchestrator 保持 Pending，而不是伪造 no_event 或让整个运行失败。
+                continue
         return inputs
 
     def remember_explicit(self, text: str) -> dict:

@@ -48,12 +48,12 @@ class ProductResult(BaseModel):
     detected_events: list[dict] = Field(default_factory=list)
     pending_candidates: list[dict] = Field(default_factory=list)
     triage_results: list[dict] = Field(default_factory=list)
+    research_actions: list[dict] = Field(default_factory=list)
     research_results: list[dict] = Field(default_factory=list)
     verification_results: list[dict] = Field(default_factory=list)
     citations: list[dict] = Field(default_factory=list)
     current_focus: str
     uncertainties: list[str] = Field(default_factory=list)
-    pipeline_stages: list[dict] = Field(default_factory=list)
     status: Literal["complete", "pending", "failed"] = "complete"
     error: dict | None = None
 
