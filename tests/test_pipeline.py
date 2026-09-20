@@ -7,19 +7,26 @@ import threading
 import unittest
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
+from datetime import date, timedelta
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from event_core.schemas import DedupResult, EventCandidate, EventDecision
+from event_core.schemas import DedupResult, EventCandidate, EventDecision, Quote
+from event_core.inputs import build_explicit_statement_input
+from event_core.evidence import merge_evidence
 from llm.config import LLMConfigurationError
 from llm.retrieval_models import EmbeddingAPIError
 from pipeline.adapters import ModuleAdapters
 from pipeline.orchestrator import ProductPipeline
 from pipeline.output import present_artifact, public_text
 from pipeline.schemas import ProductInput
+from pipeline.statements import (
+    INITIAL_BACKFILL_MAX_EVENTS, extract_statement_candidates, select_initial_backfill,
+)
 from pipeline.store import PipelineStore, identity, product_event_id
 from source_discovery.schemas import SourceDiscoveryResult
-from tests.test_event_core import data, detect_with_mock, snapshot
+from tests.test_event_core import data, decision_for, detect_with_mock, snapshot
 from triage.schemas import TriageResult
 
 
@@ -43,6 +50,28 @@ def second_fixture_event():
     return EventCandidate.model_validate(value)
 
 
+def statement_candidate(
+    text: str, *, initial: bool, statement_date: str | None = None,
+    observed_at: str = "2026-09-20T10:00:00+08:00",
+    url: str = "https://example.com/changelog",
+) -> dict:
+    """构造已经过 Integration 结构提取的 Path B 候选，不伪造 Event Core 结论。"""
+    value = snapshot(text, observed_at)
+    value.update(url=url, final_url=url, title="Example Changelog")
+    detection_input = build_explicit_statement_input(
+        value, text, competitor="Example", source_type="changelog", source_credibility="official"
+    )
+    return {
+        "statement_id": identity([url, " ".join(text.split()), ""]),
+        "source_url": url,
+        "statement_date": statement_date,
+        "input": detection_input.model_dump(mode="json"),
+        "initial_backfill": initial,
+        "is_new": True,
+        "snapshot_id": identity([url, observed_at]),
+    }
+
+
 def discovery():
     return SourceDiscoveryResult(competitor_name="Example", official_domains=["example.com"], sources=[
         {"url": "https://example.com/product", "title": "Product", "source_type": "product_page",
@@ -59,6 +88,10 @@ class ScriptedAdapters(ModuleAdapters):
     dedup_ambiguous = False
     detection_decision = "event"
     detection_statuses = []
+    statement_batches = []
+    explicit_outcomes = {}
+    explicit_event_times = {}
+    dedup_same_event = False
 
     def hit(self, name):
         self.calls[name] += 1
@@ -78,18 +111,50 @@ class ScriptedAdapters(ModuleAdapters):
         self.hit("detect")
         self.detection_statuses.append(value.state_context.comparison_status)
         decision = None
-        if self.detection_decision == "no_event":
+        if value.detection_path == "explicit_statement" and value.source_type != "verified_statement":
+            self.calls["path_b_detect"] += 1
+            outcome = self.explicit_outcomes.get(value.current_state, "event")
+            if isinstance(outcome, Exception):
+                raise outcome
+            if outcome == "no_event":
+                decision = EventDecision(decision="no_event", decision_reason="不是明确变化声明。")
+            else:
+                decision = decision_for(value)
+                event_time = self.explicit_event_times.get(value.current_state)
+                if event_time:
+                    decision.event_time = event_time
+                    decision.citations["event_time"] = [
+                        Quote(input_field="current_state", excerpt=value.current_state)
+                    ]
+        elif self.detection_decision == "no_event":
+            if value.detection_path == "state_comparison":
+                self.calls["path_a_detect"] += 1
             decision = EventDecision(decision="no_event", decision_reason="正式检测未发现产品状态变化。")
         elif self.detection_decision == "uncertain":
+            if value.detection_path == "state_comparison":
+                self.calls["path_a_detect"] += 1
             decision = EventDecision(decision="uncertain", decision_reason="正式证据仍不足。",
                                      uncertainty_reason="正式证据仍不足。")
+        elif value.detection_path == "state_comparison":
+            self.calls["path_a_detect"] += 1
         return detect_with_mock(value, decision)[0]
 
     def deduplicate(self, candidate, existing):
         self.hit("dedup")
         if self.dedup_ambiguous:
             return DedupResult(decision="UNCERTAIN", reason="同一性待判断", pending_candidate=candidate)
+        if self.dedup_same_event and existing:
+            merged = existing[0].model_copy(
+                update={"evidence": merge_evidence(existing[0].evidence, candidate.evidence)}
+            )
+            return DedupResult(decision="SAME_EVENT", reason="测试脚本判定为同一事件",
+                               matched_event_id=existing[0].candidate_id, event=merged)
         return DedupResult(decision="NEW_EVENT", reason="测试脚本的新事件", event=candidate)
+
+    def explicit_statement_candidates(self, history, source):
+        self.calls["statement_extract"] += 1
+        index = min(self.calls["scan"] - 1, len(self.statement_batches) - 1)
+        return deepcopy(self.statement_batches[index]) if self.statement_batches else []
 
     def ingest_own(self):
         self.hit("own")
@@ -152,6 +217,10 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         ScriptedAdapters.dedup_ambiguous = False
         ScriptedAdapters.detection_decision = "event"
         ScriptedAdapters.detection_statuses = []
+        ScriptedAdapters.statement_batches = []
+        ScriptedAdapters.explicit_outcomes = {}
+        ScriptedAdapters.explicit_event_times = {}
+        ScriptedAdapters.dedup_same_event = False
         self.pipeline = ProductPipeline(self.root, adapter_type=ScriptedAdapters)
 
     async def replay(self, uncertain=False):
@@ -168,6 +237,292 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["product"]["detected_events"], [])
         self.assertEqual(ScriptedAdapters.calls["detect"], 0)
         self.assertEqual(ScriptedAdapters.calls["triage"], 0)
+
+    async def test_first_scan_current_fact_is_only_baseline(self):
+        existing = statement_candidate("Supports SSO.", initial=True, statement_date=None)
+        genuinely_new = statement_candidate("We launched SCIM.", initial=False)
+        ScriptedAdapters.versions = ["Stable product page."] * 3
+        ScriptedAdapters.statement_batches = [
+            [existing],
+            [{**existing, "initial_backfill": False}],
+            [{**existing, "initial_backfill": False}, genuinely_new],
+        ]
+        result = await self.pipeline.run(self.product)
+        workspace = identity([self.product.workspace_id, self.product.competitor_name])
+        self.assertTrue(result["product"]["baseline_created"])
+        self.assertEqual(result["product"]["detected_events"], [])
+        self.assertEqual(result["product"]["historical_events"], [])
+        self.assertEqual(ScriptedAdapters.calls["path_a_detect"], 0)
+        self.assertEqual(ScriptedAdapters.calls["path_b_detect"], 0)
+        observation = self.pipeline.store.get(
+            "statement_observations:" + workspace, existing["statement_id"]
+        )
+        self.assertTrue(observation["seen_at_baseline"])
+        self.assertEqual(self.pipeline.store.items("statement_processing:" + workspace), {})
+
+        reopened = ProductPipeline(self.root, adapter_type=ScriptedAdapters)
+        unchanged = await reopened.run(self.product)
+        self.assertEqual(unchanged["product"]["detected_events"], [])
+        self.assertEqual(ScriptedAdapters.calls["path_b_detect"], 0)
+        self.assertIsNotNone(reopened.store.get(
+            "statement_observations:" + workspace, existing["statement_id"]
+        ))
+
+        added = await reopened.run(self.product)
+        self.assertEqual(ScriptedAdapters.calls["path_b_detect"], 1)
+        self.assertEqual(len(added["product"]["detected_events"]), 1)
+        self.assertEqual(added["product"]["detected_events"][0]["discovery_origin"], "normal_monitoring")
+        self.assertIsNone(added["product"]["detected_events"][0]["event_time"])
+
+    async def test_first_scan_recent_dated_statement_becomes_historical_event(self):
+        text = "On 2026-09-10 we launched SSO for enterprise plans."
+        ScriptedAdapters.statement_batches = [[
+            statement_candidate(text, initial=True, statement_date="2026-09-10")
+        ]]
+        ScriptedAdapters.explicit_event_times = {text: "2026-09-10"}
+        result = await self.pipeline.run(self.product)
+        self.assertEqual(ScriptedAdapters.calls["path_a_detect"], 0)
+        self.assertEqual(ScriptedAdapters.calls["path_b_detect"], 1)
+        self.assertEqual(result["product"]["detected_events"], [])
+        self.assertEqual(len(result["product"]["historical_events"]), 1)
+        event = result["product"]["historical_events"][0]
+        self.assertEqual(event["discovery_origin"], "historical_backfill")
+        self.assertEqual(event["event_time"], "2026-09-10")
+        self.assertNotEqual(event["event_time"], "2026-09-20T10:00:00+08:00")
+        self.assertNotIn(
+            ScriptedAdapters.statement_batches[0][0]["statement_id"], json.dumps(result["product"])
+        )
+
+    async def test_first_scan_old_or_undated_statement_is_not_backfilled(self):
+        old = statement_candidate(
+            "On 2026-05-01 we launched SSO.", initial=True, statement_date="2026-05-01"
+        )
+        undated = statement_candidate("We launched SCIM.", initial=True, statement_date=None)
+        ScriptedAdapters.versions = ["Stable product page."] * 2
+        ScriptedAdapters.statement_batches = [
+            [old, undated],
+            [{**old, "initial_backfill": False}, {**undated, "initial_backfill": False}],
+        ]
+        result = await self.pipeline.run(self.product)
+        workspace = identity([self.product.workspace_id, self.product.competitor_name])
+        self.assertEqual(result["product"]["historical_events"], [])
+        self.assertEqual(ScriptedAdapters.calls["path_b_detect"], 0)
+        observations = self.pipeline.store.items("statement_observations:" + workspace)
+        self.assertEqual(len(observations), 2)
+        self.assertTrue(all(item["seen_at_baseline"] for item in observations.values()))
+        await ProductPipeline(self.root, adapter_type=ScriptedAdapters).run(self.product)
+        self.assertEqual(ScriptedAdapters.calls["path_b_detect"], 0)
+
+    async def test_initial_backfill_filters_then_sorts_and_caps_at_twenty(self):
+        candidates = []
+        reference = date(2026, 9, 20)
+        for days_ago in range(25):
+            statement_date = reference - timedelta(days=days_ago)
+            candidates.append(statement_candidate(
+                f"On {statement_date.isoformat()} we released capability {days_ago}.",
+                initial=True, statement_date=statement_date.isoformat(),
+            ))
+        candidates.append(statement_candidate(
+            "On 2026-01-01 we released an old capability.", initial=True,
+            statement_date="2026-01-01",
+        ))
+        selected = select_initial_backfill(
+            list(reversed(candidates)), "2026-09-20T10:00:00+08:00", INITIAL_BACKFILL_MAX_EVENTS
+        )
+        self.assertEqual(len(selected), 20)
+        self.assertEqual(selected[0]["statement_date"], "2026-09-20")
+        self.assertEqual(selected[-1]["statement_date"], "2026-09-01")
+        self.assertNotIn("2026-01-01", {item["statement_date"] for item in selected})
+
+    async def test_initial_backfill_pipeline_never_calls_more_than_twenty(self):
+        reference = date(2026, 9, 20)
+        candidates = [
+            statement_candidate(
+                f"On {(reference - timedelta(days=index)).isoformat()} we released capability {index}.",
+                initial=True, statement_date=(reference - timedelta(days=index)).isoformat(),
+            )
+            for index in range(25)
+        ]
+        ScriptedAdapters.versions = ["Stable product page."] * 2
+        ScriptedAdapters.statement_batches = [
+            candidates, [{**item, "initial_backfill": False} for item in candidates]
+        ]
+        result = await self.pipeline.run(self.product)
+        workspace = identity([self.product.workspace_id, self.product.competitor_name])
+        self.assertEqual(ScriptedAdapters.calls["path_b_detect"], 20)
+        self.assertEqual(len(result["product"]["historical_events"]), 20)
+        self.assertEqual(result["product"]["detected_events"], [])
+        self.assertEqual(len(self.pipeline.store.items("statement_observations:" + workspace)), 25)
+        self.assertEqual(len(self.pipeline.store.items("statement_processing:" + workspace)), 20)
+
+        unchanged = await ProductPipeline(self.root, adapter_type=ScriptedAdapters).run(self.product)
+        self.assertEqual(ScriptedAdapters.calls["path_b_detect"], 20)
+        self.assertEqual(unchanged["product"]["detected_events"], [])
+        self.assertEqual(unchanged["product"]["historical_events"], [])
+
+    async def test_subsequent_new_undated_statement_runs_path_b_when_path_a_unchanged(self):
+        text = "We launched a new audit log export."
+        ScriptedAdapters.versions = ["Stable product page.", "Stable product page.", "Stable product page."]
+        ScriptedAdapters.statement_batches = [[], [statement_candidate(text, initial=False)], [
+            {**statement_candidate(text, initial=False), "is_new": False}
+        ]]
+        await self.pipeline.run(self.product)
+        second = await self.pipeline.run(self.product)
+        self.assertEqual(ScriptedAdapters.calls["path_b_detect"], 1)
+        self.assertEqual(len(second["product"]["detected_events"]), 1)
+        self.assertEqual(second["product"]["detected_events"][0]["discovery_origin"], "normal_monitoring")
+        self.assertIsNone(second["product"]["detected_events"][0]["event_time"])
+        observed = self.pipeline.store.items("events:" + identity(
+            [self.product.workspace_id, self.product.competitor_name]
+        ))
+        self.assertEqual(next(iter(observed.values()))["evidence"][0]["observed_at"],
+                         "2026-09-20T10:00:00+08:00")
+
+        third = await self.pipeline.run(self.product)
+        self.assertEqual(ScriptedAdapters.calls["path_b_detect"], 1)
+        self.assertEqual(third["product"]["detected_events"], [])
+
+    async def test_statement_identity_dedup_is_separate_from_event_dedup(self):
+        first = statement_candidate(
+            "On 2026-09-10 we announced SSO.", initial=True, statement_date="2026-09-10",
+            url="https://example.com/changelog",
+        )
+        second = statement_candidate(
+            "On 2026-09-10 we announced enterprise SSO.", initial=True, statement_date="2026-09-10",
+            url="https://example.com/blog",
+        )
+        ScriptedAdapters.statement_batches = [[first, second]]
+        ScriptedAdapters.dedup_same_event = True
+        result = await self.pipeline.run(self.product)
+        workspace = identity([self.product.workspace_id, self.product.competitor_name])
+        self.assertEqual(ScriptedAdapters.calls["path_b_detect"], 2)
+        self.assertEqual(len(self.pipeline.store.items("statement_processing:" + workspace)), 2)
+        self.assertEqual(len(self.pipeline.store.items("events:" + workspace)), 1)
+        self.assertEqual(len(result["product"]["historical_events"]), 1)
+        self.assertEqual(len(next(iter(self.pipeline.store.items("events:" + workspace).values()))["evidence"]), 2)
+
+    async def test_announcement_and_later_ga_have_distinct_statement_identity(self):
+        announced = statement_candidate(
+            "On 2026-09-01 we announced SSO for Q4.", initial=True, statement_date="2026-09-01"
+        )
+        launched = statement_candidate(
+            "On 2026-09-15 SSO became generally available.", initial=True, statement_date="2026-09-15"
+        )
+        ScriptedAdapters.statement_batches = [[announced, launched]]
+        await self.pipeline.run(self.product)
+        workspace = identity([self.product.workspace_id, self.product.competitor_name])
+        self.assertNotEqual(announced["statement_id"], launched["statement_id"])
+        self.assertEqual(len(self.pipeline.store.items("statement_processing:" + workspace)), 2)
+        self.assertEqual(len(self.pipeline.store.items("events:" + workspace)), 2)
+
+    async def test_path_b_partial_failure_retries_only_pending_statement_after_reopen(self):
+        ScriptedAdapters.versions = ["Stable product page.", "Stable product page."]
+        candidates = [
+            statement_candidate(
+                f"On 2026-09-{index:02d} we released capability {index}.", initial=True,
+                statement_date=f"2026-09-{index:02d}",
+            )
+            for index in range(1, 21)
+        ]
+        failed = [candidates[5], candidates[13]]
+        ScriptedAdapters.statement_batches = [candidates]
+        ScriptedAdapters.explicit_outcomes = {
+            item["input"]["current_state"]: RuntimeError("controlled Path B failure")
+            for item in failed
+        }
+        first = await self.pipeline.run(self.product)
+        workspace = identity([self.product.workspace_id, self.product.competitor_name])
+        states = self.pipeline.store.items("statement_processing:" + workspace)
+        observations = self.pipeline.store.items("statement_observations:" + workspace)
+        self.assertEqual(first["product"]["status"], "failed")
+        self.assertEqual(len(observations), 20)
+        self.assertTrue(all(item["seen_at_baseline"] for item in observations.values()))
+        self.assertEqual(sum(state["status"] == "processed" for state in states.values()), 18)
+        self.assertEqual(sum(state["status"] == "pending" for state in states.values()), 2)
+        self.assertEqual(len(self.pipeline.store.items("events:" + workspace)), 18)
+        self.assertEqual(ScriptedAdapters.calls["path_b_detect"], 20)
+        self.assertIsNotNone(self.pipeline.store.get("processed_latest:" + workspace, self.source_url))
+
+        ScriptedAdapters.explicit_outcomes = {}
+        reopened = ProductPipeline(self.root, adapter_type=ScriptedAdapters)
+        recovered = await reopened.resume(first["run_id"])
+        states = reopened.store.items("statement_processing:" + workspace)
+        self.assertEqual(recovered["product"]["status"], "complete")
+        self.assertTrue(all(state["status"] == "processed" for state in states.values()))
+        self.assertEqual(ScriptedAdapters.calls["path_b_detect"], 22)
+        self.assertEqual(len(reopened.store.items("events:" + workspace)), 20)
+
+        await ProductPipeline(self.root, adapter_type=ScriptedAdapters).run(self.product)
+        self.assertEqual(ScriptedAdapters.calls["path_b_detect"], 22)
+
+    def test_structured_candidate_extraction_uses_official_blocks_and_reliable_dates(self):
+        recent_text = "On 2026-09-10 we released SSO."
+        blocks = [
+            {"type": "heading", "level": 2, "text": "2026-09-10", "links": []},
+            {"type": "paragraph", "text": recent_text, "links": []},
+            {"type": "heading", "level": 2, "text": "Current capabilities", "links": []},
+            {"type": "paragraph", "text": "Supports SCIM.", "links": []},
+        ]
+        content = "## 2026-09-10\n\n" + recent_text + "\n\n## Current capabilities\n\nSupports SCIM."
+        current = snapshot(recent_text, "2026-09-20T10:00:00+08:00")
+        current.update(blocks=blocks, content=content, final_url="https://example.com/changelog")
+        history = {"is_first_scan": True, "current_snapshot": current, "previous_snapshot": None,
+                   "snapshot_id": "snapshot-1"}
+        source = {"url": "https://example.com/changelog", "source_type": "changelog",
+                  "credibility": "official", "official_domains": ["example.com"]}
+        candidates = extract_statement_candidates(history, source, competitor="Example")
+        self.assertEqual(candidates[0]["statement_date"], "2026-09-10")
+        self.assertIsNone(candidates[1]["statement_date"])
+        source["credibility"] = "unverified"
+        self.assertEqual(extract_statement_candidates(history, source, competitor="Example"), [])
+
+    def test_structured_candidate_extraction_has_per_source_cost_bound(self):
+        blocks = [
+            {"type": "paragraph", "text": f"Statement block {index}.", "links": []}
+            for index in range(65)
+        ]
+        current = snapshot("placeholder", "2026-09-20T10:00:00+08:00")
+        current.update(
+            blocks=blocks, content="\n\n".join(block["text"] for block in blocks),
+            final_url="https://example.com/changelog",
+        )
+        history = {"is_first_scan": True, "current_snapshot": current, "previous_snapshot": None,
+                   "snapshot_id": "bounded-snapshot"}
+        source = {"url": "https://example.com/changelog", "source_type": "changelog",
+                  "credibility": "official", "official_domains": ["example.com"]}
+        self.assertEqual(len(extract_statement_candidates(history, source, competitor="Example")), 60)
+
+    def test_statement_identity_and_seen_state_survive_store_reopen(self):
+        text = "We released audit log export."
+        source = {"url": "https://example.com/changelog", "source_type": "changelog",
+                  "credibility": "official", "official_domains": ["example.com"]}
+        first_snapshot = snapshot(text, "2026-09-20T10:00:00+08:00")
+        first_snapshot.update(final_url=source["url"])
+        second_snapshot = snapshot(text, "2026-09-21T10:00:00+08:00")
+        second_snapshot.update(final_url=source["url"])
+        first = extract_statement_candidates(
+            {"is_first_scan": True, "current_snapshot": first_snapshot,
+             "previous_snapshot": None, "snapshot_id": "first"},
+            source, competitor="Example",
+        )[0]
+        second = extract_statement_candidates(
+            {"is_first_scan": False, "current_snapshot": second_snapshot,
+             "previous_snapshot": first_snapshot, "snapshot_id": "second"},
+            source, competitor="Example",
+        )[0]
+        self.assertEqual(first["statement_id"], second["statement_id"])
+
+        workspace = "statement-seen-reopen"
+        self.assertFalse(self.pipeline.store.observe_statements(workspace, [first])[
+            first["statement_id"]
+        ]["was_seen"])
+        reopened = PipelineStore(self.root)
+        self.assertTrue(reopened.observe_statements(workspace, [second])[
+            second["statement_id"]
+        ]["was_seen"])
+        self.assertTrue(reopened.get(
+            "statement_observations:" + workspace, first["statement_id"]
+        )["seen_at_baseline"])
 
     async def test_second_scan_enters_event_detection(self):
         await self.pipeline.run(self.product)

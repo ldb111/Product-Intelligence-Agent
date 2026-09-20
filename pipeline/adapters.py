@@ -21,6 +21,7 @@ from source_discovery.search.tencent_wsa import TencentWsaSearchProvider
 from triage.workflow import TriageWorkflow
 
 from .store import identity
+from .statements import extract_statement_candidates
 
 
 class ModuleAdapters:
@@ -71,6 +72,15 @@ class ModuleAdapters:
             if change["change_type"] != "unchanged":
                 inputs.append(build_state_comparison_input(history, state_key=change["state_key"], **args))
         return inputs
+
+    def explicit_statement_candidates(self, history: dict, source: dict) -> list[dict]:
+        """从当前 Structured Content 提取有界局部单元，交给正式 Path B 判断。
+
+        输入是本次固定 Snapshot History 和已确认 Monitoring Source。这里仅负责来源资格、
+        结构切分、可靠日期识别与稳定 statement identity；不按动作关键词认定 Event。
+        输出最多 60 个局部候选，Initial Backfill 的 90 天与全竞品 20 条限制由上层统一执行。
+        """
+        return extract_statement_candidates(history, source, competitor=self.product.competitor_name)
 
     def detect(self, data):
         return detect_event(data)

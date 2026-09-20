@@ -46,6 +46,7 @@ class ProductResult(BaseModel):
     scan_status: str = "not_scanned"
     baseline_created: bool = False
     detected_events: list[dict] = Field(default_factory=list)
+    historical_events: list[dict] = Field(default_factory=list)
     pending_candidates: list[dict] = Field(default_factory=list)
     triage_results: list[dict] = Field(default_factory=list)
     research_actions: list[dict] = Field(default_factory=list)

@@ -105,6 +105,92 @@ class PipelineStore:
             self._put(db, namespace, event_id, running)
             return {"claimed": True, "state": running}
 
+    def observe_statements(self, workspace: str, statements: list[dict]) -> dict[str, dict]:
+        """原子记录本次成功扫描实际看见的全部 statement identity。
+
+        输入包含结构提取所得的 statement_id、来源、Snapshot 和是否 Initial Scan。无论声明
+        是否满足 90 天、是否进入 20 条 Backfill、是否带日期，都写入独立 observation 状态。
+        输出为每个 identity 标明写入前是否已经 seen，供上层只把真正首次出现的后续声明
+        认作 normal_monitoring。这里不创建 processing 状态，也不表示 Event Core 已处理。
+        """
+        namespace = "statement_observations:" + workspace
+        observed: dict[str, dict] = {}
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            for statement in statements:
+                key = statement["statement_id"]
+                if key in observed:
+                    continue
+                row = db.execute(
+                    "SELECT body FROM records WHERE namespace=? AND key=?", (namespace, key)
+                ).fetchone()
+                if row is None:
+                    state = {
+                        "statement_id": key,
+                        "source_url": statement["source_url"],
+                        "first_seen_snapshot_id": statement["snapshot_id"],
+                        "last_seen_snapshot_id": statement["snapshot_id"],
+                        "seen_at_baseline": bool(statement["initial_backfill"]),
+                    }
+                    was_seen = False
+                else:
+                    state = json.loads(row[0])
+                    state["last_seen_snapshot_id"] = statement["snapshot_id"]
+                    was_seen = True
+                self._put(db, namespace, key, state)
+                observed[key] = {"was_seen": was_seen, "observation": state}
+        return observed
+
+    def register_statement(self, workspace: str, statement: dict) -> dict:
+        """持久化一个准备进入 Path B 的 statement，不覆盖既有处理终态。
+
+        输入包含稳定 statement_id、正式 DetectionInput、来源和 discovery_origin。首次写入
+        状态为 pending；同一声明在 same-run/new-run 再次出现时返回旧状态，使失败项可重试、
+        已成功项可跳过。Statement 状态独立于 Path A comparison watermark 和 Event Dedup。
+        """
+        namespace = "statement_processing:" + workspace
+        key = statement["statement_id"]
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT body FROM records WHERE namespace=? AND key=?", (namespace, key)
+            ).fetchone()
+            if row is not None:
+                return json.loads(row[0])
+            state = {**statement, "status": "pending", "attempts": 0}
+            self._put(db, namespace, key, state)
+            return state
+
+    def mark_statement_processed(
+        self, workspace: str, statement_id: str, outcomes: list[str], event_ids: list[str]
+    ) -> dict:
+        """在 Path B 正式结果安全持久化后，原子记录 statement 已完成。
+
+        event 的 Event/Dedup outcome、uncertain 的 Pending Candidate 会由调用方先持久化；
+        no_event 则已有成功 Detection checkpoint。这里只更新独立 statement 状态，因此
+        Path B 的成功或失败不会推进、回退或伪造 Path A processed watermark。
+        """
+        allowed = {"event", "no_event", "uncertain"}
+        normalized = list(dict.fromkeys(outcomes))
+        if not normalized or not set(normalized) <= allowed:
+            raise ValueError("Statement 只有在 Event Core 正式终态后才能完成。")
+        namespace = "statement_processing:" + workspace
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT body FROM records WHERE namespace=? AND key=?", (namespace, statement_id)
+            ).fetchone()
+            if row is None:
+                raise ValueError("待完成的 Statement 不存在。")
+            state = json.loads(row[0])
+            state.update(
+                status="processed", event_core_outcomes=normalized,
+                event_candidate_ids=list(dict.fromkeys(event_ids)),
+                attempts=state.get("attempts", 0) + 1,
+            )
+            self._put(db, namespace, statement_id, state)
+            return state
+
     @staticmethod
     def _put(db, namespace, key, body):
         db.execute("INSERT INTO records VALUES(?,?,?) ON CONFLICT(namespace,key) DO UPDATE SET body=excluded.body",

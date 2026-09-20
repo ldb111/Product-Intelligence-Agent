@@ -2,8 +2,9 @@
 
 ## 1. Repository Inspection
 
-基于冻结 HEAD `c458f6fb8f0f32e756eed65601e29f40d62af61b` 继续，未从头重做。
-续接时实际检查了 `git status --short`、工作区与暂存区 diff、现存文件、公共接口和项目规范：6 个 `pipeline/` 文件已新增并暂存，普通 diff 为空；测试、E2E 入口和本报告尚未建立。已有代码可编译、可导入，没有发现半写入文件或需要更改冻结规则的数据契约冲突。
+Repair C 基于已提交的 Repair A/B HEAD `f4ccd0b1e59b942b9b323b6ba25c1faa5ea367de`
+继续。实际检查了工作区、现有 Path B 接口、Structured Content、Source credibility 和 SQLite
+持久化能力；现有契约足以在 Integration 层接入，不需要修改 Frozen Event Core。
 
 保留现有实现，仅在 Integration 层补齐配置失败检查点、官方域身份传递及重定向后的可信度边界。原有 `tmp/` 保持原样。Source Discovery、Stage 1、Event Core、Knowledge、Memory、Intelligence 及 `llm/` 的既有文件未修改。
 
@@ -13,8 +14,10 @@
 
 ```text
 ProductInput → 配置 → Source Discovery / 已确认来源
-  → Stage 1 → Snapshot → 首次 Baseline / 后续 Contextual Diff
-  → Event Core → confirmed: Triage → recommendation / monitor / no_action
+  → Stage 1 → Snapshot
+      → Path A：首次 Baseline / 后续 Contextual Diff
+      → Path B：首次 Limited Historical Backfill / 后续新增 Explicit Statement
+  → Event Core → confirmed: Event Dedup → Triage → recommendation / monitor / no_action
                                → 用户显式 start_research → Deep Research
                → uncertain: Verification → 正式检测 / 结束 / Pending
   → ProductResult + 独立 Audit
@@ -22,7 +25,7 @@ ProductInput → 配置 → Source Discovery / 已确认来源
 
 ## 3. Files Changed
 
-本轮交付 9 个新增文件（相对冻结 HEAD）：
+Final Integration 及 Repair A/B/C 的当前相关交付文件：
 
 | 文件 | 职责 |
 | --- | --- |
@@ -32,8 +35,12 @@ ProductInput → 配置 → Source Discovery / 已确认来源
 | `pipeline/adapters.py` | 冻结模块的薄适配 |
 | `pipeline/orchestrator.py` | 显式流程、路由、恢复、任务级去重及用户触发 Research 生命周期 |
 | `pipeline/output.py` | 产品级 Event 标识、用户字段投影、引用命名空间、内部信息隔离 |
-| `tests/test_pipeline.py` | 51 项集成控制测试 |
+| `pipeline/statements.py` | Structured Statement 候选、可靠日期识别及 Backfill 有界筛选 |
+| `tests/test_pipeline.py` | 68 项集成控制测试 |
 | `experiments/pia_e2e.py` | Baseline + 真实事件 recommendation / 显式 Research / 幂等复用验收入口 |
+| `experiments/final_integration_repair_a_e2e.py` | watermark、Event persistence 与 Verification 控制验收 |
+| `experiments/final_integration_repair_b_e2e.py` | 用户显式 Research 生命周期控制验收 |
+| `experiments/final_integration_repair_c_e2e.py` | Historical Backfill、后续 Statement 与去重控制验收 |
 | `docs/final_integration_v0.1.md` | 本实现报告 |
 
 `experiments/output/` 中的真实运行 JSON、审计和数据库是本地验收产物，受既有忽略规则保护，不属于交付文件。
@@ -81,6 +88,20 @@ Triage 的 `research` 只创建 `not_started` recommendation，主 Pipeline 正�
 
 Event Detection 构造、调用或解析失败时，当前 Snapshot 仍保留在 observed history，comparison 保持 pending，processed baseline 保持 Previous。恢复同一 run 会复用原 Snapshot 和历史对；创建新 run 时仍以 processed baseline 比较当前页面，因此页面保持不变也会重新处理原来的 A → B。成功后 B 成为新 baseline，下一次 C 正确比较 B → C。
 
+Path B 与 Path A 独立运行。首次扫描仍保持 Path A 模型调用为 0，但会从成功读取的官方
+Monitoring Source 的 Structured Content 中形成有限局部 statement 候选，再调用现有
+`build_explicit_statement_input()` 和 Event Core。程序不按动作关键词认定 Event；
+“支持 SSO”这类 Current Fact 仍须由 Event Core 判为 no_event，不能因为首次看到而成为事件。
+
+首次 Path B 只执行 Limited Historical Backfill：statement 自身正文或相邻结构上下文必须
+包含可验证的完整日期，先筛选采集参考日之前最近 90 天，再按声明日期从新到旧取全竞品
+最多 20 条。`captured_at/observed_at` 只表示系统观察时间和窗口参考点，绝不补作 event_time。
+无可靠日期的首次声明只随页面保存为 Baseline，不进入 Historical Backfill。
+
+后续扫描只处理相对上一 Snapshot 新出现、或先前失败仍为 pending 的 statement；新声明即使
+没有可靠 event_time 仍可进入正常 Path B，由 Event Core 保持 event_time 为 null。Path A
+unchanged 不会阻止 Path B 处理新的 Explicit Statement。
+
 ## 7. Event Routing
 
 | 输入/结果 | 后续行为 |
@@ -114,6 +135,18 @@ Snapshot 持久化区分 `observed_latest:<workspace>`、`processed_latest:<work
 
 成功步骤跳过，失败步骤可恢复；已完成运行直接返回保存结果。同一个 run 恢复不会重新扫描或重复创建 Snapshot，新 run 能恢复尚未处理的变化。Research 使用 `research_status:<workspace>` 独立持久化 `not_started/running/completed/failed`；completed 重复启动直接复用结果，failed 只有显式 retry 才重试。进程重启后遇到旧 process token 的 running 会标记为 `research_interrupted`，再由用户 retry。Knowledge 文档去重继续由冻结入库层负责，Integration 不新增入库规则。
 
+Path B 的观察和处理使用两个独立命名空间。`statement_observations:<workspace>` 保存每次成功
+扫描看见的全部 statement identity，包括未入选的第 21–25 条、无日期及超过 90 天的首次声明；
+`statement_processing:<workspace>` 只属于真正进入 Event Core 的声明。两者都以来源 URL、规范
+statement 原文和相邻结构上下文的稳定指纹作为 key，并与 Path A comparison watermark、
+Event candidate ID 和 Event Dedup 分离。
+
+后续 normal_monitoring 只接受 observation state 中此前从未 seen 的 identity，不能把“没有
+processing record”等同于新声明。每条入选 statement 在检测前保存 pending；event 必须先完成
+Event/Dedup outcome 持久化，uncertain 必须先保存 Pending Candidate，之后才标记 processed。
+因此一个声明可以同时是 baseline seen 和 processing pending；seen 不会阻止失败重试。单条失败
+保持 pending，同 run 或 new run 可重试；同批其他成功 statement 不回滚，也不会重复检测。
+
 这是本地单进程任务级保护；不提供跨数据库事务或供应商请求的 exactly-once。外部请求完成而本地检查点尚未保存时崩溃，恢复可能再次请求。
 
 ## 10. Error Handling
@@ -124,7 +157,15 @@ Snapshot 持久化区分 `observed_latest:<workspace>`、`processed_latest:<work
 
 ## 11. Product Output vs Audit
 
-ProductResult 包含 competitor、monitoring_sources、scan_status、baseline_created、带产品级 `event_id` 的 detected_events、带独立 `pending_id` 的 pending_candidates、triage_results、research_actions、completed research_results、verification_results、citations、current_focus、uncertainties、status / error。
+ProductResult 包含 competitor、monitoring_sources、scan_status、baseline_created、带产品级
+`event_id` 的 detected_events、单独的 historical_events、带独立 `pending_id` 的
+pending_candidates、triage_results、research_actions、completed research_results、
+verification_results、citations、current_focus、uncertainties、status / error。
+
+`historical_events` 的每项明确带 `discovery_origin=historical_backfill`，不进入正常
+`detected_events`，因此未来 Dashboard 可以把首次配置时回溯发现的近期历史事件与本次新发现
+事件分开展示。正常后续 Path B Event 标记为 `normal_monitoring`。产品输出不暴露 statement
+hash、processing key、checkpoint 或内部 candidate_id。
 
 用户 JSON 排除 candidate_id、pipeline checkpoint、内部 artifact key、Provider、模型运行配置、SQLite 地址、源文件引用和原始工具轨迹；明显凭据及本机路径再做保守遮蔽。产品级 citation/result reference 保留，并使用产品 Event 或稳定展示分组限定命名空间，避免合并后串引用。
 
@@ -132,7 +173,10 @@ ProductResult 包含 competitor、monitoring_sources、scan_status、baseline_cr
 
 ## 12. Targeted Tests
 
-`python -X utf8 -m unittest tests.test_pipeline -q`：**51/51 PASS**，12.666 秒。覆盖 Repair A 的全部 47 项语义，并加入 Repair B recommendation、显式启动、生命周期、幂等、失败重试和产品输出边界。
+`python -X utf8 -m unittest tests.test_pipeline -q`：**68/68 PASS**，28.384 秒。覆盖 Repair A/B 全部语义，
+并加入 Repair C 的首次 Baseline/Backfill 分离、90 天与 20 条顺序、可靠日期、官方来源、
+historical/normal 产品语义、statement/Event 两层去重、后续无日期声明、partial failure、
+same-run/new-run 恢复和 Store reopen。
 
 Repair B 新增覆盖 research recommendation 不自动执行、not_started/running/completed/failed 持久化、running/completed 幂等、interrupted recovery、failed retry、monitor/no_action 拒绝启动、Research failure 不污染主 Pipeline，以及产品 Event/Pending 标识、citation 与 Developer Audit 分离。Repair A 的 watermark、Event persistence 故障边界、下游恢复和 Verification Event Core re-entry 全部继续通过。
 
@@ -165,6 +209,11 @@ Case B 复用 `event_core_v01_live_02.json` 中已验收的公开官方 Case B�
 
 Repair B 没有重新消耗真实 Research 调用。既有真实 Agent E2E 继续证明 ResearchAgent 能完成真实工具链；更新后的 `pia_e2e.py` 把集成验收拆为 Phase A recommendation/not_started、Phase B 用户显式启动/completed、Phase C completed 结果复用。另以无网络控制 E2E 实际验证三阶段均 PASS。
 
+Repair C 新增无网络控制 E2E：Case A 验证首次 Path A 仅建立 Baseline、近期官方 dated
+statement 经 Path B 产生 historical_backfill；Case B 验证后续 Path A unchanged 时新增
+Explicit Statement 仍产生 normal_monitoring Event；Case C 验证重复 statement 不再次调用
+Event Core，也不产生重复 Event。本轮不要求、也未执行真实联网 Backfill。
+
 首次运行命令：`python -X utf8 experiments/pia_e2e.py --output experiments/output/pia_v01_live_01.json`。已存在状态目录应走恢复入口；创建新的演示需要自行选择新的 output 路径，不清理旧验收数据。
 
 恢复入口：准备阶段用 `--resume-setup` 复用已通过 Baseline；主链开始后用 `--resume-run <已保存的 run_id>`。不通过新建状态目录反复重跑成功步骤。
@@ -189,15 +238,15 @@ Repair B 没有重新消耗真实 Research 调用。既有真实 Agent E2E 继�
 
 ## 15. Full Regression
 
-`python -X utf8 -m unittest discover -s tests -q`：**502/502 PASS**，89.314 秒。原模块及 Repair A 测试无退化；日志中的无效 PDF、存储/响应故障和工具失败警告来自既有负向测试，最终结果为 OK。
+`python -X utf8 -m unittest discover -s tests -q`：**519/519 PASS**，74.671 秒。原模块及 Repair A/B/C 测试无退化；日志中的无效 PDF、存储/响应故障和工具失败警告来自既有负向测试，最终结果为 OK。
 
 ## 16. Code Quality
 
 核心操作按配置、扫描、候选处理、产物保存、输出投影分开，中文说明关键边界；没有 500 行 run、Manager、协调框架或多 Agent。既有公共函数的名称、返回结构及输入要求已按真实代码核对。
 
-`git diff --check`、`git diff --cached --check` 均 PASS；另对全部 9 个交付文件逐个执行 no-index 空白检查，均通过。Git 的 LF/CRLF 提示不是空白错误。
-
-扫描全部 9 个交付文件及本轮 5 个验收产物（2 JSON + 3 SQLite）：已配置凭据原值命中 **0**，高置信度凭据模式命中 **0**。暂存区禁止路径命中 **0**；相对冻结 HEAD 的原有 tracked 文件修改 **0**。扫描仅报告数量。
+`git diff --check` PASS；两个新增文件的独立 trailing-whitespace 检查命中 0。Git 的
+LF/CRLF 提示不是空白错误。本轮 9 个 Repair C 文件的高置信度 Secret 扫描命中 **0**；
+Frozen 模块 tracked 修改 **0**，`.env` 和 `experiments/output/` 修改 **0**。扫描只报告数量。
 
 ## 17. Known Limitations
 
@@ -213,23 +262,31 @@ Repair B 没有重新消耗真实 Research 调用。既有真实 Agent E2E 继�
 - 部分步骤失败后没有完整模型用量可回收；持久化指标只代表可观察调用，不能当作账单总额。已确认来源会被复用，没有本轮范围外的自动来源刷新。
 - 旧版本若只保留 `latest` 而对应运行检查点也已被外部删除，系统无法法证式判断该历史 Snapshot 是否曾处理完成，只能沿用旧指针；正常 PipelineStore 数据会保留检查点并自动选择安全 baseline。本轮不回滚或重建历史 Snapshot。
 - E2E 依赖本地已验收的事件归档和既有配置；新克隆需提供真实归档，不能凭空生成替代。后续仍需用户实际运行、验收和解释核心代码。
+- Historical Backfill 只覆盖当前 Source Reader 和 Structured Content 实际访问、抽取到的最近
+  内容。分页、无限滚动、历史归档、登录后页面或当前读取边界之外的动态加载内容不会被自动
+  穷举，因此不能宣称最近 90 天历史完整，也不能宣称全量 Changelog 或全网事件召回。
+- V0.1 的可靠日期识别限于 Structured Content 正文或相邻 Heading/Card/Table 上下文中的完整
+  日期；未进入 Snapshot 的 HTML metadata 不会被猜测补齐。每来源最多形成 60 个有界结构候选，
+  Initial Backfill 再执行全竞品最近 90 天、最多 20 条限制。
 
 ## 18. Git Status
 
-未 Commit，HEAD 保持 `c458f6fb8f0f32e756eed65601e29f40d62af61b`。保留续接时已存在的 6 个暂存新增文件，未替用户更新暂存区；三个文件有后续未暂存补充，其余新增交付文件尚未暂存。审阅以工作区最新内容为准，暂存区不是本轮最终完整快照。
+Repair C 未 Commit，HEAD 保持 Repair A/B 提交
+`f4ccd0b1e59b942b9b323b6ba25c1faa5ea367de`。暂存区为空，审阅以工作区最新内容为准。
 
 `.env` 未修改，既有 `tmp/` 未删除或清理；验收输出留在已忽略的 `experiments/output/`。没有进入 UI、Evaluation、Token 优化或下一阶段开发。
 
 ```text
-A  pipeline/__init__.py
-AM pipeline/adapters.py
-AM pipeline/orchestrator.py
-AM pipeline/output.py
-A  pipeline/schemas.py
-A  pipeline/store.py
-?? docs/final_integration_v0.1.md
-?? experiments/pia_e2e.py
-?? tests/test_pipeline.py
+ M docs/final_integration_v0.1.md
+ M pipeline/adapters.py
+ M pipeline/orchestrator.py
+ M pipeline/output.py
+ M pipeline/schemas.py
+ M pipeline/store.py
+ M tests/test_pipeline.py
+?? docs/full_implementation_drift_audit_v1.md
+?? experiments/final_integration_repair_c_e2e.py
+?? pipeline/statements.py
 ?? tmp/
 ```
 

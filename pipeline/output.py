@@ -45,7 +45,9 @@ def present_artifact(artifact: dict, group: str) -> dict:
     return {"result": qualify(result), "citations": qualify(sources)}
 
 
-def present_event(event: dict, *, pending: bool = False) -> tuple[dict, list[dict]]:
+def present_event(
+    event: dict, *, pending: bool = False, discovery_origin: str | None = None
+) -> tuple[dict, list[dict]]:
     """保留事件事实与真实来源；排除内部 evidence_context、存储引用和模型用量。"""
     facts = {k: event[k] for k in ("competitor", "decision", "event_type", "event_subject",
              "change_action", "change_items", "event_time", "effective_time", "affected_scope", "decision_reason",
@@ -53,6 +55,8 @@ def present_event(event: dict, *, pending: bool = False) -> tuple[dict, list[dic
     facts["pending_id" if pending else "event_id"] = (
         product_pending_id(event) if pending else product_event_id(event)
     )
+    if discovery_origin:
+        facts["discovery_origin"] = discovery_origin
     facts["evidence_refs"] = ["event:" + e["evidence_id"] for e in event["evidence"]]
     citations = [{"result_id": "event:" + e["evidence_id"], "url": e["source_url"], "title": e["source_title"],
                   "content": e["relevant_excerpt"], "source": "event", "domain": "competitor"}
@@ -93,13 +97,21 @@ def build_product_result(store, run_id: str, product, workspace: str, error: str
         result.baseline_created = any(s["is_first_scan"] for s in scans)
         result.scan_status = "baseline" if all(s["is_first_scan"] for s in scans) else "scanned"
     workspace_events = store.items("events:" + workspace)
-    for event in store.items("run_events:" + run_id).values():
-        facts, citations = present_event(event)
-        result.detected_events.append(facts)
+    event_origins = store.items("run_event_origins:" + run_id)
+    for internal_id, event in store.items("run_events:" + run_id).items():
+        origin = event_origins.get(internal_id, {}).get("discovery_origin", "normal_monitoring")
+        facts, citations = present_event(event, discovery_origin=origin)
+        if origin == "historical_backfill":
+            result.historical_events.append(facts)
+        else:
+            result.detected_events.append(facts)
         result.citations.extend(citations)
     for pending in store.items("pending:" + workspace).values():
         if pending["status"] == "pending":
-            facts, citations = present_event(pending["candidate"], pending=True)
+            facts, citations = present_event(
+                pending["candidate"], pending=True,
+                discovery_origin=pending.get("discovery_origin", "normal_monitoring"),
+            )
             result.pending_candidates.append({"candidate": facts, "reason": pending["reason"]})
             result.citations.extend(citations)
     for index, (_, reference) in enumerate(store.items("run_artifacts:" + run_id).items(), start=1):

@@ -16,6 +16,7 @@ from triage.schemas import TriageResult
 from .adapters import ModuleAdapters
 from .output import build_product_result, present_research_action
 from .schemas import PipelineFailure, ProductInput
+from .statements import INITIAL_BACKFILL_MAX_EVENTS, select_initial_backfill
 from .store import PipelineStore, identity, product_event_id
 
 
@@ -123,7 +124,7 @@ class ProductPipeline:
                     workspace, source["url"], history, ["baseline"]
                 )},
             )
-            return []
+            return history, []
         inputs = self._step(run_id, "comparison:" + key, "状态比较与 Contextual Diff", "event_detection_error",
                             lambda: [i.model_dump(mode="json") for i in adapter.detection_inputs(history, source)])
         candidates = []
@@ -150,14 +151,18 @@ class ProductPipeline:
             run_id, "processed:" + key, "完成事件判断并推进比较水位", "event_detection_error",
             lambda: self.store.mark_comparison_processed(workspace, source["url"], history, outcomes),
         )
-        return candidates
+        return history, candidates
 
-    def _save_pending_detection(self, workspace, candidate):
+    def _save_pending_detection(
+        self, workspace, candidate, discovery_origin="normal_monitoring"
+    ):
         """在推进比较水位前持久化 uncertain，避免崩溃后既无变化也无 Pending。"""
-        self._pending(workspace, candidate, candidate.uncertainty_reason)
+        self._pending(workspace, candidate, candidate.uncertainty_reason, discovery_origin)
         return {"candidate_id": candidate.candidate_id, "status": "pending"}
 
-    def _persist_event_outcome(self, run_id, workspace, adapter, candidate):
+    def _persist_event_outcome(
+        self, run_id, workspace, adapter, candidate, discovery_origin="normal_monitoring"
+    ):
         """完成 Event/Dedup 的可恢复持久化，但不执行 Knowledge、Triage 或 Research。
 
         输入是 Event Core 已确认的 candidate。方法先复用或执行正式 Dedup；模糊结果写入
@@ -182,20 +187,27 @@ class ProductPipeline:
         event_data = event.model_dump(mode="json")
         self.store.put("events:" + workspace, event.candidate_id, event_data)
         self.store.put("run_events:" + run_id, event.candidate_id, event_data)
+        self.store.put("run_event_origins:" + run_id, event.candidate_id,
+                       {"discovery_origin": discovery_origin})
         action_namespace = "event_actions:" + workspace
         action = self.store.get(action_namespace, event.candidate_id)
         if action is None or action.get("event") != event_data:
             self.store.put(action_namespace, event.candidate_id, {
                 "status": "pending", "event": event_data, "originating_run_id": run_id,
+                "discovery_origin": discovery_origin,
             })
         return {"status": "event_persisted", "event": event_data}
 
-    def _confirmed_event(self, run_id, workspace, product, adapter, candidate):
+    def _confirmed_event(
+        self, run_id, workspace, product, adapter, candidate, discovery_origin="normal_monitoring"
+    ):
         """复用已持久化的正式 Event，再执行可独立恢复的下游动作。"""
         outcome = self._step(
             run_id, "event_outcome:" + candidate.candidate_id, "持久化正式事件与去重结果",
             "event_detection_error",
-            lambda: self._persist_event_outcome(run_id, workspace, adapter, candidate),
+            lambda: self._persist_event_outcome(
+                run_id, workspace, adapter, candidate, discovery_origin
+            ),
         )
         if outcome["status"] != "event_persisted":
             return
@@ -218,7 +230,8 @@ class ProductPipeline:
         for action in self.store.items("event_actions:" + workspace).values():
             if action["status"] != "complete":
                 self._confirmed_event(run_id, workspace, product, adapter,
-                                      EventCandidate.model_validate(action["event"]))
+                                      EventCandidate.model_validate(action["event"]),
+                                      action.get("discovery_origin", "normal_monitoring"))
 
     def _ensure_research_state(self, workspace, event, triage_key, decision):
         """为 research 推荐建立独立 not_started 状态；monitor/no_action 不创建任务。"""
@@ -316,31 +329,41 @@ class ProductPipeline:
             urlsplit(e.source_url).hostname for e in candidate.evidence if e.source_credibility == "official"
         } - {None})
 
-    def _pending(self, workspace, candidate, reason):
+    def _pending(self, workspace, candidate, reason, discovery_origin="normal_monitoring"):
         self.store.put("pending:" + workspace, candidate.candidate_id,
-                       {"status": "pending", "reason": reason, "candidate": candidate.model_dump(mode="json")})
+                       {"status": "pending", "reason": reason, "candidate": candidate.model_dump(mode="json"),
+                        "discovery_origin": discovery_origin})
 
-    def _verify(self, run_id, workspace, product, adapter, candidate):
+    def _verify(
+        self, run_id, workspace, product, adapter, candidate,
+        discovery_origin="normal_monitoring",
+    ):
         """核验最多一轮；event/no_event 都必须携正式新证据重新进入 Event Core。"""
         resolved = self.store.get("resolved:" + workspace, candidate.candidate_id)
         if resolved:
             for data in resolved.get("events", []):
-                self._confirmed_event(run_id, workspace, product, adapter, EventCandidate.model_validate(data))
+                self._confirmed_event(
+                    run_id, workspace, product, adapter, EventCandidate.model_validate(data),
+                    resolved.get("discovery_origin", discovery_origin),
+                )
             return
-        self._pending(workspace, candidate, candidate.uncertainty_reason)
+        self._pending(workspace, candidate, candidate.uncertainty_reason, discovery_origin)
         key = identity([run_id, candidate.candidate_id])
         verification = self._artifact(run_id, workspace, "verification", key, "research_error",
             lambda: adapter.research(candidate, "verification", None, self._official_hosts(workspace, candidate)))
         decision = verification["result"]["decision"]
         if decision == "still_pending":
-            self._pending(workspace, candidate, verification["result"]["reason"])
+            self._pending(workspace, candidate, verification["result"]["reason"], discovery_origin)
             return
         inputs = self._step(
             run_id, "verification_inputs:" + key, "核验原文适配", "event_detection_error",
             lambda: [i.model_dump(mode="json") for i in adapter.verification_inputs(candidate, verification)],
         )
         if not inputs:
-            self._pending(workspace, candidate, "核验没有形成可交给 Event Core 的充分官方新证据，保留待处理。")
+            self._pending(
+                workspace, candidate, "核验没有形成可交给 Event Core 的充分官方新证据，保留待处理。",
+                discovery_origin,
+            )
             return
         formal = []
         for index, data in enumerate(inputs):
@@ -350,31 +373,134 @@ class ProductPipeline:
         confirmed = [item for item in formal if item["decision"] == "event"]
         uncertain = [item for item in formal if item["decision"] == "uncertain"]
         if not confirmed and uncertain:
-            self._pending(workspace, candidate, "Event Core 仍为 uncertain，保留待处理。")
+            self._pending(workspace, candidate, "Event Core 仍为 uncertain，保留待处理。", discovery_origin)
             return
         if not confirmed and (not formal or any(item["decision"] != "no_event" for item in formal)):
-            self._pending(workspace, candidate, "Event Core 未形成可解决候选的正式结论，保留待处理。")
+            self._pending(
+                workspace, candidate, "Event Core 未形成可解决候选的正式结论，保留待处理。",
+                discovery_origin,
+            )
             return
         for data in confirmed:
-            self._confirmed_event(run_id, workspace, product, adapter, EventCandidate.model_validate(data))
+            self._confirmed_event(
+                run_id, workspace, product, adapter, EventCandidate.model_validate(data), discovery_origin
+            )
         formal_decision = "event" if confirmed else "no_event"
         resolved_status = "resolved_event" if confirmed else "resolved_no_event"
         self.store.put("resolved:" + workspace, candidate.candidate_id,
-                       {"decision": formal_decision, "status": resolved_status, "events": confirmed})
+                       {"decision": formal_decision, "status": resolved_status, "events": confirmed,
+                        "discovery_origin": discovery_origin})
         self.store.put("pending:" + workspace, candidate.candidate_id,
                        {"status": resolved_status, "candidate": candidate.model_dump(mode="json"),
-                        "reason": verification["result"]["reason"]})
+                        "reason": verification["result"]["reason"],
+                        "discovery_origin": discovery_origin})
 
-    def process_event_candidates(self, run_id, workspace, product, adapter, candidates):
+    def _statement_plan(self, workspace, extracted: list[dict]) -> list[dict]:
+        """合并失败重试、后续新声明和有限 Initial Backfill，生成本次 Path B 计划。
+
+        已持久化 pending statement 优先重试，不消耗新的 Backfill 名额。首次候选先按可靠
+        日期筛选最近 90 天、全竞品按时间倒序取剩余名额；后续只接受相对上一 Snapshot
+        新增的结构单元。这里不读取或修改 Path A comparison watermark。
+        """
+        # Observation 必须先覆盖本次成功读取到的全部结构 statement，不能只记录最终入选
+        # Backfill 的 20 条。processing state 仍只属于真正进入 Event Core 的声明。
+        observations = self.store.observe_statements(workspace, extracted)
+        states = self.store.items("statement_processing:" + workspace)
+        planned = {
+            key: value for key, value in states.items() if value.get("status") == "pending"
+        }
+        initial, normal = [], []
+        for item in extracted:
+            old = states.get(item["statement_id"])
+            if old is not None:
+                continue
+            if item["initial_backfill"]:
+                initial.append(item)
+            elif not observations[item["statement_id"]]["was_seen"]:
+                normal.append({**item, "discovery_origin": "normal_monitoring"})
+
+        used_backfill = sum(
+            value.get("discovery_origin") == "historical_backfill" for value in states.values()
+        )
+        available = max(0, INITIAL_BACKFILL_MAX_EVENTS - used_backfill)
+        if initial and available:
+            reference_at = max(item["input"]["current_observed_at"] for item in initial)
+            for item in select_initial_backfill(initial, reference_at, available):
+                planned[item["statement_id"]] = {**item, "discovery_origin": "historical_backfill"}
+        for item in normal:
+            planned[item["statement_id"]] = item
+        return list(planned.values())
+
+    def _process_explicit_statements(self, run_id, workspace, product, adapter, statements):
+        """逐条执行 Path B，并让成功与失败 statement 拥有独立恢复边界。
+
+        每条输入先注册为 pending。Event 必须先完成正式 Event/Dedup persistence，uncertain
+        必须先保存 Pending Candidate，之后才能把 statement 标记 processed。单条失败会
+        保留 pending 并继续处理其余声明；最后再把首个业务错误返回给本次 Pipeline。
+        """
+        failures: list[PipelineFailure] = []
+        for statement in statements:
+            state = self.store.register_statement(workspace, statement)
+            if state["status"] == "processed":
+                continue
+            statement_id = state["statement_id"]
+            try:
+                result = self._step(
+                    run_id, "statement_detection:" + statement_id,
+                    "Explicit Statement Event Detection", "event_detection_error",
+                    lambda state=state: adapter.detect(
+                        DetectionInput.model_validate(state["input"])
+                    ).model_dump(mode="json"),
+                )
+                candidates = [EventCandidate.model_validate(item) for item in result["candidates"]]
+                outcomes = [candidate.decision for candidate in candidates]
+                event_ids = []
+                for candidate in candidates:
+                    if candidate.decision == "uncertain":
+                        self._step(
+                            run_id, "statement_pending:" + candidate.candidate_id,
+                            "保存 Path B 待核验候选", "event_detection_error",
+                            lambda candidate=candidate, state=state: self._save_pending_detection(
+                                workspace, candidate, state["discovery_origin"]
+                            ),
+                        )
+                    elif candidate.decision == "event":
+                        outcome = self._step(
+                            run_id, "event_outcome:" + candidate.candidate_id,
+                            "持久化 Path B 正式事件与去重结果", "event_detection_error",
+                            lambda candidate=candidate, state=state: self._persist_event_outcome(
+                                run_id, workspace, adapter, candidate, state["discovery_origin"]
+                            ),
+                        )
+                        if outcome["status"] == "event_persisted":
+                            event_ids.append(EventCandidate.model_validate(outcome["event"]).candidate_id)
+                self.store.mark_statement_processed(workspace, statement_id, outcomes, event_ids)
+                self.process_event_candidates(
+                    run_id, workspace, product, adapter, candidates,
+                    discovery_origin=state["discovery_origin"],
+                )
+            except PipelineFailure as exc:
+                failures.append(exc)
+        if failures:
+            raise failures[0]
+
+    def process_event_candidates(
+        self, run_id, workspace, product, adapter, candidates,
+        discovery_origin="normal_monitoring",
+    ):
         """按正式候选状态分流；no_event 结束，uncertain 核验，event 进入确认链路。"""
         for candidate in candidates:
             candidate = EventCandidate.model_validate(candidate.model_dump())
             if candidate.competitor != product.competitor_name:
                 raise PipelineFailure("configuration_error")
             if candidate.decision == "event":
-                self._confirmed_event(run_id, workspace, product, adapter, candidate)
+                self._confirmed_event(
+                    run_id, workspace, product, adapter, candidate, discovery_origin
+                )
             elif candidate.decision == "uncertain":
-                self._verify(run_id, workspace, product, adapter, candidate)
+                self._verify(
+                    run_id, workspace, product, adapter, candidate, discovery_origin
+                )
 
     async def run(self, product: ProductInput) -> dict:
         """用户主入口：配置→来源发现/已确认来源→扫描→候选后续路由。"""
@@ -427,14 +553,31 @@ class ProductPipeline:
                     self._step(run_id, "source_availability", "检查可监控来源", "source_discovery_error", no_sources)
                 # Event 已持久化后，Triage 等失败由独立 action 恢复；不要求再次制造 A → B。
                 self._resume_event_actions(run_id, workspace, product, adapter)
+                extracted_statements = []
                 for source in sources["sources"]:
-                    candidates = self.run_monitoring_scan(run_id, workspace, adapter, source)
+                    history, candidates = self.run_monitoring_scan(run_id, workspace, adapter, source)
                     self.process_event_candidates(run_id, workspace, product, adapter, candidates)
+                    statement_key = "statement_extraction:" + history["snapshot_id"]
+                    statements = self._step(
+                        run_id, statement_key, "提取 Explicit Statement Candidates",
+                        "event_detection_error",
+                        lambda history=history, source=source: adapter.explicit_statement_candidates(
+                            history, source
+                        ),
+                    )
+                    extracted_statements.extend(statements)
+                self._process_explicit_statements(
+                    run_id, workspace, product, adapter,
+                    self._statement_plan(workspace, extracted_statements),
+                )
             else:
                 payload = self._step(run_id, "replay", "复用已确认 Event/Evidence（未重跑发现或采集）", "configuration_error",
                                      lambda: run["payload"])
-                self.process_event_candidates(run_id, workspace, product, adapter,
-                    [EventCandidate.model_validate(c) for c in payload["candidates"]])
+                self.process_event_candidates(
+                    run_id, workspace, product, adapter,
+                    [EventCandidate.model_validate(c) for c in payload["candidates"]],
+                    discovery_origin="event_replay",
+                )
         except PipelineFailure as exc:
             error = exc.category
         except Exception as exc:
