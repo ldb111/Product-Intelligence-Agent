@@ -2,8 +2,8 @@
 
 from .ingestion import KnowledgeIngestor
 from .retrieval import KnowledgeRetriever
-from .schemas import KnowledgeDocument, RetrievalResponse, RetrievalResult
+from .schemas import DocumentSetIngestionResult, KnowledgeDocument, RetrievalResponse, RetrievalResult
 from .store import KnowledgeStore
 
 __all__ = ["KnowledgeDocument", "KnowledgeIngestor", "KnowledgeRetriever", "KnowledgeStore",
-           "RetrievalResponse", "RetrievalResult"]
+           "DocumentSetIngestionResult", "RetrievalResponse", "RetrievalResult"]

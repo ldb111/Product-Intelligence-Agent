@@ -36,11 +36,13 @@ Final Integration 及 Repair A/B/C 的当前相关交付文件：
 | `pipeline/orchestrator.py` | 显式流程、路由、恢复、任务级去重及用户触发 Research 生命周期 |
 | `pipeline/output.py` | 产品级 Event 标识、用户字段投影、引用命名空间、内部信息隔离 |
 | `pipeline/statements.py` | Structured Statement 候选、可靠日期识别及 Backfill 有界筛选 |
+| `pipeline/documents.py` | 独立 Own Product Document Add/Replace、Registry 与产品结果投影 |
 | `tests/test_pipeline.py` | 68 项集成控制测试 |
 | `experiments/pia_e2e.py` | Baseline + 真实事件 recommendation / 显式 Research / 幂等复用验收入口 |
 | `experiments/final_integration_repair_a_e2e.py` | watermark、Event persistence 与 Verification 控制验收 |
 | `experiments/final_integration_repair_b_e2e.py` | 用户显式 Research 生命周期控制验收 |
 | `experiments/final_integration_repair_c_e2e.py` | Historical Backfill、后续 Statement 与去重控制验收 |
+| `experiments/own_product_document_integration_e2e.py` | 文件配置、原子 Replace、重复与重开控制验收 |
 | `docs/final_integration_v0.1.md` | 本实现报告 |
 
 `experiments/output/` 中的真实运行 JSON、审计和数据库是本地验收产物，受既有忽略规则保护，不属于交付文件。
@@ -74,7 +76,7 @@ developer_audit = output["audit"]
 
 ## 5. Main Workflow
 
-`run()` 是统一入口。配置首先校验自身文档资格；资料通过 Knowledge 正式入口入库；首次无来源时调用真实 `run_source_discovery()` 并保存结果，此后复用已确认来源；逐来源扫描、比较及处理候选。显式可信调用方也可用 `confirm_monitoring_sources()` 确认来源。
+`run()` 是 Monitoring 入口。它只消费已经持久化的 Own Product Knowledge，不读取或解析上传文件；首次无来源时调用真实 `run_source_discovery()` 并保存结果，此后复用已确认来源，再逐来源扫描、比较及处理候选。自身文件通过独立 `OwnProductDocumentService` 的 Add/Replace Workspace Configuration 生命周期入库。显式可信调用方也可用 `confirm_monitoring_sources()` 确认来源。
 
 `run_events()` 是已有正式 Event/Evidence 的回放入口，要求标注 provenance；阶段中明确说明没有重新发现或采集。本轮真实 E2E 使用此入口，不冒充从零重新采集产生的新事件。
 
@@ -123,7 +125,9 @@ Verification Agent / Research Agent 的自然语言 decision 不能直接改写�
 
 Structured State、Knowledge、Memory 分开。两知识域复用冻结 KnowledgeStore 的 domain / product / competitor 过滤，Memory 使用独立数据库及 workspace scope。
 
-自身文档只走 `own_product_file()` + KnowledgeIngestor；确认事件只走 `event_documents()` + KnowledgeIngestor。Triage 和 Research 使用已有双域检索与 MemoryRetriever，不重写 RAG。普通 current_focus 仅是当前输入；只有另行明确调用 `remember_explicit()` 才通过 MemoryWriter 写入。研究结果不会自动进入 Knowledge 或 Memory。
+自身文档只走 `parse_and_prepare()` + 文件级 KnowledgeIngestor；确认事件只走 `event_documents()` + KnowledgeIngestor。Triage 和 Research 使用已有双域检索与 MemoryRetriever，不重写 RAG。普通 current_focus 仅是当前输入；只有另行明确调用 `remember_explicit()` 才通过 MemoryWriter 写入。文件 Add/Replace 与研究结果都不会自动进入 Memory。
+
+自身资料采用 current-version only。Add 生成稳定产品文档 ID；Replace 以该 ID 为锚点，在完成全部 Embedding 后通过单一 SQLite 事务删除旧 unit set、写入新 set 并更新当前 Registry。相同 bytes 跨路径复用已有文档；同名不同内容不会自动覆盖。Monitoring 不调用该服务，因此重复扫描不会重复解析或向量化自身文件。
 
 没有提供自身文档时记录上下文缺口；不能由未检索到资料推断某项能力不存在。
 
@@ -133,7 +137,7 @@ Structured State、Knowledge、Memory 分开。两知识域复用冻结 Knowledg
 
 Snapshot 持久化区分 `observed_latest:<workspace>`、`processed_latest:<workspace>` 和 `comparisons:<workspace>`。Event Detection 失败后，observed Snapshot、未完成 comparison 和旧 processed baseline 都可在进程重启后恢复；Pending verification 继续保存在 `pending:<workspace>`。旧数据库无需修改 records 表：首次读取旧 `latest` 时结合既有 comparison/detection 检查点确定安全 baseline；旧格式 history 在恢复完成时补齐 comparison 元数据，不删除或回滚真实 Snapshot。
 
-成功步骤跳过，失败步骤可恢复；已完成运行直接返回保存结果。同一个 run 恢复不会重新扫描或重复创建 Snapshot，新 run 能恢复尚未处理的变化。Research 使用 `research_status:<workspace>` 独立持久化 `not_started/running/completed/failed`；completed 重复启动直接复用结果，failed 只有显式 retry 才重试。进程重启后遇到旧 process token 的 running 会标记为 `research_interrupted`，再由用户 retry。Knowledge 文档去重继续由冻结入库层负责，Integration 不新增入库规则。
+成功步骤跳过，失败步骤可恢复；已完成运行直接返回保存结果。同一个 run 恢复不会重新扫描或重复创建 Snapshot，新 run 能恢复尚未处理的变化。Research 使用 `research_status:<workspace>` 独立持久化 `not_started/running/completed/failed`；completed 重复启动直接复用结果，failed 只有显式 retry 才重试。进程重启后遇到旧 process token 的 running 会标记为 `research_interrupted`，再由用户 retry。Own Product Document Registry 与对应 unit set 位于同一个 Knowledge SQLite，Replace 时一起提交或回滚；不需要 Retrieval current-version filter。
 
 Path B 的观察和处理使用两个独立命名空间。`statement_observations:<workspace>` 保存每次成功
 扫描看见的全部 statement identity，包括未入选的第 21–25 条、无日期及超过 90 天的首次声明；
@@ -173,7 +177,7 @@ hash、processing key、checkpoint 或内部 candidate_id。
 
 ## 12. Targeted Tests
 
-`python -X utf8 -m unittest tests.test_pipeline -q`：**68/68 PASS**，28.384 秒。覆盖 Repair A/B 全部语义，
+`python -X utf8 -m unittest tests.test_pipeline -q`：**68/68 PASS**，26.735 秒。覆盖 Repair A/B 全部语义，
 并加入 Repair C 的首次 Baseline/Backfill 分离、90 天与 20 条顺序、可靠日期、官方来源、
 historical/normal 产品语义、statement/Event 两层去重、后续无日期声明、partial failure、
 same-run/new-run 恢复和 Store reopen。
@@ -214,6 +218,14 @@ statement 经 Path B 产生 historical_backfill；Case B 验证后续 Path A unc
 Explicit Statement 仍产生 normal_monitoring Event；Case C 验证重复 statement 不再次调用
 Event Core，也不产生重复 Event。本轮不要求、也未执行真实联网 Backfill。
 
+Own Product Document Controlled E2E 另行验证独立 Workspace Configuration 生命周期：DOCX
+Add 后可经 Retrieval/Rerank 查询；3 units Replace 为 2 units 后旧 Section 完全删除；相同 bytes
+跨路径复用已有文档且不重复 Embedding；Store reopen 后 ID、状态与 Retrieval 继续有效。
+
+Own Product Document 的并发审计另以 4 项受控测试验证 Registry 原子边界：相同 bytes 并发 Add
+只持久化一个逻辑文档；不同内容不会误合并；并发 A→B / A→C 中后提交的 stale request 被拒绝且
+不留下部分 Knowledge，基于最新 B 的明确 retry 可完成 B→C；同目标 A→B 收敛为幂等结果。
+
 首次运行命令：`python -X utf8 experiments/pia_e2e.py --output experiments/output/pia_v01_live_01.json`。已存在状态目录应走恢复入口；创建新的演示需要自行选择新的 output 路径，不清理旧验收数据。
 
 恢复入口：准备阶段用 `--resume-setup` 复用已通过 Baseline；主链开始后用 `--resume-run <已保存的 run_id>`。不通过新建状态目录反复重跑成功步骤。
@@ -238,7 +250,7 @@ Event Core，也不产生重复 Event。本轮不要求、也未执行真实联�
 
 ## 15. Full Regression
 
-`python -X utf8 -m unittest discover -s tests -q`：**519/519 PASS**，74.671 秒。原模块及 Repair A/B/C 测试无退化；日志中的无效 PDF、存储/响应故障和工具失败警告来自既有负向测试，最终结果为 OK。
+`python -X utf8 -m unittest discover -s tests -q`：**535/535 PASS**，82.399 秒。原模块、Repair A/B/C 及 16 项 Own Product Document Integration 测试全部通过；其中 4 项新增受控并发测试。日志中的无效 PDF、存储/响应故障和工具失败警告来自受控负向测试，最终结果为 OK。
 
 ## 16. Code Quality
 

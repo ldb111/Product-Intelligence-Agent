@@ -21,6 +21,14 @@ class EmptyDocumentError(KnowledgeError): pass
 class EmptyChunkError(KnowledgeError): pass
 class InvalidDomainError(KnowledgeError): pass
 class KnowledgeAdmissionError(KnowledgeError): pass
+class DocumentSetConflictError(KnowledgeError):
+    """文件级文档集合与当前 Registry 状态冲突。"""
+
+    def __init__(self, code: str):
+        super().__init__(code)
+        self.code = code
+
+
 class StoreWriteError(RuntimeError): pass
 class StoreReadError(RuntimeError): pass
 class VectorSpaceError(KnowledgeError): pass
@@ -160,3 +168,12 @@ class IngestionResult(Contract):
     content_hash: str
     chunk_ids: list[str]
     status: Literal["inserted", "updated", "unchanged"]
+
+
+class DocumentSetIngestionResult(Contract):
+    """文件级原子替换结果；unit IDs 只供可信 Integration Registry 使用。"""
+
+    document_id: str
+    knowledge_domain: KnowledgeDomain
+    unit_document_ids: list[str]
+    status: Literal["inserted", "updated"]

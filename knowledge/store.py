@@ -11,8 +11,8 @@ from pathlib import Path
 from llm.retrieval_models import unit_vector
 
 from .schemas import (
-    KnowledgeChunk, KnowledgeDocument, RetrievalResult, StoreReadError,
-    StoreWriteError, VectorSpaceError, domains_for,
+    DocumentSetConflictError, KnowledgeChunk, KnowledgeDocument, RetrievalResult,
+    StoreReadError, StoreWriteError, VectorSpaceError, domains_for,
 )
 
 logger = logging.getLogger(__name__)
@@ -50,6 +50,17 @@ class KnowledgeStore:
                     );
                     CREATE INDEX IF NOT EXISTS chunks_domain_document
                         ON chunks(domain, document_id);
+                    CREATE TABLE IF NOT EXISTS document_sets (
+                        domain TEXT NOT NULL CHECK(domain IN ('own_product','competitor')),
+                        product_id TEXT NOT NULL,
+                        document_id TEXT NOT NULL,
+                        current_content_hash TEXT NOT NULL,
+                        display_name_key TEXT NOT NULL,
+                        payload TEXT NOT NULL,
+                        PRIMARY KEY(domain, product_id, document_id),
+                        UNIQUE(domain, product_id, current_content_hash),
+                        UNIQUE(domain, product_id, display_name_key)
+                    );
                 """)
         except (sqlite3.Error, OSError):
             logger.warning("knowledge_store_initialization_failed")
@@ -130,6 +141,175 @@ class KnowledgeStore:
         except (sqlite3.Error, ValueError, TypeError, OSError):
             logger.warning("knowledge_store_write_failed")
             raise StoreWriteError("知识存储写入失败，旧版本未被替换。") from None
+
+    def document_set_record(self, domain: str, product_id: str, document_id: str) -> dict | None:
+        """读取一个产品级逻辑文档的当前 Registry，不返回 chunks 或向量。"""
+        domains_for(domain)
+        try:
+            with closing(self._connect()) as connection:
+                row = connection.execute(
+                    "SELECT payload FROM document_sets WHERE domain=? AND product_id=? AND document_id=?",
+                    (domain, product_id, document_id),
+                ).fetchone()
+            return json.loads(row[0]) if row else None
+        except (sqlite3.Error, ValueError, TypeError):
+            raise StoreReadError("产品文档状态读取失败。") from None
+
+    def document_set_by_content_hash(self, domain: str, product_id: str,
+                                     current_content_hash: str) -> dict | None:
+        """在单一产品作用域内按完整源文件哈希查找精确重复。"""
+        domains_for(domain)
+        try:
+            with closing(self._connect()) as connection:
+                row = connection.execute(
+                    "SELECT payload FROM document_sets WHERE domain=? AND product_id=? AND current_content_hash=?",
+                    (domain, product_id, current_content_hash),
+                ).fetchone()
+            return json.loads(row[0]) if row else None
+        except (sqlite3.Error, ValueError, TypeError):
+            raise StoreReadError("产品文档状态读取失败。") from None
+
+    def document_set_by_display_name(self, domain: str, product_id: str,
+                                     display_name_key: str) -> dict | None:
+        """按规范化展示名检查 Add 冲突；文件名永远不会触发隐式 Replace。"""
+        domains_for(domain)
+        try:
+            with closing(self._connect()) as connection:
+                row = connection.execute(
+                    "SELECT payload FROM document_sets WHERE domain=? AND product_id=? AND display_name_key=?",
+                    (domain, product_id, display_name_key),
+                ).fetchone()
+            return json.loads(row[0]) if row else None
+        except (sqlite3.Error, ValueError, TypeError):
+            raise StoreReadError("产品文档状态读取失败。") from None
+
+    def document_sets(self, domain: str, product_id: str) -> list[dict]:
+        """列出产品当前有效的逻辑文档 Registry，供 Integration 生成上下文身份。"""
+        domains_for(domain)
+        try:
+            with closing(self._connect()) as connection:
+                rows = connection.execute(
+                    "SELECT payload FROM document_sets WHERE domain=? AND product_id=? ORDER BY document_id",
+                    (domain, product_id),
+                ).fetchall()
+            return [json.loads(row[0]) for row in rows]
+        except (sqlite3.Error, ValueError, TypeError):
+            raise StoreReadError("产品文档状态读取失败。") from None
+
+    def replace_document_set(
+        self, *, registry: dict, documents: list[tuple[KnowledgeDocument, str,
+        list[KnowledgeChunk], list[list[float]]]], space_id: str,
+        expected_content_hash: str | None, create_only: bool,
+    ) -> str:
+        """在一个事务内切换逻辑文件的全部 KnowledgeDocument 和 Registry。
+
+        输入中的文档、切片、指纹和向量都必须已在事务外准备完成。事务只执行本地校验、
+        删除旧 unit、写入完整新 set 和更新当前 Registry；任一步失败都会回滚，因此不会
+        出现部分新 unit 与旧 unit 混合的可检索状态。
+        """
+        domain = registry["knowledge_domain"]
+        product_id = registry["product_id"]
+        logical_id = registry["document_id"]
+        domains_for(domain)
+        expected_ids = [item[0].document_id for item in documents]
+        if (domain != "own_product" or not product_id or not logical_id or not documents
+                or registry.get("unit_document_ids") != expected_ids
+                or not registry.get("display_name_key")
+                or len(registry.get("current_content_hash", "")) != 64):
+            raise StoreWriteError("文件级知识集合参数无效。")
+        rows = []
+        for document, fingerprint, chunks, vectors in documents:
+            if (document.knowledge_domain != domain or document.product_id != product_id
+                    or not document.document_id.startswith(logical_id + ":unit:")
+                    or not chunks or len(chunks) != len(vectors)):
+                raise StoreWriteError("文件级知识集合身份不一致。")
+            try:
+                normalized = [unit_vector(vector) for vector in vectors]
+            except (ValueError, TypeError):
+                raise StoreWriteError("文件级知识向量无效。") from None
+            if any(chunk.document_id != document.document_id or chunk.knowledge_domain != domain
+                   for chunk in chunks):
+                raise StoreWriteError("文件级知识切片身份不一致。")
+            rows.append((document, fingerprint, chunks, normalized))
+        dimensions = {len(vector) for _, _, _, vectors in rows for vector in vectors}
+        if len(dimensions) != 1:
+            raise StoreWriteError("文件级知识向量维度不一致。")
+        dimension = next(iter(dimensions))
+        payload = json.dumps(registry, ensure_ascii=False, sort_keys=True, allow_nan=False)
+        try:
+            with closing(self._connect()) as connection, connection:
+                connection.execute("BEGIN IMMEDIATE")
+                self._check_space(connection, space_id, dimension)
+                current_row = connection.execute(
+                    "SELECT current_content_hash, payload FROM document_sets "
+                    "WHERE domain=? AND product_id=? AND document_id=?",
+                    (domain, product_id, logical_id),
+                ).fetchone()
+                if create_only and current_row:
+                    raise DocumentSetConflictError("document_exists")
+                if not create_only and not current_row:
+                    raise DocumentSetConflictError("document_not_found")
+                if (not create_only and current_row[0] != expected_content_hash):
+                    raise DocumentSetConflictError("document_changed")
+                duplicate = connection.execute(
+                    "SELECT document_id FROM document_sets WHERE domain=? AND product_id=? "
+                    "AND current_content_hash=? AND document_id<>?",
+                    (domain, product_id, registry["current_content_hash"], logical_id),
+                ).fetchone()
+                if duplicate:
+                    raise DocumentSetConflictError("duplicate_content")
+                same_name = connection.execute(
+                    "SELECT document_id FROM document_sets WHERE domain=? AND product_id=? "
+                    "AND display_name_key=? AND document_id<>?",
+                    (domain, product_id, registry["display_name_key"], logical_id),
+                ).fetchone()
+                if same_name:
+                    raise DocumentSetConflictError("display_name_conflict")
+                if current_row:
+                    old = json.loads(current_row[1])
+                    old_ids = old.get("unit_document_ids", [])
+                    if old_ids:
+                        placeholders = ",".join("?" for _ in old_ids)
+                        connection.execute(
+                            f"DELETE FROM documents WHERE domain=? AND document_id IN ({placeholders})",
+                            (domain, *old_ids),
+                        )
+                connection.execute("INSERT OR IGNORE INTO vector_space VALUES (1, ?, ?)",
+                                   (space_id, dimension))
+                for document, fingerprint, chunks, vectors in rows:
+                    connection.execute(
+                        "INSERT INTO documents VALUES (?, ?, ?, ?)",
+                        (domain, document.document_id, fingerprint, document.model_dump_json()),
+                    )
+                    connection.executemany(
+                        "INSERT INTO chunks VALUES (?, ?, ?, ?, ?, ?)",
+                        [(chunk.chunk_id, domain, document.document_id, chunk.chunk_index,
+                          chunk.model_dump_json(), json.dumps(vector, allow_nan=False))
+                         for chunk, vector in zip(chunks, vectors)],
+                    )
+                values = (registry["current_content_hash"], registry["display_name_key"], payload,
+                          domain, product_id, logical_id)
+                if create_only:
+                    connection.execute(
+                        "INSERT INTO document_sets "
+                        "(domain, product_id, document_id, current_content_hash, display_name_key, payload) "
+                        "VALUES (?, ?, ?, ?, ?, ?)",
+                        (domain, product_id, logical_id, registry["current_content_hash"],
+                         registry["display_name_key"], payload),
+                    )
+                else:
+                    updated = connection.execute(
+                        "UPDATE document_sets SET current_content_hash=?, display_name_key=?, payload=? "
+                        "WHERE domain=? AND product_id=? AND document_id=?", values,
+                    )
+                    if updated.rowcount != 1:
+                        raise DocumentSetConflictError("document_changed")
+            return "inserted" if create_only else "updated"
+        except (DocumentSetConflictError, VectorSpaceError):
+            raise
+        except (sqlite3.Error, ValueError, TypeError, OSError, KeyError):
+            logger.warning("knowledge_document_set_replace_failed")
+            raise StoreWriteError("文件级知识集合替换失败，旧版本保持不变。") from None
 
     def search(self, query_vector: list[float], *, knowledge_domain: str, space_id: str,
                top_n: int, filters: dict | None = None) -> list[RetrievalResult]:

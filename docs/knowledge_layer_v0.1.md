@@ -75,6 +75,8 @@ Research Result 后续可复用文档/来源契约；需要先明确验证规则
 
 Embedding 全部成功后才写入；写入事务失败会回滚，旧知识仍可读取。不同 document_id 即使正文相同也保留各自来源，不自动合并可能不同的知识身份。
 
+Own Product Document Integration 另增加窄范围的 `replace_document_set()` 公共契约：一个逻辑文件的全部 unit 在事务外完成 Chunking/Embedding，再与当前 Document Registry 一起在单个 SQLite 事务中替换。该接口只服务 current-version-only 文件配置，不改变既有单文档 `ingest()`、双域 Retrieval、Rerank、过滤或 Chunk Schema。结构缩减时旧 unit 通过外键级联删除，事务失败则完整保留旧 set。
+
 ## 7. Chunking
 
 优先识别 Markdown ATX 标题、章节、空行段落、列表和表格。相同章节的小段可以合并，不同章节分开；围栏代码里的 `#` 不当作标题。单个超长结构块先按换行/句子边界拆分，再按字符长度兜底。

@@ -20,6 +20,7 @@ from source_discovery.agent import run_source_discovery
 from source_discovery.search.tencent_wsa import TencentWsaSearchProvider
 from triage.workflow import TriageWorkflow
 
+from .documents import product_scope_id, workspace_knowledge_path
 from .store import identity
 from .statements import extract_statement_candidates
 
@@ -30,10 +31,10 @@ class ModuleAdapters:
     def __init__(self, directory: str | Path, product):
         self.directory = Path(directory)
         self.product = product
-        self.product_id = identity(product.workspace_id)
+        self.product_id = product_scope_id(product.workspace_id, product.own_product_id)
         self.competitor_id = identity([product.workspace_id, product.competitor_name])
-        self.knowledge_path = self.directory / (self.product_id + ".knowledge.sqlite3")
-        self.memory_path = self.directory / (self.product_id + ".memory.sqlite3")
+        self.knowledge_path = workspace_knowledge_path(self.directory, product.workspace_id)
+        self.memory_path = self.directory / (identity(product.workspace_id) + ".memory.sqlite3")
 
     @property
     def scope(self):
@@ -89,7 +90,10 @@ class ModuleAdapters:
         return deduplicate_event(candidate, existing)
 
     def ingest_own(self) -> dict:
-        """仅接收明确提供的文件，通过原入库入口处理；空列表不创建模型请求。"""
+        """旧 md/txt compatibility 入口；正式产品上传使用 OwnProductDocumentService。
+
+        本方法保留给显式迁移脚本，不再由 Monitoring run 自动调用，也不扩展五格式。
+        """
         results, runtime = [], []
         if not self.product.own_product_documents:
             return {"results": results, "runtime": runtime}
@@ -103,6 +107,12 @@ class ModuleAdapters:
             results.append(ingestor.ingest(document).model_dump(mode="json"))
             runtime.extend(asdict(r) for r in ingestor.last_runtime)
         return {"results": results, "runtime": runtime}
+
+    def own_product_context_identity(self) -> list[dict]:
+        """返回当前 Registry 的稳定内容身份，供 Triage artifact 判断知识是否已更新。"""
+        records = KnowledgeStore(self.knowledge_path).document_sets("own_product", self.product_id)
+        return [{"document_id": item["document_id"],
+                 "current_content_hash": item["current_content_hash"]} for item in records]
 
     def ingest_event(self, event) -> dict:
         """仅将正式确认的原始 Event/Evidence 交给已有知识入口；研究结果不具备此入口。"""

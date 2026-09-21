@@ -160,7 +160,7 @@ DOCX/PDF/XLSX Fixture 均做真实结构或视觉检查；依赖在 Python 3.13 
 - XLSX 不计算公式。cached value 可能由文件创建者留下且已经过时；metadata 会标明来源，但不能证明值新鲜。实现使用 openpyxl 已加载单元格集合来避免遍历纯格式大区域，该内部表示升级时需回归验证。
 - Markdown 只识别 ATX 标题，不实现完整 CommonMark AST。TXT 不做编码探测或格式推断。
 - ZIP 预检提供基础上限，不等同于完整恶意文档沙箱。解析库自身漏洞、XML 复杂度和极端但未超限的文件仍需进程隔离与运行资源限制才能达到生产安全等级。
-- 当前稳定入口供后续 UI/后端调用；冻结 `ProductPipeline` 未改动，因此其现有 `own_product_documents` 自动入库路径仍只接受 `.md/.txt`。接入 UI 时应先调用 `parse_and_prepare()`，再把 ingestion_input 交给现有 KnowledgeIngestor。本轮不进入 UI。
+- 五格式已通过 `OwnProductDocumentService` 接入正式 Workspace Configuration 生命周期。服务复用 `parse_and_prepare()` 和现有 KnowledgeIngestor；Monitoring 不会重新解析上传文件。旧 `own_product_documents` 仅保留 compatibility 字段，不再作为正式上传入口。本轮不进入 UI。
 - Own Product 原文进入现有 Knowledge 后，Embedding/Rerank 的外发边界不变。生产仍需依据数据分级、企业策略和供应商合规要求处理脱敏、企业协议、租户隔离或私有模型。
 - E2E 是 5 个小型模拟 Fixture 和一个查询，只证明链路与 provenance，不是通用解析准确率、RAG 质量或安全 Evaluation。
 

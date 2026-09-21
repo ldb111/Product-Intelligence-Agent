@@ -160,6 +160,9 @@ class ScriptedAdapters(ModuleAdapters):
         self.hit("own")
         return {"results": [], "runtime": []}
 
+    def own_product_context_identity(self):
+        return []
+
     def ingest_event(self, event):
         self.hit("admit")
         return {"results": [], "runtime": []}
@@ -1085,12 +1088,14 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
                                                    "credibility": "official", "official_domains": ["example.com"]})
         self.assertTrue(all(i.source_credibility == "unverified" for i in inputs))
 
-    async def test_configuration_failure_has_persisted_stage(self):
+    async def test_monitoring_does_not_read_legacy_own_product_files(self):
         product = self.product.model_copy(update={"own_product_documents": [str(self.root / "missing.md")]})
         result = await self.pipeline.run(product)
-        self.assertEqual(result["product"]["error"]["type"], "configuration_error")
-        self.assertNotIn("pipeline_stages", result["product"])
-        self.assertEqual(result["audit"]["steps"]["configuration"]["status"], "failed")
+        self.assertEqual(result["product"]["status"], "complete")
+        repeated = await self.pipeline.run(product)
+        self.assertEqual(repeated["product"]["status"], "complete")
+        self.assertEqual(ScriptedAdapters.calls["own"], 0)
+        self.assertEqual(result["audit"]["steps"]["configuration"]["status"], "complete")
 
     async def test_verification_no_event_with_formal_uncertain_stays_pending(self):
         ScriptedAdapters.verification = "no_event"

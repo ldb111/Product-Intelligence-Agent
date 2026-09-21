@@ -135,8 +135,6 @@ def build_product_result(store, run_id: str, product, workspace: str, error: str
             result.research_results.append({"result": action["result"], "citations": action.get("citations", [])})
             result.citations.extend(action.get("citations", []))
     result.citations = list({c["result_id"]: c for c in result.citations}.values())
-    if not product.own_product_documents:
-        result.uncertainties.append("未在本次配置提供自身文档；是否有足够历史资料由实际检索决定，不能推断能力不存在。")
     result.uncertainties = list(dict.fromkeys(result.uncertainties))
     result.status = "failed" if error else "pending" if result.pending_candidates else "complete"
     if error:

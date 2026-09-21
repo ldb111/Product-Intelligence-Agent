@@ -100,10 +100,16 @@ async def run_main(args, pipeline, public, audit):
     event = EventCandidate.model_validate(case["detection"]["candidates"][0])
     audit["event_provenance"] = {"path": str(args.event_report), "sha256": content_hash(raw),
                                  "kind": "archived_real_official_event"}
-    config = ProductInput(workspace_id="pia-integration-fixture", competitor_name=event.competitor,
-                          official_url="https://z-report.cn", current_focus=FOCUS,
-                          product_profile="自身产品资料为明确的模拟 Fixture，本轮研究免费套餐的周期积分机制。",
-                          own_product_documents=[str(ROOT / "experiments/fixtures/knowledge_own_product.md")])
+    config = ProductInput(workspace_id="pia-integration-fixture", own_product_id="pia-own-fixture",
+                           competitor_name=event.competitor,
+                           official_url="https://z-report.cn", current_focus=FOCUS,
+                           product_profile="自身产品资料为明确的模拟 Fixture，本轮研究免费套餐的周期积分机制。")
+    # 自身资料先通过独立 Workspace Configuration 入口入库，Monitoring/回放只消费持久化知识。
+    if "own_product_ingestion" not in audit:
+        audit["own_product_ingestion"] = pipeline.add_own_product_document(
+            workspace_id=config.workspace_id, product_id=config.own_product_id,
+            file=ROOT / "experiments/fixtures/knowledge_own_product.md",
+        ).model_dump(mode="json")
     # 用户明确要求的测试记忆通过正式写入工作流准备；不是 current_focus 的自动副作用。
     audit["stage"] = "explicit_memory_preparation"
     if "memory_preparation" not in audit:

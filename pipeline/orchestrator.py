@@ -14,6 +14,7 @@ from source_discovery.schemas import SourceDiscoveryResult
 from triage.schemas import TriageResult
 
 from .adapters import ModuleAdapters
+from .documents import OwnProductDocumentService
 from .output import build_product_result, present_research_action
 from .schemas import PipelineFailure, ProductInput
 from .statements import INITIAL_BACKFILL_MAX_EVENTS, select_initial_backfill
@@ -29,12 +30,8 @@ class ProductPipeline:
         self.adapter_type = adapter_type
 
     def configure_competitor(self, product: ProductInput):
-        """确定工作区/竞品内部键并保存配置；文件资格在产生模型请求前检查。"""
+        """确定工作区/竞品内部键并保存配置；Monitoring 不读取或解析自身文件。"""
         product = ProductInput.model_validate(product.model_dump())
-        for name in product.own_product_documents:
-            path = Path(name)
-            if not path.is_file() or path.suffix.lower() not in {".md", ".txt"}:
-                raise PipelineFailure("configuration_error")
         workspace = identity([product.workspace_id, product.competitor_name])
         adapter = self.adapter_type(self.store.directory, product)
         self.store.put("workspaces", workspace, {"config": product.model_dump(), "stores": adapter.store_references()})
@@ -215,8 +212,8 @@ class ProductPipeline:
         self._step(run_id, "admit:" + identity(event.model_dump(mode="json")), "确认原始证据进入竞品知识", "retrieval_error",
                     lambda: adapter.ingest_event(event))
         context = {"event": event.model_dump(mode="json"), "product": product.model_dump()}
-        # 文档路径相同但正文更新时，重新分诊是新上下文，不是重复运行。
-        context["documents"] = [identity(Path(p).read_text(encoding="utf-8-sig")) for p in product.own_product_documents]
+        # 自身知识属于独立配置生命周期；只读取持久化 Registry 身份，不触碰上传文件。
+        context["documents"] = adapter.own_product_context_identity()
         key = identity(context)
         triage = self._artifact(run_id, workspace, "triage", key, "triage_error", lambda: adapter.triage(event))
         decision = TriageResult.model_validate(triage["result"])
@@ -506,6 +503,22 @@ class ProductPipeline:
         """用户主入口：配置→来源发现/已确认来源→扫描→候选后续路由。"""
         return await self._start(product, "monitor", {})
 
+    def add_own_product_document(self, *, workspace_id: str, product_id: str,
+                                 file: str | Path, display_name: str | None = None):
+        """独立 Workspace Configuration 入口；不会启动 Monitoring 或 Intelligence。"""
+        return OwnProductDocumentService(self.store.directory).add_own_product_document(
+            workspace_id=workspace_id, product_id=product_id, file=file,
+            display_name=display_name,
+        )
+
+    def replace_own_product_document(self, *, workspace_id: str, product_id: str,
+                                     document_id: str, new_file: str | Path):
+        """显式替换一个逻辑产品文档；document_id 在更新前后保持不变。"""
+        return OwnProductDocumentService(self.store.directory).replace_own_product_document(
+            workspace_id=workspace_id, product_id=product_id,
+            document_id=document_id, new_file=new_file,
+        )
+
     async def run_events(self, product: ProductInput, candidates: list[EventCandidate], *, provenance: str) -> dict:
         """从已有正式事件回放后半链路，供可信调用方接入或低成本演示；明确记录未重跑采集。"""
         if not provenance.strip():
@@ -533,7 +546,6 @@ class ProductPipeline:
             self._step(run_id, "configuration", "工作区与竞品配置", "configuration_error",
                        lambda: {"workspace": self.configure_competitor(product)[0]})
             adapter = self.adapter_type(self.store.directory, product)
-            self._step(run_id, "own_knowledge", "自身资料入库", "retrieval_error", adapter.ingest_own)
             if run["mode"] == "monitor":
                 if self.store.get("sources", workspace) is None:
                     # Discovery 是已有异步入口；完成结果先保存，再执行后续同步步骤。

@@ -6,11 +6,13 @@ from urllib.parse import urlsplit
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from memory.policy import contains_secret
+from file_parsing.schemas import ParsingStatus
 
 
 class ProductInput(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     workspace_id: str = Field(min_length=1, max_length=200)
+    own_product_id: str | None = Field(default=None, min_length=1, max_length=200)
     competitor_name: str = Field(min_length=1, max_length=200)
     official_url: str | None = None
     additional_urls: list[str] = Field(default_factory=list, max_length=20)
@@ -18,7 +20,7 @@ class ProductInput(BaseModel):
     current_focus: str = Field(default="", max_length=2000)
     own_product_documents: list[str] = Field(default_factory=list, max_length=20)
 
-    @field_validator("workspace_id", "competitor_name", "product_profile", "current_focus")
+    @field_validator("workspace_id", "own_product_id", "competitor_name", "product_profile", "current_focus")
     @classmethod
     def safe_text(cls, value):
         if value is not None and contains_secret(value):
@@ -57,6 +59,25 @@ class ProductResult(BaseModel):
     uncertainties: list[str] = Field(default_factory=list)
     status: Literal["complete", "pending", "failed"] = "complete"
     error: dict | None = None
+
+
+class OwnProductDocumentResult(BaseModel):
+    """自身产品资料配置动作的用户结果，不暴露路径、unit ID、向量或数据库字段。"""
+
+    model_config = ConfigDict(extra="forbid")
+    document_id: str | None = None
+    display_name: str
+    file_format: str
+    parsing_status: ParsingStatus
+    ingestion_status: Literal["not_started", "ingesting", "completed", "failed"]
+    content_status: Literal[
+        "current", "existing", "unchanged", "conflict", "unavailable", "current_preserved"
+    ]
+    knowledge_status: Literal["available", "unavailable"]
+    failure_reason: str | None = None
+    created_at: str | None = None
+    updated_at: str | None = None
+    unit_count: int = 0
 
 
 class PipelineFailure(RuntimeError):

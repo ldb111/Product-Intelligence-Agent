@@ -5,7 +5,10 @@ import json
 from llm.retrieval_models import EmbeddingRole, ModelCallRecord
 
 from .chunking import CHUNKING_VERSION, chunk_document, normalize
-from .schemas import IngestionResult, KnowledgeAdmissionError, KnowledgeDocument, content_hash
+from .schemas import (
+    DocumentSetIngestionResult, IngestionResult, KnowledgeAdmissionError,
+    KnowledgeDocument, content_hash,
+)
 from .store import KnowledgeStore
 
 
@@ -61,4 +64,55 @@ class KnowledgeIngestor:
         return IngestionResult(
             document_id=document.document_id, knowledge_domain=document.knowledge_domain,
             content_hash=content_hash(document.content), chunk_ids=[c.chunk_id for c in chunks], status=status,
+        )
+
+    def replace_document_set(
+        self, *, logical_document_id: str, documents: list[KnowledgeDocument], registry: dict,
+        expected_content_hash: str | None = None, create_only: bool = False,
+    ) -> DocumentSetIngestionResult:
+        """预计算一个文件的全部 unit，再通过 Store 单事务切换当前版本。
+
+        输入是同一 own_product 逻辑文档的完整 KnowledgeDocument 集合和当前 Registry。
+        本函数先完成契约校验、Chunking 与全部 Embedding；只有所有外部调用成功后才进入
+        SQLite 事务。输出只说明整个集合已插入或更新，不提供逐 unit 的部分成功语义。
+        """
+        self.last_runtime = []
+        if not logical_document_id or not documents:
+            raise KnowledgeAdmissionError("文件级知识集合不能为空。")
+        prepared = []
+        all_chunks = []
+        for index, value in enumerate(documents, 1):
+            document = KnowledgeDocument.model_validate(value.model_dump())
+            validate_admission(document)
+            document = KnowledgeDocument(**{
+                **document.model_dump(), "content": normalize(document.content)
+            })
+            if (document.knowledge_domain != "own_product"
+                    or document.document_id != f"{logical_document_id}:unit:{index}"):
+                raise KnowledgeAdmissionError("文件级知识集合的 unit 身份无效。")
+            chunks = chunk_document(document, self.max_chars)
+            fingerprint = content_hash(json.dumps({
+                "document": document.model_dump(mode="json"), "chunking": CHUNKING_VERSION,
+                "max_chars": self.max_chars, "space_id": self.embedding.space_id,
+            }, ensure_ascii=False, sort_keys=True, allow_nan=False))
+            prepared.append([document, fingerprint, chunks, []])
+            all_chunks.extend(chunks)
+        self.store.assert_space(self.embedding.space_id)
+        output = self.embedding.embed([chunk.model_text() for chunk in all_chunks])
+        self.last_runtime = output.runtime
+        offset = 0
+        for item in prepared:
+            count = len(item[2])
+            item[3] = output.vectors[offset:offset + count]
+            offset += count
+        if offset != len(output.vectors):
+            raise ValueError("向量返回数量与文件级知识集合不一致。")
+        status = self.store.replace_document_set(
+            registry=registry, documents=[tuple(item) for item in prepared],
+            space_id=self.embedding.space_id, expected_content_hash=expected_content_hash,
+            create_only=create_only,
+        )
+        return DocumentSetIngestionResult(
+            document_id=logical_document_id, knowledge_domain="own_product",
+            unit_document_ids=[item[0].document_id for item in prepared], status=status,
         )
