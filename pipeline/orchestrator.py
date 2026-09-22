@@ -1,5 +1,7 @@
 """显式产品 Workflow：接线、状态保存和路由，不承担新的 AI 判断。"""
 
+import asyncio
+
 from pathlib import Path
 from time import perf_counter
 from urllib.parse import urlsplit
@@ -567,7 +569,12 @@ class ProductPipeline:
                 self._resume_event_actions(run_id, workspace, product, adapter)
                 extracted_statements = []
                 for source in sources["sources"]:
-                    history, candidates = self.run_monitoring_scan(run_id, workspace, adapter, source)
+                    # FastAPI 等异步入口已经运行 Event Loop，而 Stage 1 浏览器采集使用
+                    # Playwright 同步 API。把完整的单来源扫描步骤放到工作线程，既避免
+                    # 同步 Playwright 与 Event Loop 冲突，也保留原有检查点和失败语义。
+                    history, candidates = await asyncio.to_thread(
+                        self.run_monitoring_scan, run_id, workspace, adapter, source
+                    )
                     self.process_event_candidates(run_id, workspace, product, adapter, candidates)
                     statement_key = "statement_extraction:" + history["snapshot_id"]
                     statements = self._step(

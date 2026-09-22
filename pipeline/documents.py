@@ -129,6 +129,19 @@ class OwnProductDocumentService:
         record = self._store(workspace_id).document_set_record("own_product", scope, document_id)
         return self._public(record) if record else None
 
+    def list_own_product_documents(self, *, workspace_id: str,
+                                   product_id: str) -> list[OwnProductDocumentResult]:
+        """列出一个产品作用域当前有效的自身资料。
+
+        输入是前端已经选定的 workspace 和产品身份；服务只读取正式 Document Registry，
+        不重新打开上传文件，也不暴露内容哈希、unit ID 或 Knowledge 数据库字段。输出沿用
+        单文档查询的产品状态，因此 Add、Replace 和列表页看到的是同一套 current-version
+        语义。
+        """
+        scope = self._scope(workspace_id, product_id)
+        records = self._store(workspace_id).document_sets("own_product", scope)
+        return [self._public(record) for record in records]
+
     def add_own_product_document(self, *, workspace_id: str, product_id: str,
                                  file: str | Path, display_name: str | None = None
                                  ) -> OwnProductDocumentResult:

@@ -13,3 +13,4 @@ Thumbs.db
 .idea/
 data/snapshots/*.json
 experiments/output/
+.pia-state/

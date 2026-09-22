@@ -241,6 +241,22 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ScriptedAdapters.calls["detect"], 0)
         self.assertEqual(ScriptedAdapters.calls["triage"], 0)
 
+    async def test_sync_browser_scan_runs_outside_asyncio_event_loop(self):
+        """回归 FastAPI 下同步 Playwright 因处于 Event Loop 而失败的问题。"""
+
+        class EventLoopSensitiveAdapter(ScriptedAdapters):
+            def scan(self, url):
+                try:
+                    asyncio.get_running_loop()
+                except RuntimeError:
+                    return super().scan(url)
+                raise RuntimeError("同步浏览器采集仍在 asyncio Event Loop 内运行。")
+
+        pipeline = ProductPipeline(self.root, adapter_type=EventLoopSensitiveAdapter)
+        result = await pipeline.run(self.product)
+        self.assertEqual(result["product"]["status"], "complete")
+        self.assertTrue(result["product"]["baseline_created"])
+
     async def test_first_scan_current_fact_is_only_baseline(self):
         existing = statement_candidate("Supports SSO.", initial=True, statement_date=None)
         genuinely_new = statement_candidate("We launched SCIM.", initial=False)
@@ -1006,6 +1022,28 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.pipeline.remember_explicit(self.product, "长期关注导出能力")
         self.assertEqual(ScriptedAdapters.calls["write_memory"], 1)
 
+    def test_module_adapter_passes_each_current_focus_to_triage(self):
+        """配置更新后新建的真实适配器必须把当次 Focus 原样交给 TriageWorkflow。"""
+        result = TriageResult(
+            event_id=fixture_event().candidate_id, decision="monitor", reason="继续观察。",
+            focus_relevance="相关。",
+            own_product_relevance={"status": "insufficient_own_product_context", "claims": []},
+            evidence_refs=["event:evidence_001"], uncertainty=[], missing_context=[],
+        )
+        received = []
+
+        with patch("pipeline.adapters.TriageWorkflow") as workflow:
+            workflow.return_value.run.side_effect = lambda _event, **kwargs: (
+                received.append(kwargs["current_focus"]) or {"result": result}
+            )
+            for focus in ("Focus A", "Focus B"):
+                adapter = ModuleAdapters(
+                    self.root, self.product.model_copy(update={"current_focus": focus})
+                )
+                adapter.readers = lambda: (object(), object())
+                adapter.triage(fixture_event())
+
+        self.assertEqual(received, ["Focus A", "Focus B"])
     async def test_identity_ambiguity_kept_separate_from_uncertain_facts(self):
         ScriptedAdapters.dedup_ambiguous = True
         result = await self.replay()
@@ -1131,6 +1169,36 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(output["product"]["scan_status"], "partial")
         self.assertTrue(output["product"]["baseline_created"])
         self.assertEqual(len(self.pipeline.store.items("snapshots")), 1)
+
+
+class RuntimeBoundarySyncTests(unittest.TestCase):
+    """验证 CLI 式同步调用不会改变 Pipeline 的扫描和基线语义。"""
+
+    def test_asyncio_run_pipeline_keeps_sync_scan_behavior(self):
+        class SyncCallAdapter(ScriptedAdapters):
+            def scan(self, url):
+                try:
+                    asyncio.get_running_loop()
+                except RuntimeError:
+                    return snapshot("Stable page.")
+                raise RuntimeError("同步扫描错误地运行在 asyncio Event Loop 中。")
+
+            def explicit_statement_candidates(self, _history, _source):
+                return []
+
+        with tempfile.TemporaryDirectory() as directory:
+            ScriptedAdapters.calls = Counter()
+            ScriptedAdapters.failures = {}
+            product = ProductInput(
+                workspace_id="sync", competitor_name="Example",
+                official_url="https://example.com",
+            )
+            pipeline = ProductPipeline(directory, adapter_type=SyncCallAdapter)
+            pipeline.confirm_monitoring_sources(product, discovery())
+            result = asyncio.run(pipeline.run(product))
+
+        self.assertEqual(result["product"]["status"], "complete")
+        self.assertTrue(result["product"]["baseline_created"])
 
 
 if __name__ == "__main__":
