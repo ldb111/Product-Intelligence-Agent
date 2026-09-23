@@ -19,11 +19,35 @@ FINAL_PROMPT = """搜索已关闭。只根据所给登记证据生成结构化 J
 事实的 support 必须含对应来源原文的连续 excerpt；不得引用搜索摘要、待确认证据或 Memory。
 excerpt 直接复制简短原文句子，保留原有顺序、空格和标点，不拼接不同位置、不重排文字、
 不补表格符号或项目符号、不用省略号。无法逐字核对的条目不要输出，放入 uncertainties。
+每条 Research Claim support 还必须输出 evidence_summary。它是给产品经理直接阅读的证据说明：
+严格基于同一 result_id 的真实内容和 excerpt，只说明与当前 Claim 直接相关的高价值事实；
+使用一至三个简洁自然的中文短句或短要点，不重复整个 Claim，不补充来源没有的事实。
+不要复制完整表格、大段网页、导航、参数列表或页面结构，不使用 Markdown 表格、标题、代码块、链接和内部 ID。
+excerpt 继续承担逐字核验，evidence_summary 只承担产品表达；两者不能互相替代。
+
+Internal Context 与 User-facing Output 必须严格分开。source_group、status、result_id 等
+内部字段可用于证据判断和结构化关联；result_id、evidence_refs 等 Schema 字段仍要
+填写真实内部 ID。但研究摘要、关键发现、对自身产品的影响、产品建议、
+下一步关注、evidence_summary、uncertainties 和 VerificationResult.reason 等自然语言
+值必须使用自然中文和产品语言，不得暴露后端字段名、英文枚举值或内部 ID。
+用户可见文本禁止直接输出 confirmed、pending、conflict、research、monitor、
+no_action、source_group、source_id、result_id、event_id、candidate_id、chunk_id、
+artifact_id，也不得输出 research_evidence_*、event_evidence_*、source_*、knowledge_*
+等内部编号或其他实现名称。
+需要表达状态时：confirmed 写“已确认”，pending 写“待确认”，conflict 写
+“证据存在冲突”；research 表达为“建议深入研究”，monitor 表达为
+“建议持续关注”，no_action 表达为“当前无需进一步处理”。
+可以使用 source_group 判断来源独立性，但自然语言只能写成业务含义，例如：
+“现有证据来自同一原始来源，暂不能视为独立交叉验证。”
+
 fact 仅陈述证据直接支持的事实；inference 是推论；recommendation 是建议。
 本轮新读到的第三方页面只能用于 inference，不直接升级为 fact。
 event_summary、background、competitor_context 各声明明确标记 kind；implications 和 watch_next 不得标 fact。
 own_product_comparison 每条比较必须同时引用自身知识和竞品事实原文。
 没有直接自身证据时 status=insufficient_own_product_context、claims=[]，并在 uncertainties 解释缺口。
+event_summary 只保留整体核心结论，不重复全部细节；background 和 competitor_context 放具体关键发现。
+implications 中 inference 表达对自身产品的潜在影响，recommendation 表达值得考虑的产品动作。
+watch_next 和 uncertainties 只保留会影响后续产品或竞争判断的重要跟踪项，删除低价值的泛化未知项。
 即使查到自身资料，也不能由未提及推断“不支持”。不得把 Fixture 能力当真实部署能力。
 event_time 未提供则不推断日期；观察时间不是事件时间。第三方文章不能推翻官方原文。
 页面条目的标注日期不等于该变化的实际生效日，不写“自该日起生效”；只可说明页面如何标注。

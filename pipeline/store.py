@@ -62,6 +62,138 @@ class PipelineStore:
         with self.connection() as db:
             self._put(db, namespace, key, body)
 
+    def reset_competitor_test_data(
+        self, *, workspace_id: str, product_id: str | None, competitor_name: str
+    ) -> dict[str, int]:
+        """原子清除一个已配置竞品的测试运行历史，同时保留正式配置和知识数据。
+
+        输入使用产品层 workspace、own product 和 competitor 三元组。方法先核对已保存
+        的竞品配置，再在一个 ``BEGIN IMMEDIATE`` 事务中删除该竞品独有 namespace、
+        对应 run 检查点及其 Snapshot。``workspaces``、``sources``、产品配置和独立
+        Knowledge Store 均不在删除范围内。输出只包含各类清理数量，不暴露内部键。
+        """
+        runtime_workspace = identity([workspace_id, competitor_name])
+        scoped_namespaces = {
+            "events": "events:" + runtime_workspace,
+            "event_actions": "event_actions:" + runtime_workspace,
+            "pending": "pending:" + runtime_workspace,
+            "resolved": "resolved:" + runtime_workspace,
+            "research_states": "research_status:" + runtime_workspace,
+            "triage": "triage:" + runtime_workspace,
+            "research_artifacts": "research:" + runtime_workspace,
+            "verification_artifacts": "verification:" + runtime_workspace,
+            "statement_observations": "statement_observations:" + runtime_workspace,
+            "statement_processing": "statement_processing:" + runtime_workspace,
+            "comparisons": "comparisons:" + runtime_workspace,
+            "observed_latest": "observed_latest:" + runtime_workspace,
+            "processed_latest": "processed_latest:" + runtime_workspace,
+            "legacy_latest": "latest:" + runtime_workspace,
+        }
+
+        def load_rows(db, namespace: str) -> list[tuple[str, object]]:
+            rows = db.execute(
+                "SELECT key,body FROM records WHERE namespace=?", (namespace,)
+            ).fetchall()
+            return [(key, json.loads(body)) for key, body in rows]
+
+        def collect_snapshot_ids(value, found: set[str]) -> None:
+            """只收集明确命名的 Snapshot 引用，避免把任意哈希误当成快照删除。"""
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    if key in {
+                        "snapshot_id", "previous_snapshot_id", "current_snapshot_id",
+                        "first_seen_snapshot_id", "last_seen_snapshot_id",
+                    } and isinstance(item, str):
+                        found.add(item)
+                    else:
+                        collect_snapshot_ids(item, found)
+            elif isinstance(value, list):
+                for item in value:
+                    collect_snapshot_ids(item, found)
+
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            configured = db.execute(
+                "SELECT body FROM records WHERE namespace='workspaces' AND key=?",
+                (runtime_workspace,),
+            ).fetchone()
+            if configured is None:
+                raise ValueError("待重置的竞品配置不存在。")
+            saved_config = json.loads(configured[0]).get("config", {})
+            if (
+                saved_config.get("workspace_id") != workspace_id
+                or saved_config.get("competitor_name") != competitor_name
+                or saved_config.get("own_product_id") != product_id
+            ):
+                raise ValueError("测试重置范围与已保存竞品配置不一致。")
+
+            run_ids: list[str] = []
+            for run_id, run in load_rows(db, "runs"):
+                config = run.get("product", {}) if isinstance(run, dict) else {}
+                if (
+                    config.get("workspace_id") == workspace_id
+                    and config.get("competitor_name") == competitor_name
+                    and config.get("own_product_id") == product_id
+                ):
+                    run_ids.append(run_id)
+
+            snapshot_ids: set[str] = set()
+            for name, namespace in scoped_namespaces.items():
+                for _, value in load_rows(db, namespace):
+                    if name in {"observed_latest", "processed_latest", "legacy_latest"}:
+                        if isinstance(value, str):
+                            snapshot_ids.add(value)
+                    else:
+                        collect_snapshot_ids(value, snapshot_ids)
+            for run_id in run_ids:
+                for _, value in load_rows(db, "steps:" + run_id):
+                    collect_snapshot_ids(value, snapshot_ids)
+
+            counts = {
+                "events_cleared": len(load_rows(db, scoped_namespaces["events"])),
+                "triage_results_cleared": len(load_rows(db, scoped_namespaces["triage"])),
+                "pending_candidates_cleared": len(load_rows(db, scoped_namespaces["pending"])),
+                "research_runs_cleared": len(load_rows(db, scoped_namespaces["research_states"])),
+                "research_artifacts_cleared": len(load_rows(db, scoped_namespaces["research_artifacts"])),
+                "statement_states_cleared": (
+                    len(load_rows(db, scoped_namespaces["statement_observations"]))
+                    + len(load_rows(db, scoped_namespaces["statement_processing"]))
+                ),
+                "monitoring_states_cleared": sum(
+                    len(load_rows(db, scoped_namespaces[name]))
+                    for name in (
+                        "comparisons", "observed_latest", "processed_latest", "legacy_latest",
+                        "event_actions", "resolved",
+                    )
+                ),
+                "snapshots_cleared": len(snapshot_ids),
+                "run_records_cleared": len(run_ids),
+            }
+
+            for namespace in scoped_namespaces.values():
+                db.execute("DELETE FROM records WHERE namespace=?", (namespace,))
+            for run_id in run_ids:
+                for namespace in (
+                    "steps:" + run_id,
+                    "run_artifacts:" + run_id,
+                    "run_events:" + run_id,
+                    "run_event_origins:" + run_id,
+                ):
+                    db.execute("DELETE FROM records WHERE namespace=?", (namespace,))
+                db.execute(
+                    "DELETE FROM records WHERE namespace IN ('runs','results') AND key=?",
+                    (run_id,),
+                )
+            for snapshot_id in snapshot_ids:
+                db.execute(
+                    "DELETE FROM records WHERE namespace='snapshots' AND key=?", (snapshot_id,)
+                )
+            db.execute(
+                "DELETE FROM records WHERE namespace=? AND key=?",
+                ("ui_competitor_scans:" + workspace_id, competitor_name),
+            )
+        return counts
+
     def claim_research(self, workspace: str, event_id: str, process_token: str, *, retry: bool = False) -> dict:
         """原子占用单个 Event 的 Research 执行权。
 

@@ -14,6 +14,8 @@ from research.agent import ResearchAgent, ResearchLimits
 from research.evidence import EvidenceError, EvidenceRegistry
 from research.schemas import Claim, OwnComparison, ResearchReport, Support, VerificationResult
 from research.tools import ResearchTools, TOOL_DEFINITIONS, public_url
+from research.prompts import FINAL_PROMPT
+from triage.prompts import TRIAGE_PROMPT
 from triage.schemas import TriageDecision, TriageResult
 from triage.workflow import TriageWorkflow
 
@@ -82,7 +84,8 @@ def pending():
 
 def report():
     return ResearchReport(event_summary=[Claim(text="积分变化", kind="fact", support=[Support(
-        result_id="event_evidence_001", excerpt="每月 2000 积分")])], background=[], competitor_context=[],
+        result_id="event_evidence_001", excerpt="每月 2000 积分",
+        evidence_summary="官方材料说明，免费档调整为每月 2000 积分。")])], background=[], competitor_context=[],
         own_product_comparison=OwnComparison(status="insufficient_own_product_context"), implications=[], watch_next=[],
         uncertainties=["自身资料不足"], evidence_refs=["event_evidence_001"])
 
@@ -132,6 +135,36 @@ class TriageTests(unittest.TestCase):
 
     def test_low_relevance_routes_no_action(self):
         self.assertEqual(self.run_route("no_action")[0]["result"].decision, "no_action")
+
+    def test_user_facing_reason_uses_product_language_without_internal_fields(self):
+        safe_reason = (
+            "该事件已经确认，与当前关注重点直接相关，建议深入研究。"
+            "现有证据来自同一原始来源，暂不能视为独立交叉验证。"
+        )
+        k, m, _, _ = dependencies()
+        decision = triage_decision().model_copy(update={"reason": safe_reason})
+        output = TriageWorkflow(
+            knowledge=k, memory=m, product_id="p", competitor_id="c",
+            memory_scope="workspace", memory_scope_id="w",
+            client=Mock(decide=Mock(return_value=(decision, record()))),
+        ).run(event(), current_focus="免费计划")
+
+        reason = output["result"].reason
+        self.assertEqual(reason, safe_reason)
+        for internal in (
+            "source_group", "source_", "result_id", "event_id", "confirmed",
+        ):
+            self.assertNotIn(internal, reason)
+        self.assertIn("现有证据来自同一原始来源，暂不能视为独立交叉验证", reason)
+
+    def test_triage_prompt_separates_internal_context_from_user_facing_output(self):
+        for required in (
+            "Internal Context", "User-facing Output", "source_group", "result_id",
+            "已确认", "待确认", "证据存在冲突", "建议深入研究",
+            "建议持续关注", "当前无需进一步处理",
+            "现有证据来自同一原始来源",
+        ):
+            self.assertIn(required, TRIAGE_PROMPT)
 
     def test_missing_own_context_is_explicit(self):
         output, _, _, _ = self.run_route(own=False)
@@ -293,6 +326,23 @@ class CitationTests(unittest.TestCase):
         with self.assertRaises(EvidenceError):
             self.registry.validate_report(r)
 
+    def test_research_claim_requires_evidence_summary(self):
+        with self.assertRaises(ValueError):
+            Claim(text="积分变化", kind="fact", support=[Support(
+                result_id="event_evidence_001", excerpt="每月 2000 积分")])
+
+    def test_research_prompt_keeps_internal_ids_out_of_user_facing_language(self):
+        for required in (
+            "Internal Context", "User-facing Output", "result_id", "evidence_refs",
+            "evidence_summary", "source_group", "自然中文", "已确认",
+            "现有证据来自同一原始来源",
+        ):
+            self.assertIn(required, FINAL_PROMPT)
+
+    def test_evidence_summary_rejects_invalid_type(self):
+        with self.assertRaises(ValueError):
+            Support(result_id="event_evidence_001", excerpt="每月 2000 积分", evidence_summary=123)
+
     def test_memory_is_never_factual_support(self):
         self.tools.execute("retrieve_memory", {"query": "关注"})
         with self.assertRaises(EvidenceError):
@@ -306,7 +356,8 @@ class CitationTests(unittest.TestCase):
         self.tools.official_hosts = frozenset()
         self.tools.execute("read_page", {"candidate_id": "candidate_001"})
         r = report().model_copy(update={"event_summary": [Claim(text="引用第三方覆盖原始事实", kind="fact",
-            support=[Support(result_id="research_evidence_001", excerpt="官方确认")])],
+            support=[Support(result_id="research_evidence_001", excerpt="官方确认",
+                             evidence_summary="第三方页面声称该变化已经得到确认。")])],
             "evidence_refs": ["research_evidence_001"]})
         with self.assertRaises(EvidenceError):
             self.registry.validate_report(r)
@@ -327,8 +378,10 @@ class CitationTests(unittest.TestCase):
     def test_comparison_with_both_domains_passes(self):
         self.tools.execute("retrieve_own_product_knowledge", {"query": "积分"})
         claim = Claim(text="测试自身积分较低", kind="fact", support=[
-            Support(result_id="knowledge_001", excerpt="每月 500 积分"),
-            Support(result_id="event_evidence_001", excerpt="每月 2000 积分")])
+            Support(result_id="knowledge_001", excerpt="每月 500 积分",
+                    evidence_summary="自身产品资料记录每月提供 500 积分。"),
+            Support(result_id="event_evidence_001", excerpt="每月 2000 积分",
+                    evidence_summary="竞品官方材料记录每月提供 2000 积分。")])
         r = report().model_copy(update={"own_product_comparison": OwnComparison(status="supported", claims=[claim]),
                                       "evidence_refs": ["event_evidence_001", "knowledge_001"]})
         self.assertEqual(len(self.registry.validate_report(r)), 2)
@@ -447,7 +500,11 @@ class AgentTests(unittest.TestCase):
 
     def test_deep_research(self):
         agent = ResearchAgent(tools(), client=FakeClient([[call("retrieve_competitor_knowledge", query="积分")]], report()))
-        self.assertEqual(agent.run(event(), mode="deep_research", triage_result=route())["mode"], "deep_research")
+        output = agent.run(event(), mode="deep_research", triage_result=route())
+        self.assertEqual(output["mode"], "deep_research")
+        restored = ResearchReport.model_validate(json.loads(json.dumps(output["result"])))
+        self.assertEqual(restored.event_summary[0].support[0].evidence_summary,
+                         "官方材料说明，免费档调整为每月 2000 积分。")
 
     def test_deep_requires_matching_research_triage(self):
         with self.assertRaises(ValueError):

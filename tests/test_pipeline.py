@@ -18,6 +18,8 @@ from event_core.evidence import merge_evidence
 from llm.config import LLMConfigurationError
 from llm.retrieval_models import EmbeddingAPIError
 from pipeline.adapters import ModuleAdapters
+from pipeline.configuration import ProductConfigurationService
+from pipeline.documents import workspace_knowledge_path
 from pipeline.orchestrator import ProductPipeline
 from pipeline.output import present_artifact, public_text
 from pipeline.schemas import ProductInput
@@ -1134,6 +1136,125 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(repeated["product"]["status"], "complete")
         self.assertEqual(ScriptedAdapters.calls["own"], 0)
         self.assertEqual(result["audit"]["steps"]["configuration"]["status"], "complete")
+
+    def test_competitor_test_reset_is_scoped_and_preserves_configuration(self):
+        product_a = ProductInput(
+            workspace_id="w", own_product_id="main", competitor_name="Example",
+            official_url="https://example.com",
+        )
+        product_b = ProductInput(
+            workspace_id="w", own_product_id="main", competitor_name="Other",
+            official_url="https://other.example",
+        )
+        workspace_a, _ = self.pipeline.configure_competitor(product_a)
+        workspace_b, _ = self.pipeline.configure_competitor(product_b)
+        self.pipeline.store.put("sources", workspace_a, {"sources": [{"url": "https://example.com"}]})
+        self.pipeline.store.put("sources", workspace_b, {"sources": [{"url": "https://other.example"}]})
+        ProductConfigurationService(self.pipeline.store).update(
+            "w", "main", {"current_focus": "保留当前研究重点"}
+        )
+        knowledge_path = workspace_knowledge_path(self.root, "w")
+        knowledge_path.write_bytes(b"own-product-knowledge-sentinel")
+
+        snapshot_a = identity("snapshot-a")
+        run_a = "run-a"
+        self.pipeline.store.put("events:" + workspace_a, "event-a", {"marker": "a"})
+        self.pipeline.store.put("triage:" + workspace_a, "triage-a", {"marker": "a"})
+        self.pipeline.store.put("pending:" + workspace_a, "pending-a", {"status": "pending"})
+        self.pipeline.store.put("research_status:" + workspace_a, "evt_same", {"status": "completed"})
+        self.pipeline.store.put("research:" + workspace_a, "research-a", {"marker": "a"})
+        self.pipeline.store.put("statement_observations:" + workspace_a, "statement-a", {
+            "statement_id": "statement-a", "first_seen_snapshot_id": snapshot_a,
+            "last_seen_snapshot_id": snapshot_a,
+        })
+        self.pipeline.store.put("statement_processing:" + workspace_a, "statement-a", {
+            "statement_id": "statement-a", "snapshot_id": snapshot_a, "status": "processed",
+        })
+        self.pipeline.store.put("processed_latest:" + workspace_a, "https://example.com", snapshot_a)
+        self.pipeline.store.put("observed_latest:" + workspace_a, "https://example.com", snapshot_a)
+        self.pipeline.store.put("comparisons:" + workspace_a, "comparison-a", {
+            "current_snapshot_id": snapshot_a, "previous_snapshot_id": None,
+        })
+        self.pipeline.store.put("snapshots", snapshot_a, {"snapshot_id": snapshot_a})
+        self.pipeline.store.put("runs", run_a, {"product": product_a.model_dump(), "mode": "monitor"})
+        self.pipeline.store.put("results", run_a, {"product": {"status": "complete"}})
+        self.pipeline.store.put("steps:" + run_a, "scan", {"data": {"snapshot_id": snapshot_a}})
+        self.pipeline.store.put("ui_competitor_scans:w", "Example", "2026-09-23T00:00:00Z")
+
+        self.pipeline.store.put("events:" + workspace_b, "event-b", {"marker": "b"})
+        self.pipeline.store.put("processed_latest:" + workspace_b, "https://other.example", "snapshot-b")
+
+        cleared = self.pipeline.store.reset_competitor_test_data(
+            workspace_id="w", product_id="main", competitor_name="Example"
+        )
+
+        self.assertEqual(cleared["events_cleared"], 1)
+        self.assertEqual(cleared["pending_candidates_cleared"], 1)
+        self.assertEqual(cleared["research_runs_cleared"], 1)
+        self.assertEqual(cleared["snapshots_cleared"], 1)
+        for namespace in (
+            "events:", "triage:", "pending:", "research_status:", "research:",
+            "statement_observations:", "statement_processing:", "processed_latest:",
+            "observed_latest:", "comparisons:",
+        ):
+            self.assertEqual(self.pipeline.store.items(namespace + workspace_a), {})
+        self.assertIsNone(self.pipeline.store.get("runs", run_a))
+        self.assertIsNone(self.pipeline.store.get("snapshots", snapshot_a))
+        self.assertIsNone(self.pipeline.store.get("ui_competitor_scans:w", "Example"))
+        self.assertEqual(self.pipeline.store.items("events:" + workspace_b)["event-b"]["marker"], "b")
+        self.assertEqual(
+            self.pipeline.store.get("processed_latest:" + workspace_b, "https://other.example"),
+            "snapshot-b",
+        )
+        self.assertIsNotNone(self.pipeline.store.get("workspaces", workspace_a))
+        self.assertEqual(self.pipeline.store.get("sources", workspace_a)["sources"][0]["url"],
+                         "https://example.com")
+        self.assertEqual(
+            ProductConfigurationService(self.pipeline.store).get("w", "main").current_focus,
+            "保留当前研究重点",
+        )
+        self.assertEqual(knowledge_path.read_bytes(), b"own-product-knowledge-sentinel")
+
+    async def test_research_lifecycle_can_restart_for_same_event_after_test_reset(self):
+        product = self.product.model_copy(update={"own_product_id": "main"})
+        first = await self.pipeline.run_events(product, [fixture_event()], provenance="first")
+        event_id = first["product"]["detected_events"][0]["event_id"]
+        completed = self.pipeline.start_research(product, event_id)["product"]["research"]
+        self.assertEqual(completed["status"], "completed")
+
+        cleared = self.pipeline.store.reset_competitor_test_data(
+            workspace_id="w", product_id="main", competitor_name="Example"
+        )
+        second = await self.pipeline.run_events(product, [fixture_event()], provenance="second")
+        repeated_event_id = second["product"]["detected_events"][0]["event_id"]
+        workspace = identity(["w", "Example"])
+        self.assertEqual(repeated_event_id, event_id)
+        self.assertEqual(cleared["research_runs_cleared"], 1)
+        self.assertEqual(self.pipeline.store.get("research_status:" + workspace, event_id)["status"],
+                         "not_started")
+        replayed = self.pipeline.start_research(product, event_id)["product"]["research"]
+        self.assertEqual(replayed["status"], "completed")
+        self.assertEqual(ScriptedAdapters.calls["deep_research"], 2)
+
+    async def test_historical_backfill_replays_after_reset_without_path_a_false_event(self):
+        product = self.product.model_copy(update={"own_product_id": "main"})
+        statement = statement_candidate(
+            "Official launch statement.", initial=True, statement_date="2026-09-20"
+        )
+        ScriptedAdapters.versions = ["Stable current page.", "Stable current page."]
+        ScriptedAdapters.statement_batches = [[statement], [statement]]
+
+        first = await self.pipeline.run(product)
+        first_event_id = first["product"]["historical_events"][0]["event_id"]
+        self.pipeline.store.reset_competitor_test_data(
+            workspace_id="w", product_id="main", competitor_name="Example"
+        )
+        second = await self.pipeline.run(product)
+
+        self.assertTrue(second["product"]["baseline_created"])
+        self.assertEqual(second["product"]["detected_events"], [])
+        self.assertEqual(second["product"]["historical_events"][0]["event_id"], first_event_id)
+        self.assertEqual(ScriptedAdapters.calls["path_a_detect"], 0)
 
     async def test_verification_no_event_with_formal_uncertain_stays_pending(self):
         ScriptedAdapters.verification = "no_event"

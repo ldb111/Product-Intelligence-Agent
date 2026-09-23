@@ -15,6 +15,7 @@ export interface Evidence {
 export interface ClaimSupport {
   result_id: string
   excerpt: string
+  evidence_summary?: string | null
 }
 
 export interface Claim {
@@ -109,6 +110,21 @@ export interface Competitor {
   last_scan_at?: string | null
 }
 
+export interface TestResetResult {
+  success: boolean
+  cleared: {
+    events_cleared: number
+    triage_results_cleared: number
+    pending_candidates_cleared: number
+    research_runs_cleared: number
+    research_artifacts_cleared: number
+    statement_states_cleared: number
+    monitoring_states_cleared: number
+    snapshots_cleared: number
+    run_records_cleared: number
+  }
+}
+
 export interface OwnProductDocument {
   document_id?: string | null
   display_name: string
@@ -135,6 +151,7 @@ export interface ScanResult {
   status: 'complete' | 'partial' | 'failed'
   completed_at: string
   new_event_count: number
+  historical_backfill_count: number
   error?: { type: 'configuration_error' | 'runtime_error' | 'source_error' | 'pipeline_error'; message: string }
   competitors: Array<{
     competitor: string

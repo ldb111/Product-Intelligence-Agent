@@ -1,4 +1,4 @@
-import type { CompetitionEvent, OwnProductDocument, TriageDecision } from './types'
+import type { CompetitionEvent, OwnProductDocument, ScanResult, TriageDecision } from './types'
 
 const priority: Record<TriageDecision, number> = { research: 0, monitor: 1, no_action: 2 }
 
@@ -21,6 +21,15 @@ export function isWithinDays(event: CompetitionEvent, days: number | null): bool
   if (days === null) return true
   const timestamp = timeValue(event)
   return timestamp > 0 && timestamp >= Date.now() - days * 86_400_000
+}
+
+export function scanSummary(result: ScanResult) {
+  const normal = result.new_event_count
+  const historical = result.historical_backfill_count ?? 0
+  if (normal > 0 && historical > 0) return `扫描完成 · 新增 ${normal} 条 · 历史回溯 ${historical} 条`
+  if (normal > 0) return `扫描完成 · 新增 ${normal} 条事件`
+  if (historical > 0) return `扫描完成 · 发现 ${historical} 条历史事件，本次无新增事件`
+  return '扫描完成 · 本次未发现新的竞争事件'
 }
 
 export function documentStatus(document: OwnProductDocument): {

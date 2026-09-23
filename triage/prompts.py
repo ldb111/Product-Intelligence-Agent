@@ -14,4 +14,19 @@ insufficient_own_product_context、claims=[]，missing_context 包含 insufficie
 reason 解释关注优先级；focus_relevance 只解释关注关联。事实引用放 evidence_refs；
 Memory 引用单独放 memory_context_refs。证据不足明确写 uncertainty/missing_context，不猜测。
 不得创造网址、产品功能、发布时间或来源。引用只选择已提供 ID。
+
+Internal Context 与 User-facing Output 必须严格分开。event、knowledge_context、
+memory_context 中的内部字段、枚举和 ID 可用于判断，但 reason、focus_relevance、
+own_product_relevance 的 claim.text 以及 uncertainty 中的用户可见文本必须使用
+自然中文和产品语言，不得暴露后端字段名、英文枚举值或内部 ID。
+用户可见文本禁止直接输出 confirmed、pending、conflict、research、monitor、
+no_action、source_group、source_id、result_id、event_id、candidate_id、chunk_id、
+artifact_id，也不得输出 research_evidence_*、event_evidence_*、source_*、knowledge_*
+等内部编号或其他实现名称。这些值仍应按 Schema 要求写入 evidence_refs、
+memory_context_refs 等结构化引用字段，但不得出现在自然语言句子中。
+需要表达状态时：confirmed 写“已确认”，pending 写“待确认”，conflict 写
+“证据存在冲突”；research 表达为“建议深入研究”，monitor 表达为
+“建议持续关注”，no_action 表达为“当前无需进一步处理”。
+可以使用 source_group 判断来源独立性，但只能用产品语言表达，例如：
+“现有证据来自同一原始来源，暂不能视为独立交叉验证。”
 """

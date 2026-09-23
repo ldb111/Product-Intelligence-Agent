@@ -140,6 +140,28 @@ class ProductApplicationService:
             raise ProductApiError("competitor_update_failed", "竞品更新失败，请重试。", 502) from None
         return self._configured_product_view(updated)
 
+    def reset_competitor_test_data(
+        self, workspace_id: str, competitor_name: str
+    ) -> dict[str, Any]:
+        """清理单个竞品的测试运行历史，保留竞品、来源和自身产品配置。
+
+        路由传入产品层 workspace 与竞品名称；这里先解析正式配置中的 own product scope，
+        再交给 PipelineStore 做单事务清理。该入口不调用 Event、Triage 或 Research，因而
+        不改变正式业务判断，只让下次扫描重新走正常首次扫描与 Historical Backfill。
+        """
+        product = self._configured_product(workspace_id, competitor_name)
+        try:
+            cleared = self.pipeline.store.reset_competitor_test_data(
+                workspace_id=workspace_id,
+                product_id=product.own_product_id,
+                competitor_name=competitor_name,
+            )
+        except ValueError:
+            raise ProductApiError(
+                "test_reset_failed", "重置失败，未能完整清除测试数据。", 409
+            ) from None
+        return {"success": True, "cleared": cleared}
+
     def _configured_product_view(self, product: ProductInput) -> dict[str, Any]:
         return next(
             row for row in self.list_competitors(product.workspace_id)
@@ -154,6 +176,7 @@ class ProductApplicationService:
         completed_at = datetime.now(timezone.utc).isoformat()
         results = []
         new_event_count = 0
+        historical_backfill_count = 0
         for product in products:
             try:
                 result = await self.pipeline.run(product)
@@ -162,6 +185,7 @@ class ProductApplicationService:
                 if public["status"] == "failed":
                     item["error"] = self._scan_error(public.get("error", {}).get("type"))
                 new_event_count += len(public.get("detected_events", []))
+                historical_backfill_count += len(public.get("historical_events", []))
             except Exception:
                 # 未被 Pipeline 收敛的运行异常仍记录为失败，但绝不把异常正文送到浏览器。
                 item = {
@@ -181,6 +205,7 @@ class ProductApplicationService:
             "status": status,
             "completed_at": completed_at,
             "new_event_count": new_event_count,
+            "historical_backfill_count": historical_backfill_count,
             "competitors": results,
         }
         if failed:
@@ -209,6 +234,33 @@ class ProductApplicationService:
             return view["result"]
         return None
 
+    def _research_view(self, workspace: str, state: dict[str, Any]) -> dict[str, Any]:
+        """生成网页所需的 Research 视图，并补回可核验的来源元数据。
+
+        Research 产物内部还包含 source_group、工具来源类别等开发字段。网页不需要这些
+        实现细节，因此这里只保留 Claim 关联所需的公开引用 ID、正文、链接、可信度与
+        观察日期；结论本身及其 Evidence 关系保持原样。
+        """
+        action = present_research_action(self.pipeline.store, workspace, state)
+        if action.get("status") != "completed" or "citations" not in action:
+            return action
+        reference = state.get("artifact", {})
+        artifact = self.pipeline.store.get(reference.get("namespace", ""), reference.get("key", ""))
+        raw_citations = artifact.get("citations", []) if isinstance(artifact, dict) else []
+        raw_by_id = {item.get("result_id"): item for item in raw_citations}
+        prefix = "research:" + state["event_id"] + ":"
+        safe_citations = []
+        for citation in action["citations"]:
+            raw_id = citation.get("result_id", "")
+            raw = raw_by_id.get(raw_id.removeprefix(prefix), {})
+            safe = {key: citation[key] for key in ("result_id", "url", "title", "content") if key in citation}
+            for key in ("credibility", "status", "observed_at"):
+                if raw.get(key) is not None:
+                    safe[key] = raw[key]
+            safe_citations.append(safe)
+        action["citations"] = safe_citations
+        return action
+
     def _event_view(
         self, product: ProductInput, internal_event_id: str, event_data: dict[str, Any]
     ) -> dict[str, Any]:
@@ -223,7 +275,7 @@ class ProductApplicationService:
         event_id = facts["event_id"]
         research_state = self.pipeline.store.get("research_status:" + workspace, event_id)
         research = (
-            present_research_action(self.pipeline.store, workspace, research_state)
+            self._research_view(workspace, research_state)
             if research_state is not None else None
         )
         return {
@@ -284,7 +336,7 @@ class ProductApplicationService:
         workspace = self._workspace(product)
         state = self.pipeline.store.get("research_status:" + workspace, event_id)
         if state is not None:
-            return {"accepted": True, "research": present_research_action(self.pipeline.store, workspace, state)}
+            return {"accepted": True, "research": self._research_view(workspace, state)}
         triage = self._triage_for_event(workspace, internal_id)
         if triage is None or triage.get("decision") != "research":
             return {"accepted": False, "event_id": event_id, "reason": "research_not_recommended"}
@@ -293,7 +345,12 @@ class ProductApplicationService:
 
     def start_research(self, workspace_id: str, event_id: str, *, retry: bool) -> dict[str, Any]:
         product, _, _ = self._find_event(workspace_id, event_id)
-        return self.pipeline.start_research(product, event_id, retry=retry)["product"]
+        result = self.pipeline.start_research(product, event_id, retry=retry)["product"]
+        workspace = self._workspace(product)
+        state = self.pipeline.store.get("research_status:" + workspace, event_id)
+        if result.get("accepted") and state is not None:
+            result["research"] = self._research_view(workspace, state)
+        return result
 
     def own_product(self, workspace_id: str, product_id: str) -> dict[str, Any]:
         configuration = self.configuration.get(workspace_id, product_id)

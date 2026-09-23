@@ -4,6 +4,7 @@ import {
   documentStatus,
   eventTypeLabels,
   isWithinDays,
+  scanSummary,
   sortCompetitionEvents,
   sourceTypeLabels,
 } from './domain'
@@ -23,6 +24,7 @@ import type {
 
 type Route = { page: 'home' | 'competitors' | 'product' } | { page: 'research'; eventId: string }
 type LoadState = 'loading' | 'ready' | 'error'
+type ResearchExecutionState = 'idle' | 'starting' | 'running' | 'completed' | 'failed'
 
 const triageMeta: Record<TriageDecision, { label: string; className: string }> = {
   research: { label: '建议深入研究', className: 'badge-research' },
@@ -131,11 +133,12 @@ export function EventCard({ event, onResearch }: {
       <EvidenceList evidence={event.evidence} />
       {triage && (
         <div className="triage-row">
-          <div><span>智能分诊</span><p>{triage.reason}</p></div>
+          <div className="triage-copy"><span>智能分诊</span><p>{triage.reason}</p></div>
           {triage.decision === 'research' && (
-            <button className={researchCompleted ? 'secondary-button' : 'primary-button'} onClick={() => onResearch(event)}>
-              {researchCompleted ? '查看研究' : '深入研究'}
-            </button>
+            <div className="triage-action"><button
+              className={`${researchCompleted ? 'secondary-button' : 'primary-button'} research-action-button`}
+              onClick={() => onResearch(event)}
+            >{researchCompleted ? '查看研究' : '深入研究'}</button></div>
           )}
         </div>
       )}
@@ -176,7 +179,7 @@ export function HomePage({ onResearch }: { onResearch: (event: CompetitionEvent)
     try {
       const result = await api.scan()
       if (result.status !== 'complete') throw new Error(result.error?.message ?? '扫描失败，请重试。')
-      setScanMessage(`扫描完成 · 发现 ${result.new_event_count} 条新事件`)
+      setScanMessage(scanSummary(result))
       await load()
     } catch (reason) {
       setScanMessage(reason instanceof Error ? reason.message : '扫描失败，请重试。')
@@ -268,6 +271,9 @@ export function CompetitorsPage() {
   const [name, setName] = useState('')
   const [url, setUrl] = useState('')
   const [editing, setEditing] = useState<Competitor | null>(null)
+  const [resetTarget, setResetTarget] = useState<Competitor | null>(null)
+  const [resetting, setResetting] = useState(false)
+  const [notice, setNotice] = useState('')
 
   const load = useCallback(async () => {
     try { setItems(await api.getCompetitors()); setState('ready'); setError('') }
@@ -294,10 +300,26 @@ export function CompetitorsPage() {
     finally { setSaving(false) }
   }
 
+  const resetTestData = async () => {
+    if (!resetTarget) return
+    setResetting(true); setError(''); setNotice('')
+    try {
+      await api.resetCompetitorTestData(resetTarget.name)
+      setResetTarget(null)
+      setNotice('测试数据已重置，可重新扫描。')
+      await load()
+    } catch {
+      setError('重置失败，未能完整清除测试数据。')
+    } finally {
+      setResetting(false)
+    }
+  }
+
   if (state === 'loading') return <PageLoading label="正在加载竞品…" />
   return <main className="page page-wide">
     <header className="page-header"><div><h1>竞品配置</h1><p>管理监控对象与信息来源</p></div><button className="primary-button" onClick={() => setAdding(true)}>添加竞品</button></header>
     {error && <ErrorNotice message={error} retry={state === 'error' ? load : undefined} />}
+    {notice && <div role="status" className="notice notice-success">{notice}</div>}
     {adding && <form className="form-card" onSubmit={add}>
       <div className="form-grid"><label>竞品名称<input required value={name} onChange={event => setName(event.target.value)} /></label>
         <label>官网 URL<input required type="url" value={url} onChange={event => setUrl(event.target.value)} placeholder="https://example.com" /></label></div>
@@ -305,7 +327,10 @@ export function CompetitorsPage() {
     </form>}
     {!items.length && !adding ? <div className="empty-state"><h2>暂无竞品</h2><p>添加监控对象与官网后开始来源识别。</p></div> :
       <div className="competitor-grid">{items.map(item => <article key={item.name} className="competitor-card">
-        <div className="card-heading"><div><h2>{item.name}</h2>{item.official_url && <a href={item.official_url} target="_blank" rel="noreferrer">{item.official_url}</a>}</div><button className="secondary-button small" onClick={() => setEditing(item)}>编辑</button></div>
+        <div className="card-heading"><div><h2>{item.name}</h2>{item.official_url && <a href={item.official_url} target="_blank" rel="noreferrer">{item.official_url}</a>}</div><div className="card-actions">
+          <button className="secondary-button small" onClick={() => setEditing(item)}>编辑</button>
+          {import.meta.env.DEV && <button className="danger-secondary small" onClick={() => { setResetTarget(item); setNotice('') }}>重置测试数据</button>}
+        </div></div>
         <div className="card-meta"><span>已识别来源 {item.sources.length}</span><span>最近扫描：{formatDate(item.last_scan_at, true)}</span></div>
         {item.sources.length ? <ul className="source-list">{item.sources.map(source => <SourceRow key={source.url} source={source} />)}</ul> : <p className="muted mt-4">尚未识别到可监控来源</p>}
       </article>)}</div>}
@@ -314,6 +339,11 @@ export function CompetitorsPage() {
       <label>官网 URL<input name="official_url" type="url" defaultValue={editing.official_url ?? ''} required /></label>
       <div className="form-actions"><button type="button" className="secondary-button" onClick={() => setEditing(null)}>取消</button><button className="primary-button" disabled={saving}>{saving ? '保存中…' : '保存'}</button></div>
     </form></div>}
+    {resetTarget && <div className="modal-backdrop" role="presentation"><div className="modal" role="dialog" aria-modal="true" aria-labelledby="reset-title">
+      <div><h2 id="reset-title">重置测试数据？</h2><p>将清除该竞品已发现的事件、研究结果和扫描状态，但保留竞品及来源配置。</p><p>下次扫描将按首次扫描重新处理。</p></div>
+      <div className="form-actions"><button type="button" className="secondary-button" disabled={resetting} onClick={() => setResetTarget(null)}>取消</button>
+        <button type="button" className="danger-button" disabled={resetting} onClick={() => void resetTestData()}>{resetting ? '正在重置…' : '确认重置'}</button></div>
+    </div></div>}
   </main>
 }
 
@@ -408,70 +438,206 @@ export function OwnProductPage() {
   </main>
 }
 
-function ClaimList({ claims, citations }: { claims: Claim[]; citations: Map<string, Evidence> }) {
-  return <div className="claim-list">{claims.map((claim, index) => <div className="claim" key={`${claim.text}-${index}`}>
-    <span className={`claim-kind claim-${claim.kind}`}>{claim.kind === 'fact' ? '事实' : claim.kind === 'inference' ? '推断' : '建议'}</span>
-    <div><p>{claim.text}</p>{claim.support.length > 0 && <div className="claim-sources">{claim.support.map(support => {
+function credibilityLabel(value: Evidence['credibility']) {
+  if (value === 'official') return '官方来源'
+  if (value === 'unverified') return '待确认来源'
+  return null
+}
+
+function researchCopy(value: string) {
+  return value
+    .replace(/\bsource_group\b(?:\s+source_[a-f0-9]{8,})?\s*/gi, '来源组')
+    .replace(/\bsource_[a-f0-9]{8,}\b/gi, '')
+    .replace(/\bresult_id\b/gi, '来源引用')
+    .replace(/\bartifact[_ ]?id\b/gi, '研究产物')
+    .replace(/\bchunk_id\b/gi, '文本片段')
+    .replace(/\s*\btool[_ ]?trace\b\s*/gi, '研究过程')
+    .replace(/\bown_product_comparison\b\s*/gi, '自身产品对照')
+    .replace(/\s*\binsufficient_own_product_context\b/gi, '自身产品资料不足')
+    .replace(/\bprevious_state\b/gi, '先前状态')
+    .replace(/\bcurrent_state\b/gi, '当前状态')
+    .replace(/\beffective_time\b/gi, '实际生效时间')
+    .replace(/\b(?:research_evidence|event_evidence|knowledge|candidate)_\d+\b/gi, '证据')
+    .replace(/\bknowledge\b/gi, '知识资料')
+    .replace(/\bEvent\b/g, '事件证据')
+    .replace(/\bnull\b/gi, '未记录')
+    .replace(/\s{2,}/g, ' ')
+    .trim()
+}
+
+function plainEvidence(value: string) {
+  return value
+    .replace(/```[\s\S]*?```/g, block => block.replace(/```[^\n]*\n?|```/g, ' '))
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
+    .replace(/^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$/gm, ' ')
+    .replace(/^\s*#{1,6}\s+/gm, '')
+    .replace(/^\s*(?:[-*+]\s+|>\s*)/gm, '')
+    .replace(/`([^`]+)`/g, '$1')
+    .replace(/^\s*\|(.+)\|\s*$/gm, (_, row: string) => row.split('|').map(cell => cell.trim()).filter(Boolean).join('；'))
+    .replace(/[ \t]*\n[ \t]*/g, ' ')
+    .replace(/\s{2,}/g, ' ')
+    .trim()
+}
+
+function EvidenceCard({ evidence, label, support, kind }: {
+  evidence: Evidence
+  label: string
+  support: Claim['support'][number]
+  kind: Claim['kind']
+}) {
+  const credibility = credibilityLabel(evidence.credibility)
+  const historical = !support.evidence_summary
+  const summary = plainEvidence(support.evidence_summary ?? support.excerpt)
+  const proofLabel = historical ? '原文摘录' : kind === 'fact' ? '关键证据' : kind === 'inference' ? '依据' : '参考依据'
+  return <article className="research-evidence-card">
+    <div className="evidence-card-heading">
+      <span className="evidence-id">{label}</span>
+      {evidence.url ? <a href={evidence.url} target="_blank" rel="noreferrer">{evidence.title}</a> : <strong>{evidence.title}</strong>}
+      {credibility && <span className="mini-badge">{credibility}</span>}
+      {evidence.observed_at && <span className="evidence-date">{formatDate(evidence.observed_at)}</span>}
+    </div>
+    <p className="evidence-proof"><strong>{proofLabel}</strong><span>{summary}</span></p>
+    {evidence.url && <div className="evidence-actions"><a href={evidence.url} target="_blank" rel="noreferrer">查看来源</a></div>}
+  </article>
+}
+
+function ClaimList({ claims, citations, labels }: {
+  claims: Claim[]
+  citations: Map<string, Evidence>
+  labels: Map<string, string>
+}) {
+  return <div className="claim-list">{claims.map((claim, index) => <article className="claim" key={`${claim.text}-${index}`}>
+    <div className="claim-heading">
+      <span className={`claim-kind claim-${claim.kind}`}>{claim.kind === 'fact' ? '事实' : claim.kind === 'inference' ? '推断' : '产品建议'}</span>
+      <p>{researchCopy(claim.text)}</p>
+    </div>
+    {claim.support.length > 0 ? <div className="claim-evidence">{claim.support.map((support, supportIndex) => {
       const source = citations.get(support.result_id)
-      return <span key={`${support.result_id}-${support.excerpt}`}>{source?.title ?? '已确认来源'}</span>
-    })}</div>}</div>
-  </div>)}</div>
+      if (!source) return <p className="evidence-missing" key={`${support.result_id}-${supportIndex}`}>当前 Evidence 不足，仍需验证。</p>
+      return <EvidenceCard
+        key={`${support.result_id}-${support.excerpt}-${supportIndex}`}
+        evidence={source}
+        label={labels.get(support.result_id) ?? `E${supportIndex + 1}`}
+        support={support}
+        kind={claim.kind}
+      />
+    })}</div> : claim.kind === 'inference' && <p className="evidence-missing">当前事实依据不足，仍需验证。</p>}
+  </article>)}</div>
+}
+
+function WatchList({ claims, labels, prefix }: { claims: Claim[]; labels: Map<string, string>; prefix: string }) {
+  return <ul className="watch-list">{claims.map((claim, index) => <li key={`${claim.text}-${index}`}>
+    <span className="claim-kind claim-pending">{prefix}</span><span>{researchCopy(claim.text)}</span>
+    {claim.support.map(item => labels.get(item.result_id)).filter(Boolean).map(label => <span className="citation-label" key={label}>{label}</span>)}
+  </li>)}</ul>
+}
+
+function ResearchSummary({ claims }: { claims: Claim[] }) {
+  return <div className="research-summary">{claims.map((claim, index) =>
+    <p key={`${claim.text}-${index}`}>{researchCopy(claim.text)}</p>)}</div>
 }
 
 function ResearchResult({ report, evidence }: { report: ResearchReport; evidence: Evidence[] }) {
   const citations = new Map(evidence.map(item => [item.result_id, item]))
-  const sections: Array<[string, Claim[]]> = [
-    ['研究摘要', report.event_summary], ['背景', report.background], ['竞品情况', report.competitor_context],
-    ['产品启示', report.implications], ['后续关注', report.watch_next],
-  ]
+  const labels = new Map(evidence.map((item, index) => [item.result_id, `E${index + 1}`]))
+  const findings = [...report.background, ...report.competitor_context]
+  const impact = report.implications.filter(claim => claim.kind === 'inference')
+  const recommendations = report.implications.filter(claim => claim.kind === 'recommendation')
   return <div className="research-report">
-    {sections.filter(([, claims]) => claims.length).map(([title, claims]) => <section key={title}><h2>{title}</h2><ClaimList claims={claims} citations={citations} /></section>)}
-    <section><h2>与自身产品的关系</h2>{report.own_product_comparison.status === 'supported'
-      ? <ClaimList claims={report.own_product_comparison.claims} citations={citations} />
-      : <p className="muted">当前自身产品资料不足，暂无法判断对应能力情况。</p>}</section>
-    {report.uncertainties.length > 0 && <section><h2>仍需确认</h2><ul className="bullet-list">{report.uncertainties.map(item => <li key={item}>{item}</li>)}</ul></section>}
-    <section><h2>证据</h2><div className="research-evidence">{evidence.map(item => <article key={item.result_id}><a href={item.url ?? undefined} target="_blank" rel="noreferrer">{item.title}</a><p>{item.content}</p></article>)}</div></section>
+    <section><h2>研究摘要</h2><ResearchSummary claims={report.event_summary} /></section>
+    {findings.length > 0 && <section><h2>关键发现</h2><ClaimList claims={findings} citations={citations} labels={labels} /></section>}
+    <section className={report.own_product_comparison.status === 'supported' ? '' : 'research-callout'}><h2>对自身产品的影响</h2>{report.own_product_comparison.status === 'supported'
+      ? <><ClaimList claims={report.own_product_comparison.claims} citations={citations} labels={labels} />
+        {impact.length > 0 && <ClaimList claims={impact} citations={citations} labels={labels} />}</>
+      : <p>当前自身产品资料不足，暂无法判断对应影响。</p>}</section>
+    {recommendations.length > 0 && <section><h2>产品建议</h2><ClaimList claims={recommendations} citations={citations} labels={labels} /></section>}
+    {(report.watch_next.length > 0 || report.uncertainties.length > 0) && <section><h2>下一步关注</h2>
+      {report.watch_next.length > 0 && <WatchList claims={report.watch_next} labels={labels} prefix="重点跟踪" />}
+      {report.uncertainties.length > 0 && <ul className="watch-list">{report.uncertainties.map(item => <li key={item}><span className="claim-kind claim-pending">待验证</span><span>{researchCopy(item)}</span></li>)}</ul>}
+    </section>}
+    {evidence.length > 0 && <details className="source-index"><summary>全部来源（{evidence.length}）</summary><ol>{evidence.map(item => <li key={item.result_id}>
+      <span className="evidence-id">{labels.get(item.result_id)}</span><span className="source-index-copy"><strong>{item.title}</strong><span>{credibilityLabel(item.credibility) ?? '已核验来源'}{item.observed_at ? ` · ${formatDate(item.observed_at)}` : ''}</span></span>
+      {item.url && <a href={item.url} target="_blank" rel="noreferrer">查看来源</a>}
+    </li>)}</ol></details>}
   </div>
 }
 
 export function ResearchPage({ eventId, onBack }: { eventId: string; onBack: () => void }) {
   const [event, setEvent] = useState<CompetitionEvent | null>(null)
   const [research, setResearch] = useState<ResearchState | null>(null)
+  const [executionState, setExecutionState] = useState<ResearchExecutionState>('idle')
   const [state, setState] = useState<LoadState>('loading')
   const [error, setError] = useState('')
-  const started = useRef(false)
+  const loadVersion = useRef(0)
+  const activeEventId = useRef(eventId)
+  const startRequest = useRef<{ eventId: string; promise: Promise<ResearchState | null> } | null>(null)
+  activeEventId.current = eventId
+
+  const applyResearchState = useCallback((value: ResearchState) => {
+    setResearch(value)
+    if (value.status === 'completed') setExecutionState('completed')
+    else if (value.status === 'failed') setExecutionState('failed')
+    else if (value.status === 'running') setExecutionState('running')
+    else setExecutionState('idle')
+  }, [])
+
+  const start = useCallback((current: ResearchState, retry: boolean) => {
+    // starting 是前端等待 HTTP 的状态，不改变 Backend Research lifecycle。
+    // 它先于请求发出而设置，因此真实深度研究返回前 Body 也始终可见。
+    setExecutionState('starting')
+    setError('')
+    if (startRequest.current?.eventId === eventId) return
+
+    const promise = api.startResearch(eventId, retry)
+    startRequest.current = { eventId, promise }
+    void promise.then(result => {
+      if (activeEventId.current === eventId && result) applyResearchState(result)
+    }).catch(reason => {
+      if (activeEventId.current !== eventId) return
+      setError(reason instanceof Error ? reason.message : '深入研究失败。')
+      setResearch({ ...current, status: 'failed' })
+      setExecutionState('failed')
+    }).finally(() => {
+      if (startRequest.current?.promise === promise) startRequest.current = null
+    })
+  }, [applyResearchState, eventId])
 
   const load = useCallback(async () => {
+    const version = ++loadVersion.current
     setState('loading')
     try {
       const overview = await api.getOverview()
+      if (version !== loadVersion.current) return
       const selected = overview.events.find(item => item.event_id === eventId)
       if (!selected) throw new Error('未找到该竞争事件。')
       setEvent(selected)
       const current = await api.getResearch(eventId)
+      if (version !== loadVersion.current) return
       if (!current) throw new Error('该事件不支持深入研究。')
-      setResearch(current)
-      if (current.status === 'not_started' && !started.current) {
-        started.current = true
-        setResearch({ ...current, status: 'running' })
-        const result = await api.startResearch(eventId, false)
-        if (result) setResearch(result)
-      }
-      setState('ready')
       setError('')
+      setResearch(current)
+      if (current.status === 'not_started') {
+        setState('ready')
+        start(current, false)
+        return
+      }
+      applyResearchState(current)
+      setState('ready')
     } catch (reason) {
+      if (version !== loadVersion.current) return
       setError(reason instanceof Error ? reason.message : '深入研究未完成。')
       setState('error')
     }
-  }, [eventId])
+  }, [applyResearchState, eventId, start])
   useEffect(() => { void load() }, [load])
 
-  const retry = async () => {
+  const retry = () => {
     setResearch(current => current ? { ...current, status: 'running' } : current)
-    setError('')
-    try { const result = await api.startResearch(eventId, true); if (result) setResearch(result) }
-    catch (reason) { setError(reason instanceof Error ? reason.message : '深入研究失败。') }
+    if (research) start(research, true)
   }
+
+  const showRunning = executionState === 'starting' || executionState === 'running'
 
   if (state === 'loading' && !event) return <PageLoading label="正在打开研究…" />
   if (state === 'error' && !event) return <main className="research-page"><button className="back-button" onClick={onBack}>← 返回首页</button><ErrorNotice message={error} retry={load} /></main>
@@ -481,7 +647,7 @@ export function ResearchPage({ eventId, onBack }: { eventId: string; onBack: () 
         {research?.status === 'failed' && <button className="secondary-button" onClick={retry}>重新研究</button>}</div></div></header>
     <div className="research-body research-width">
       {error && <ErrorNotice message={error} />}
-      {research?.status === 'running' && <div className="research-running"><span className="spinner" /><div><strong>研究中</strong><p>正在搜索、核验并整理相关信息…</p></div></div>}
+      {showRunning && <div className="research-running"><span className="spinner" /><div className="research-running-copy"><div><h2>正在深入研究</h2><span className="badge badge-research">研究中</span></div><p>正在搜索、核验并整理与该事件相关的信息，研究完成后结果会自动显示在这里。</p><dl><div><dt>研究对象</dt><dd>{event?.title}</dd></div><div><dt>已有证据</dt><dd>{event?.evidence.length ?? 0} 条</dd></div></dl></div></div>}
       {research?.status === 'failed' && <div className="empty-state"><h2>研究失败</h2><p>本次深入研究未完成，事件及已有证据不受影响。</p><button className="primary-button" onClick={retry}>重新研究</button></div>}
       {research?.status === 'completed' && research.result && <ResearchResult report={research.result} evidence={research.citations ?? []} />}
     </div>

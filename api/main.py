@@ -7,6 +7,7 @@ import os
 import tempfile
 from pathlib import Path
 from typing import Annotated, Callable
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -65,6 +66,7 @@ async def _copy_upload(upload: UploadFile) -> Path:
 def create_app(
     service: ProductApplicationService | None = None,
     *, service_factory: Callable[[], ProductApplicationService] | None = None,
+    test_reset_enabled: bool | None = None,
 ) -> FastAPI:
     """创建可注入服务的 API App，生产环境延迟初始化本地状态仓库。"""
     api = FastAPI(title="产品情报助手 API", version="0.1.0")
@@ -85,6 +87,24 @@ def create_app(
         if cached is None:
             cached = (service_factory or (lambda: ProductApplicationService(_default_state_directory())))()
         return cached
+
+    def allow_test_reset(request: Request) -> bool:
+        """只在显式开启或本机开发页面中暴露测试清理能力。
+
+        ``PIA_ENABLE_TEST_RESET`` 可显式开启或关闭。没有配置时仅接受本机客户端且
+        Origin 也为本机开发页面的请求；生产域名默认无法调用，即使手写 API 路径也会
+        得到 404。测试可通过 create_app 参数明确控制，不依赖进程环境。
+        """
+        if test_reset_enabled is not None:
+            return test_reset_enabled
+        configured = os.getenv("PIA_ENABLE_TEST_RESET")
+        if configured is not None:
+            return configured.strip().lower() in {"1", "true", "yes", "on"}
+        client_host = request.client.host if request.client else ""
+        origin_host = urlsplit(request.headers.get("origin", "")).hostname or ""
+        return client_host in {"127.0.0.1", "::1", "localhost"} and origin_host in {
+            "127.0.0.1", "::1", "localhost",
+        }
 
     @api.exception_handler(ProductApiError)
     async def product_error_handler(_request: Request, exc: ProductApiError):
@@ -130,6 +150,19 @@ def create_app(
     ):
         return {"data": await application().update_competitor(
             workspace_id, competitor_name, body.model_dump()
+        )}
+
+    @api.post(
+        "/api/workspaces/{workspace_id}/competitors/{competitor_name}/reset-test-data",
+        response_model=ApiEnvelope,
+    )
+    async def reset_competitor_test_data(
+        workspace_id: str, competitor_name: str, request: Request
+    ):
+        if not allow_test_reset(request):
+            raise ProductApiError("not_found", "未找到该接口。", 404)
+        return {"data": application().reset_competitor_test_data(
+            workspace_id, competitor_name
         )}
 
     @api.get(

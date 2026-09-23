@@ -47,6 +47,16 @@ class StubHttpService:
         self.calls.append(("update_competitor", workspace_id, name, body))
         return {"name": name, "official_url": body["official_url"], "sources": []}
 
+    def reset_competitor_test_data(self, workspace_id, name):
+        self.calls.append(("reset_competitor_test_data", workspace_id, name))
+        return {"success": True, "cleared": {
+            "events_cleared": 1, "triage_results_cleared": 1,
+            "pending_candidates_cleared": 0, "research_runs_cleared": 1,
+            "research_artifacts_cleared": 1, "statement_states_cleared": 3,
+            "monitoring_states_cleared": 4, "snapshots_cleared": 1,
+            "run_records_cleared": 1,
+        }}
+
     def research(self, workspace_id, event_id):
         self.calls.append(("research", workspace_id, event_id))
         return {"accepted": True, "research": {"event_id": event_id, "recommended": True,
@@ -104,6 +114,21 @@ class HttpApiContractTests(unittest.TestCase):
         call = next(item for item in self.service.calls if item[0] == "add_competitor")
         self.assertEqual(call[2]["official_url"], "https://openai.com")
         self.assertEqual(call[2]["own_product_id"], "main")
+
+    def test_test_reset_route_requires_guard_and_forwards_exact_competitor(self):
+        disabled = self.client.post(
+            "/api/workspaces/team/competitors/OpenAI/reset-test-data"
+        )
+        self.assertEqual(disabled.status_code, 404)
+
+        enabled = TestClient(create_app(self.service, test_reset_enabled=True))
+        response = enabled.post(
+            "/api/workspaces/team/competitors/OpenAI/reset-test-data"
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["data"]["success"])
+        self.assertEqual(response.json()["data"]["cleared"]["events_cleared"], 1)
+        self.assertIn(("reset_competitor_test_data", "team", "OpenAI"), self.service.calls)
 
     def test_research_retry_uses_explicit_retry_contract(self):
         response = self.client.post(
@@ -213,11 +238,13 @@ class ApplicationServiceTests(unittest.IsolatedAsyncioTestCase):
                                competitor_name="OpenAI", official_url="https://openai.com")
         self.pipeline.configure_competitor(product)
         self.pipeline.run = AsyncMock(return_value={"product": {
-            "status": "complete", "detected_events": [{"event_id": "evt_1"}]
+            "status": "complete", "detected_events": [{"event_id": "evt_1"}],
+            "historical_events": [{"event_id": "evt_historical"}],
         }})
         result = await self.service.scan("team")
         self.pipeline.run.assert_awaited_once_with(product)
         self.assertEqual(result["new_event_count"], 1)
+        self.assertEqual(result["historical_backfill_count"], 1)
 
     def test_product_configuration_defaults_empty_and_survives_store_reopen(self):
         empty = self.service.own_product("team", "main")
@@ -235,6 +262,38 @@ class ApplicationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(loaded["product_name"], "Acme Agent Platform")
         self.assertEqual(loaded["current_focus"], "企业级 Agent 管理与治理")
         self.pipeline.remember_explicit.assert_not_called()
+
+    def test_research_view_keeps_verification_metadata_and_removes_developer_fields(self):
+        workspace = "workspace-key"
+        event_id = "evt_public"
+        artifact_key = "research-artifact"
+        self.pipeline.store.put("research:" + workspace, artifact_key, {
+            "result": {"event_summary": [{"text": "正式上线", "kind": "fact", "support": [{
+                "result_id": "page_001", "excerpt": "正式上线。",
+                "evidence_summary": "官方更新日志确认该能力已经正式上线。",
+            }]}], "evidence_refs": ["page_001"]},
+            "citations": [{
+                "result_id": "page_001", "url": "https://example.com/changelog",
+                "title": "官方更新日志", "content": "正式上线。", "source": "page",
+                "domain": "competitor", "source_group": "developer-only",
+                "credibility": "official", "status": "confirmed",
+                "observed_at": "2026-09-20T00:00:00Z",
+            }],
+        })
+        state = {"event_id": event_id, "status": "completed", "artifact": {
+            "namespace": "research:" + workspace, "key": artifact_key,
+        }}
+
+        view = self.service._research_view(workspace, state)
+        citation = view["citations"][0]
+
+        self.assertEqual(view["result"]["event_summary"][0]["support"][0]["evidence_summary"],
+                         "官方更新日志确认该能力已经正式上线。")
+        self.assertEqual(citation["credibility"], "official")
+        self.assertEqual(citation["observed_at"], "2026-09-20T00:00:00Z")
+        self.assertNotIn("source_group", citation)
+        self.assertNotIn("source", citation)
+        self.assertNotIn("domain", citation)
 
     async def test_each_scan_receives_latest_saved_focus_for_triage_context(self):
         product = ProductInput(workspace_id="team", own_product_id="main",

@@ -5,6 +5,7 @@ import type {
   OwnProductDocument,
   ResearchState,
   ScanResult,
+  TestResetResult,
 } from '../types'
 
 const baseUrl = (import.meta.env.VITE_API_BASE_URL ?? '').replace(/\/$/, '')
@@ -48,6 +49,10 @@ export const api = {
   updateCompetitor: (name: string, input: Partial<Competitor>) =>
     request<Competitor>(`${root()}/competitors/${encodeURIComponent(name)}`, {
       method: 'PUT', body: JSON.stringify(input),
+    }),
+  resetCompetitorTestData: (name: string) =>
+    request<TestResetResult>(`${root()}/competitors/${encodeURIComponent(name)}/reset-test-data`, {
+      method: 'POST',
     }),
   getOwnProduct: () => request<OwnProduct>(`${root()}/own-product?product_id=${encodeURIComponent(productId)}`),
   updateOwnProduct: (input: { product_name: string; current_focus: string }) =>
