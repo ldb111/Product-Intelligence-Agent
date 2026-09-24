@@ -36,3 +36,38 @@ evaluation_use = regression_only
 
 本目录当前只完成 Source Discovery 与 Stage 1 的 Legacy Regression 数据基础。Event Detection、Verification、Triage、Research、Memory Extraction 和 Follow-up Research 的独立 Evaluation 尚未建立。
 
+## Legacy Regression Runner V0.1
+
+Runner 复用正式 Source Discovery Agent 与 Stage 1 页面采集入口，但把动态报告写入
+`tmp/evals/<run_id>/`，不会写入正式页面历史。旧 Gold 已参与 Prompt、Rule 或 Code 开发，
+所以结果只用于发现既有能力回退，不得解释为独立准确率、泛化能力或模型质量证明。
+
+先校验执行计划，不访问网页或模型：
+
+```powershell
+python -X utf8 -m evals.runners.legacy_regression --target all --dry-run
+```
+
+分别执行 Stage 1 或 Source Discovery：
+
+```powershell
+python -X utf8 -m evals.runners.legacy_regression --target stage1
+python -X utf8 -m evals.runners.legacy_regression --target source_discovery
+```
+
+也可以用 `--case S1-01` 只运行一个 Case，或用 `--output <目录>` 指定本次动态结果目录。
+默认输出包含 `results.json` 和 `report.md`。
+
+状态定义：
+
+- `PASS`：本次自动检查未发现与旧 Gold 的差异，也没有待人工结构断言。
+- `REVIEW`：发现内容差异、新来源、缺失来源或必须人工判断的结构断言。它不是失败；Runner
+  无法自动区分真实网页变化和实现回归。
+- `BLOCKED`：外部模型、认证、网络、浏览器或供应商服务阻止了本次运行。
+- `ERROR`：生产返回结构或 Runner 内部契约出现非预期错误。
+
+Source Discovery 使用每个旧 Case 的第一个核心 `product_page` 作为唯一 bootstrap，不把其余
+Gold 来源注入 Agent。Stage 1 V0.1 只检查当前页面采集、内容锚点与内存 Snapshot；旧资产未
+提供 `previous_snapshot`、State Matching、Contextual Diff 或 Contextual State Diff 的答案，
+Runner 不会补造这些结论。报告中的每个比率均保留分子和分母，Source Discovery 与 Stage 1
+分别汇总，不生成混合总分。
