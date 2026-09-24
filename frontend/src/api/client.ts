@@ -3,6 +3,11 @@ import type {
   Overview,
   OwnProduct,
   OwnProductDocument,
+  FollowUpConversation,
+  FollowUpTurn,
+  PreferenceItem,
+  Preferences,
+  PreferenceType,
   ResearchState,
   ScanResult,
   TestResetResult,
@@ -75,6 +80,29 @@ export const api = {
       { method: 'PUT', body: form },
     )
   },
+  getPreferences: () => request<Preferences>(
+    `${root()}/own-product/preferences?product_id=${encodeURIComponent(productId)}`,
+  ),
+  addPreference: (input: { type: PreferenceType; content: string }) => request<PreferenceItem>(
+    `${root()}/own-product/preferences?product_id=${encodeURIComponent(productId)}`,
+    { method: 'POST', body: JSON.stringify(input) },
+  ),
+  editPreference: (itemId: string, input: { type: PreferenceType; content: string }) => request<PreferenceItem>(
+    `${root()}/own-product/preferences/${encodeURIComponent(itemId)}?product_id=${encodeURIComponent(productId)}`,
+    { method: 'PUT', body: JSON.stringify(input) },
+  ),
+  removePreference: (itemId: string) => request<{ removed: boolean }>(
+    `${root()}/own-product/preferences/${encodeURIComponent(itemId)}?product_id=${encodeURIComponent(productId)}`,
+    { method: 'DELETE' },
+  ),
+  confirmPreference: (itemId: string) => request<PreferenceItem>(
+    `${root()}/own-product/preferences/${encodeURIComponent(itemId)}/confirm?product_id=${encodeURIComponent(productId)}`,
+    { method: 'POST' },
+  ),
+  ignorePreference: (itemId: string) => request<{ ignored: boolean }>(
+    `${root()}/own-product/preferences/${encodeURIComponent(itemId)}/ignore?product_id=${encodeURIComponent(productId)}`,
+    { method: 'POST' },
+  ),
   getResearch: async (eventId: string) => {
     const value = await request<{ accepted: boolean; research?: ResearchState }>(
       `${root()}/events/${encodeURIComponent(eventId)}/research`,
@@ -88,4 +116,15 @@ export const api = {
     )
     return value.research ?? null
   },
+  getFollowUps: (eventId: string) => request<FollowUpConversation>(
+    `${root()}/events/${encodeURIComponent(eventId)}/research/follow-ups`,
+  ),
+  sendFollowUp: (eventId: string, input: { request_id: string; question: string }) => request<FollowUpTurn>(
+    `${root()}/events/${encodeURIComponent(eventId)}/research/follow-ups`,
+    { method: 'POST', body: JSON.stringify(input) },
+  ),
+  retryFollowUp: (eventId: string, turnId: string) => request<FollowUpTurn>(
+    `${root()}/events/${encodeURIComponent(eventId)}/research/follow-ups/${encodeURIComponent(turnId)}/retry`,
+    { method: 'POST' },
+  ),
 }

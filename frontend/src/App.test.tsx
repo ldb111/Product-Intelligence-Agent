@@ -9,7 +9,9 @@ import type { CompetitionEvent, Overview, OwnProductDocument, ResearchState } fr
 const mocks = vi.hoisted(() => ({
   getOverview: vi.fn(), scan: vi.fn(), getCompetitors: vi.fn(), addCompetitor: vi.fn(),
   updateCompetitor: vi.fn(), resetCompetitorTestData: vi.fn(), getOwnProduct: vi.fn(), updateOwnProduct: vi.fn(), addDocument: vi.fn(),
-  replaceDocument: vi.fn(), getResearch: vi.fn(), startResearch: vi.fn(),
+  replaceDocument: vi.fn(), getResearch: vi.fn(), startResearch: vi.fn(), getPreferences: vi.fn(),
+  addPreference: vi.fn(), editPreference: vi.fn(), removePreference: vi.fn(), confirmPreference: vi.fn(), ignorePreference: vi.fn(),
+  getFollowUps: vi.fn(), sendFollowUp: vi.fn(), retryFollowUp: vi.fn(),
 }))
 
 vi.mock('./api/client', () => ({ api: mocks, workspaceId: 'default', productId: 'main' }))
@@ -38,6 +40,8 @@ beforeEach(() => {
   vi.clearAllMocks()
   mocks.getOverview.mockResolvedValue(overview([]))
   mocks.getCompetitors.mockResolvedValue([])
+  mocks.getPreferences.mockResolvedValue({ confirmed_items: [], awaiting_confirmation_items: [] })
+  mocks.getFollowUps.mockResolvedValue({ available: true, turns: [] })
 })
 
 describe('竞争事件工作台', () => {
@@ -309,6 +313,40 @@ describe('深入研究生命周期', () => {
     expect(mocks.startResearch).toHaveBeenCalledWith('evt_1', true)
     expect(await screen.findByText('竞品已上线更轻量的监测向导，可能降低首次使用门槛。')).toBeInTheDocument()
   })
+
+  it('初始研究完成后可进入继续追问，发送期间显示运行状态并保留事件标题', async () => {
+    mocks.getOverview.mockResolvedValue(overview([event({ research: completed })]))
+    mocks.getResearch.mockResolvedValue(completed)
+    let resolve!: (value: unknown) => void
+    mocks.sendFollowUp.mockReturnValue(new Promise(value => { resolve = value }))
+    render(<ResearchPage eventId="evt_1" onBack={vi.fn()} />)
+    await userEvent.click(await screen.findByRole('button', { name: '继续追问' }))
+    expect(screen.getByRole('heading', { name: '发布企业能力' })).toBeInTheDocument()
+    await userEvent.click(screen.getByRole('button', { name: '这次变化对我们当前产品影响最大的是什么？' }))
+    await userEvent.click(screen.getByRole('button', { name: '发送' }))
+    expect(screen.getAllByText('正在继续研究…')).toHaveLength(2)
+    expect(screen.getByRole('button', { name: '正在继续研究…' })).toBeDisabled()
+    resolve({ turn_id: 'turn_1', user_message: '这次变化对我们当前产品影响最大的是什么？', status: 'completed',
+      candidate_count: 0, created_at: '2026-09-24T00:00:00Z', updated_at: '2026-09-24T00:00:01Z',
+      result: { answer: [{ text: '应优先验证管理入口的采用率。', kind: 'recommendation', support: [] }], uncertainties: [], evidence_refs: [] }, citations: [] })
+    expect(await screen.findByText('应优先验证管理入口的采用率。')).toBeInTheDocument()
+  })
+
+  it('继续追问引用默认折叠，识别到待确认关注后提供产品入口', async () => {
+    mocks.getOverview.mockResolvedValue(overview([event({ research: completed })]))
+    mocks.getResearch.mockResolvedValue(completed)
+    mocks.getFollowUps.mockResolvedValue({ available: true, turns: [{
+      turn_id: 'turn_1', user_message: '我长期关注权限治理。', status: 'completed', candidate_count: 1,
+      created_at: '2026-09-24T00:00:00Z', updated_at: '2026-09-24T00:00:01Z',
+      result: { answer: [{ text: '建议持续核对权限覆盖范围。', kind: 'recommendation', support: [{ result_id: 'follow_up:turn_1:page_001', excerpt: '权限覆盖' }] }], uncertainties: [], evidence_refs: ['follow_up:turn_1:page_001'] },
+      citations: [{ result_id: 'follow_up:turn_1:page_001', title: '官方说明', content: '权限覆盖' }],
+    }] })
+    render(<ResearchPage eventId="evt_1" onBack={vi.fn()} />)
+    await userEvent.click(await screen.findByRole('button', { name: '继续追问' }))
+    const source = await screen.findByText('参考来源（1）')
+    expect(source.closest('details')).not.toHaveAttribute('open')
+    expect(document.body).not.toHaveTextContent('follow_up:turn_1:page_001')
+  })
 })
 
 describe('配置与文档显示', () => {
@@ -359,7 +397,7 @@ describe('配置与文档显示', () => {
     await screen.findAllByText('尚未配置')
     await userEvent.click(screen.getByRole('button', { name: '编辑' }))
     await userEvent.type(screen.getByLabelText('产品名称'), 'Acme Agent Platform')
-    await userEvent.type(screen.getByLabelText('当前研究重点'), '企业级 Agent 管理、权限体系、Agent 治理')
+    await userEvent.type(screen.getByLabelText('当前关注重点'), '企业级 Agent 管理、权限体系、Agent 治理')
     await userEvent.click(screen.getByRole('button', { name: '保存' }))
     expect(mocks.updateOwnProduct).toHaveBeenCalledWith({
       product_name: 'Acme Agent Platform',
@@ -370,6 +408,21 @@ describe('配置与文档显示', () => {
     first.unmount()
     render(<OwnProductPage />)
     expect(await screen.findByText('企业级 Agent 管理、权限体系、Agent 治理')).toBeInTheDocument()
+  })
+
+  it('关注与偏好显示中文类型，并可确认系统识别的待确认项', async () => {
+    const product = { product_id: 'main', product_name: 'Acme', current_focus: '', editable: true, documents: [] }
+    const awaiting = { item_id: 'item_1', type: 'hypothesis', content: '企业权限可能影响采购决策。',
+      source: '从研究交流中识别', updated_at: '2026-09-24T00:00:00Z' }
+    mocks.getOwnProduct.mockResolvedValue(product)
+    mocks.getPreferences.mockResolvedValueOnce({ confirmed_items: [], awaiting_confirmation_items: [awaiting] })
+      .mockResolvedValueOnce({ confirmed_items: [{ ...awaiting, source: '从研究交流中确认' }], awaiting_confirmation_items: [] })
+    render(<OwnProductPage />)
+    await userEvent.click(await screen.findByRole('button', { name: '待确认（1）' }))
+    expect(screen.getByText('待验证判断')).toBeInTheDocument()
+    expect(document.body).not.toHaveTextContent('hypothesis')
+    await userEvent.click(screen.getByRole('button', { name: '确认' }))
+    expect(mocks.confirmPreference).toHaveBeenCalledWith('item_1')
   })
 
   it('把真实解析与入库状态压缩为用户状态', () => {

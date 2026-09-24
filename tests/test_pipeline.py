@@ -94,6 +94,7 @@ class ScriptedAdapters(ModuleAdapters):
     explicit_outcomes = {}
     explicit_event_times = {}
     dedup_same_event = False
+    follow_up_inputs = []
 
     def hit(self, name):
         self.calls[name] += 1
@@ -199,6 +200,21 @@ class ScriptedAdapters(ModuleAdapters):
             citations = []
         return {"result": result, "citations": citations, "audit": {"provider": "private-provider"}}
 
+    def extract_preference_candidates(self, text, *, event_id, turn_id):
+        self.hit("extract_preference")
+        return [{"content": text}] if "长期关注" in text else []
+
+    def follow_up(self, event, triage_result, official_hosts, *, initial_artifact,
+                  conversation_history, question):
+        self.hit("follow_up")
+        self.follow_up_inputs.append({
+            "question": question, "history": deepcopy(conversation_history),
+            "initial": deepcopy(initial_artifact),
+        })
+        return {"result": {"answer": [{"text": "继续研究回答", "kind": "recommendation", "support": []}],
+                           "uncertainties": [], "evidence_refs": []},
+                "citations": [], "audit": {"provider": "private-provider"}}
+
     def remember_explicit(self, text):
         self.hit("write_memory")
         return {"result": {"content": text}, "runtime": []}
@@ -226,6 +242,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         ScriptedAdapters.explicit_outcomes = {}
         ScriptedAdapters.explicit_event_times = {}
         ScriptedAdapters.dedup_same_event = False
+        ScriptedAdapters.follow_up_inputs = []
         self.pipeline = ProductPipeline(self.root, adapter_type=ScriptedAdapters)
 
     async def replay(self, uncertain=False):
@@ -857,6 +874,57 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ScriptedAdapters.calls["deep_research"], 1)
         workspace = identity([self.product.workspace_id, self.product.competitor_name])
         self.assertEqual(len(self.pipeline.store.items("research:" + workspace)), 1)
+
+    async def test_follow_up_requires_completed_initial_research_and_duplicate_request_is_idempotent(self):
+        _, event_id = await self.recommendation()
+        unavailable = self.pipeline.follow_up_research(
+            self.product, event_id, request_id="request-123", question="这件事有什么影响？"
+        )
+        self.assertFalse(unavailable["accepted"])
+        self.pipeline.start_research(self.product, event_id)
+        first = self.pipeline.follow_up_research(
+            self.product, event_id, request_id="request-123", question="我长期关注企业权限，这件事有什么影响？"
+        )
+        duplicate = self.pipeline.follow_up_research(
+            self.product, event_id, request_id="request-123", question="不得覆盖原问题"
+        )
+        self.assertEqual(first["turn"]["status"], "completed")
+        self.assertTrue(duplicate["reused"])
+        self.assertEqual(duplicate["turn"]["user_message"], "我长期关注企业权限，这件事有什么影响？")
+        self.assertEqual(ScriptedAdapters.calls["follow_up"], 1)
+        self.assertEqual(ScriptedAdapters.calls["extract_preference"], 1)
+        self.assertEqual(first["turn"]["candidate_count"], 1)
+
+    async def test_follow_up_failure_keeps_turn_and_retry_uses_conversation_history(self):
+        _, event_id = await self.recommendation()
+        self.pipeline.start_research(self.product, event_id)
+        first = self.pipeline.follow_up_research(
+            self.product, event_id, request_id="request-first", question="先分析产品影响。"
+        )
+        self.assertEqual(first["turn"]["status"], "completed")
+        ScriptedAdapters.failures["follow_up"] = RuntimeError("private failure")
+        failed = self.pipeline.follow_up_research(
+            self.product, event_id, request_id="request-second", question="再看竞争回应。"
+        )
+        self.assertEqual(failed["turn"]["status"], "failed")
+        self.assertNotIn("private failure", json.dumps(failed))
+        del ScriptedAdapters.failures["follow_up"]
+        retried = self.pipeline.follow_up_research(
+            self.product, event_id, retry_turn_id=failed["turn"]["turn_id"]
+        )
+        self.assertEqual(retried["turn"]["status"], "completed")
+        self.assertEqual(ScriptedAdapters.follow_up_inputs[-1]["history"][0]["user"], "先分析产品影响。")
+        self.assertEqual(ScriptedAdapters.calls["extract_preference"], 2)
+
+    async def test_preference_extraction_failure_does_not_fail_follow_up(self):
+        _, event_id = await self.recommendation()
+        self.pipeline.start_research(self.product, event_id)
+        ScriptedAdapters.failures["extract_preference"] = RuntimeError("controlled extraction failure")
+        output = self.pipeline.follow_up_research(
+            self.product, event_id, request_id="request-123", question="我长期关注企业权限。"
+        )
+        self.assertEqual(output["turn"]["status"], "completed")
+        self.assertEqual(output["turn"]["candidate_count"], 0)
 
     async def test_running_research_is_idempotent(self):
         _, event_id = await self.recommendation()

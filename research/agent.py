@@ -1,4 +1,4 @@
-"""一个有界工具循环服务两种模式；关闭搜索与最终生成严格分离。"""
+"""一个有界工具循环服务核验、初始研究与事件追问；搜索和最终生成严格分离。"""
 
 import json
 from dataclasses import dataclass
@@ -7,7 +7,7 @@ from time import perf_counter
 from llm.research import get_research_llm
 
 from .prompts import FINAL_PROMPT, RESEARCH_PROMPT
-from .schemas import ResearchReport, VerificationResult
+from .schemas import FollowUpAnswer, ResearchReport, VerificationResult
 from .tools import TOOL_DEFINITIONS
 
 
@@ -35,7 +35,9 @@ class ResearchAgent:
         self.states: list[str] = []
         self.last_result = None
 
-    def run(self, event, *, mode: str, triage_result=None, current_focus: str = "") -> dict:
+    def run(self, event, *, mode: str, triage_result=None, current_focus: str = "",
+            initial_report: dict | None = None, initial_citations: list[dict] | None = None,
+            conversation_history: list[dict] | None = None, question: str | None = None) -> dict:
         """核对输入资格，执行有界工具决策，关闭后一次生成并校验引用。
 
         verification 只输出结果和新证据，不替换上游候选。deep_research 必须有该事件
@@ -44,7 +46,7 @@ class ResearchAgent:
         """
         if self.used or self.tools.registry.items:
             raise ValueError("每次研究必须使用新 Agent 和新工具上下文。")
-        if mode not in {"verification", "deep_research"}:
+        if mode not in {"verification", "deep_research", "follow_up"}:
             raise ValueError("未知研究模式。")
         if mode == "verification" and event.decision != "uncertain":
             raise ValueError("核验只接受 uncertain 候选。")
@@ -52,9 +54,22 @@ class ResearchAgent:
             if (event.decision != "event" or triage_result is None
                     or triage_result.event_id != event.candidate_id or triage_result.decision != "research"):
                 raise ValueError("深度研究需要同一已确认事件的 research 分诊结果。")
+        if mode == "follow_up":
+            if (event.decision != "event" or not isinstance(initial_report, dict)
+                    or not isinstance(initial_citations, list)
+                    or not isinstance(conversation_history, list)
+                    or not isinstance(question, str) or not question.strip()):
+                raise ValueError("继续追问需要已确认事件、初始研究、既有引用、历史消息和用户问题。")
         self.used = True
         started = perf_counter()
         payload = {"mode": mode, "event": self.tools.seed_event(event), "current_focus": current_focus}
+        if mode == "follow_up":
+            payload.update({
+                "initial_research": initial_report,
+                "initial_research_evidence": self.tools.seed_citations(initial_citations or []),
+                "conversation_history": conversation_history,
+                "question": question.strip(),
+            })
         if triage_result is not None:
             # 分诊引用属于上一个登记表，不能冒充本轮引用；此处仅提供路由上下文。
             payload["triage"] = {"decision": triage_result.decision, "reason": triage_result.reason}
@@ -110,11 +125,13 @@ class ResearchAgent:
         final_items = [i for i in self.tools.registry.model_items() if i["source"] != "search"]
         final_payload = {**payload, "event": final_event, "stop_reason": stop, "evidence": final_items,
                          "initial_evidence_ids": sorted(initial_ids)}
-        schema = VerificationResult if mode == "verification" else ResearchReport
+        schema = (VerificationResult if mode == "verification" else
+                  FollowUpAnswer if mode == "follow_up" else ResearchReport)
         result = self.client.finalize(FINAL_PROMPT, final_payload, schema)
         self.last_result = result
         registry = self.tools.registry
         citations = (registry.validate_verification(result, initial_ids) if mode == "verification"
+                     else registry.validate_follow_up(result) if mode == "follow_up"
                      else registry.validate_report(result))
         self.states.append("COMPLETE")
         return {"mode": mode, "event_id": event.candidate_id, "result": result.model_dump(),

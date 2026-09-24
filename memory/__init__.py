@@ -5,9 +5,10 @@ from .retrieval import MemoryRetriever
 from .schemas import MemoryCandidate, MemoryRecord, MemoryRetrievalResponse, MemoryWriteResult
 from .store import MemoryStore
 from .writing import MemoryWriter
+from .product import PreferenceNotFoundError, PreferenceService
 
 __all__ = [
     "ExtractionOutcome", "MemoryCandidate", "MemoryRecord", "MemoryRetriever",
     "MemoryRetrievalResponse", "MemoryStore", "MemoryWriteResult", "MemoryWriter",
-    "extract_candidates",
+    "extract_candidates", "PreferenceNotFoundError", "PreferenceService",
 ]

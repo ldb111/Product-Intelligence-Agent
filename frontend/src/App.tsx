@@ -17,6 +17,10 @@ import type {
   Overview,
   OwnProduct,
   OwnProductDocument,
+  FollowUpTurn,
+  PreferenceItem,
+  Preferences,
+  PreferenceType,
   ResearchReport,
   ResearchState,
   TriageDecision,
@@ -25,6 +29,11 @@ import type {
 type Route = { page: 'home' | 'competitors' | 'product' } | { page: 'research'; eventId: string }
 type LoadState = 'loading' | 'ready' | 'error'
 type ResearchExecutionState = 'idle' | 'starting' | 'running' | 'completed' | 'failed'
+
+const preferenceTypeLabels: Record<PreferenceType, string> = {
+  focus: '关注点', preference: '偏好', constraint: '限制条件', goal: '目标',
+  decision: '决策', hypothesis: '待验证判断', open_question: '待确认问题',
+}
 
 const triageMeta: Record<TriageDecision, { label: string; className: string }> = {
   research: { label: '建议深入研究', className: 'badge-research' },
@@ -370,9 +379,17 @@ export function OwnProductPage() {
   const [replacing, setReplacing] = useState<string | null>(null)
   const [editing, setEditing] = useState(false)
   const [saving, setSaving] = useState(false)
+  const [preferences, setPreferences] = useState<Preferences>({ confirmed_items: [], awaiting_confirmation_items: [] })
+  const [preferenceTab, setPreferenceTab] = useState<'confirmed' | 'awaiting'>(() =>
+    new URLSearchParams(window.location.search).get('preferences') === 'awaiting' ? 'awaiting' : 'confirmed')
+  const [preferenceForm, setPreferenceForm] = useState<PreferenceItem | 'new' | null>(null)
+  const [preferenceBusy, setPreferenceBusy] = useState(false)
 
   const load = useCallback(async () => {
-    try { setProduct(await api.getOwnProduct()); setState('ready'); setError('') }
+    try {
+      const [nextProduct, nextPreferences] = await Promise.all([api.getOwnProduct(), api.getPreferences()])
+      setProduct(nextProduct); setPreferences(nextPreferences); setState('ready'); setError('')
+    }
     catch (reason) { setError(reason instanceof Error ? reason.message : '产品资料加载失败。'); setState('error') }
   }, [])
   useEffect(() => { void load() }, [load])
@@ -408,6 +425,30 @@ export function OwnProductPage() {
     }
   }
 
+  const savePreference = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    const form = new FormData(event.currentTarget)
+    const input = { type: String(form.get('type')) as PreferenceType, content: String(form.get('content') ?? '').trim() }
+    if (!input.content) return
+    setPreferenceBusy(true); setError('')
+    try {
+      if (preferenceForm === 'new') await api.addPreference(input)
+      else if (preferenceForm) await api.editPreference(preferenceForm.item_id, input)
+      setPreferences(await api.getPreferences()); setPreferenceForm(null)
+    } catch (reason) { setError(reason instanceof Error ? reason.message : '关注信息保存失败。') }
+    finally { setPreferenceBusy(false) }
+  }
+  const preferenceAction = async (action: 'remove' | 'confirm' | 'ignore', item: PreferenceItem) => {
+    setPreferenceBusy(true); setError('')
+    try {
+      if (action === 'remove') await api.removePreference(item.item_id)
+      if (action === 'confirm') await api.confirmPreference(item.item_id)
+      if (action === 'ignore') await api.ignorePreference(item.item_id)
+      setPreferences(await api.getPreferences())
+    } catch (reason) { setError(reason instanceof Error ? reason.message : '操作未完成。') }
+    finally { setPreferenceBusy(false) }
+  }
+
   if (state === 'loading') return <PageLoading label="正在加载产品资料…" />
   if (state === 'error' && !product) return <main className="page"><ErrorNotice message={error} retry={load} /></main>
   return <main className="page">
@@ -419,13 +460,13 @@ export function OwnProductPage() {
       </div>
       {editing ? <form onSubmit={saveConfiguration}>
         <div className="product-config-form">
-          <label>产品名称<input name="product_name" defaultValue={product?.product_name ?? ''} maxLength={200} placeholder="例如：Acme Agent Platform" /></label>
-          <label>当前研究重点<textarea name="current_focus" defaultValue={product?.current_focus ?? ''} maxLength={2000} rows={4} placeholder="例如：企业级 Agent 管理、权限体系、Agent 治理" /></label>
+          <label>产品名称<input name="product_name" defaultValue={product?.product_name ?? ''} maxLength={200} placeholder="例如：Acme 智能协作平台" /></label>
+          <label>当前关注重点<textarea name="current_focus" defaultValue={product?.current_focus ?? ''} maxLength={2000} rows={4} placeholder="例如：企业级智能体管理、权限体系与治理" /></label>
         </div>
         <div className="form-actions"><button type="button" className="secondary-button" onClick={() => setEditing(false)} disabled={saving}>取消</button><button className="primary-button" disabled={saving}>{saving ? '保存中…' : '保存'}</button></div>
       </form> : <div className="product-identity">
         <div><span>产品名称</span><strong>{product?.product_name ?? '尚未配置'}</strong></div>
-        <div><span>当前研究重点</span><strong>{product?.current_focus ?? '尚未配置'}</strong></div>
+        <div><span>当前关注重点</span><strong>{product?.current_focus ?? '尚未配置'}</strong></div>
       </div>}
     </section>
     <section className="section-card">
@@ -435,6 +476,26 @@ export function OwnProductPage() {
       {product?.documents.length ? <div className="document-list">{product.documents.map(item => <DocumentRow key={item.document_id ?? item.display_name} document={item} replacing={replacing === item.document_id} onReplace={replace} />)}</div>
         : <div className="empty-state compact"><h2>暂无产品资料</h2><p>上传资料后可用于分诊与深入研究。</p></div>}
     </section>
+    <section className="section-card" id="preferences">
+      <div className="section-heading"><div><h2>关注与偏好</h2><p>用于记录长期关注、工作偏好和判断原则，分诊与深入研究会参考这些信息。</p></div>
+        <button className="primary-button" onClick={() => setPreferenceForm('new')}>＋ 添加关注与偏好</button></div>
+      <div className="preference-tabs" role="tablist">
+        <button className={preferenceTab === 'confirmed' ? 'active' : ''} onClick={() => setPreferenceTab('confirmed')}>已确认（{preferences.confirmed_items.length}）</button>
+        <button className={preferenceTab === 'awaiting' ? 'active' : ''} onClick={() => setPreferenceTab('awaiting')}>待确认（{preferences.awaiting_confirmation_items.length}）</button>
+      </div>
+      <div className="preference-list">{(preferenceTab === 'confirmed' ? preferences.confirmed_items : preferences.awaiting_confirmation_items).map(item =>
+        <article className="preference-row" key={item.item_id}><div><span className="preference-type">{preferenceTypeLabels[item.type]}</span><p>{item.content}</p><small>来源：{item.source} · 更新于 {formatDate(item.updated_at)}</small></div>
+          <div className="preference-actions">{preferenceTab === 'confirmed' ? <><button className="secondary-button small" onClick={() => setPreferenceForm(item)}>编辑</button><button className="danger-secondary" disabled={preferenceBusy} onClick={() => void preferenceAction('remove', item)}>移除</button></>
+            : <><button className="primary-button small" disabled={preferenceBusy} onClick={() => void preferenceAction('confirm', item)}>确认</button><button className="secondary-button small" disabled={preferenceBusy} onClick={() => void preferenceAction('ignore', item)}>忽略</button></>}</div>
+        </article>)}
+        {(preferenceTab === 'confirmed' ? preferences.confirmed_items : preferences.awaiting_confirmation_items).length === 0 && <div className="empty-state compact"><h2>{preferenceTab === 'confirmed' ? '暂无关注与偏好' : '暂无待确认内容'}</h2><p>{preferenceTab === 'confirmed' ? '你可以添加希望持续关注的方向。' : '研究交流中识别到的候选会出现在这里。'}</p></div>}
+      </div>
+    </section>
+    {preferenceForm && <div className="modal-backdrop" role="presentation"><form className="modal" onSubmit={savePreference}><div><h2>{preferenceForm === 'new' ? '添加关注' : '编辑关注'}</h2><p>保存后会用于相关事件的研究优先级判断。</p></div>
+      <label>类型<select name="type" defaultValue={preferenceForm === 'new' ? 'focus' : preferenceForm.type}>{Object.entries(preferenceTypeLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
+      <label>内容<textarea name="content" required maxLength={2000} rows={4} defaultValue={preferenceForm === 'new' ? '' : preferenceForm.content} placeholder="例如：持续关注企业级权限治理能力" /></label>
+      <div className="form-actions"><button type="button" className="secondary-button" disabled={preferenceBusy} onClick={() => setPreferenceForm(null)}>取消</button><button className="primary-button" disabled={preferenceBusy}>{preferenceBusy ? '保存中…' : '保存'}</button></div>
+    </form></div>}
   </main>
 }
 
@@ -514,7 +575,7 @@ function ClaimList({ claims, citations, labels }: {
     </div>
     {claim.support.length > 0 ? <div className="claim-evidence">{claim.support.map((support, supportIndex) => {
       const source = citations.get(support.result_id)
-      if (!source) return <p className="evidence-missing" key={`${support.result_id}-${supportIndex}`}>当前 Evidence 不足，仍需验证。</p>
+      if (!source) return <p className="evidence-missing" key={`${support.result_id}-${supportIndex}`}>当前证据不足，仍需验证。</p>
       return <EvidenceCard
         key={`${support.result_id}-${support.excerpt}-${supportIndex}`}
         evidence={source}
@@ -563,12 +624,32 @@ function ResearchResult({ report, evidence }: { report: ResearchReport; evidence
   </div>
 }
 
+function FollowUpResult({ turn }: { turn: FollowUpTurn }) {
+  const evidence = turn.citations ?? []
+  const citations = new Map(evidence.map(item => [item.result_id, item]))
+  const labels = new Map(evidence.map((item, index) => [item.result_id, `E${index + 1}`]))
+  return <div className="follow-up-answer">
+    {turn.result && <ClaimList claims={turn.result.answer} citations={citations} labels={labels} />}
+    {!!turn.result?.uncertainties.length && <div className="follow-up-uncertainties"><strong>仍需确认</strong><ul>{turn.result.uncertainties.map(item => <li key={item}>{researchCopy(item)}</li>)}</ul></div>}
+    {evidence.length > 0 && <details className="source-index"><summary>参考来源（{evidence.length}）</summary><ol>{evidence.map((item, index) => <li key={item.result_id}>
+      <span className="evidence-id">E{index + 1}</span><span className="source-index-copy"><strong>{item.title}</strong><span>{credibilityLabel(item.credibility) ?? '已核验来源'}</span></span>
+      {item.url && <a href={item.url} target="_blank" rel="noreferrer">查看来源</a>}
+    </li>)}</ol></details>}
+  </div>
+}
+
 export function ResearchPage({ eventId, onBack }: { eventId: string; onBack: () => void }) {
   const [event, setEvent] = useState<CompetitionEvent | null>(null)
   const [research, setResearch] = useState<ResearchState | null>(null)
   const [executionState, setExecutionState] = useState<ResearchExecutionState>('idle')
   const [state, setState] = useState<LoadState>('loading')
   const [error, setError] = useState('')
+  const [researchTab, setResearchTab] = useState<'result' | 'follow-up'>('result')
+  const [turns, setTurns] = useState<FollowUpTurn[]>([])
+  const [question, setQuestion] = useState('')
+  const [followUpError, setFollowUpError] = useState('')
+  const [sending, setSending] = useState(false)
+  const [candidateNotice, setCandidateNotice] = useState(0)
   const loadVersion = useRef(0)
   const activeEventId = useRef(eventId)
   const startRequest = useRef<{ eventId: string; promise: Promise<ResearchState | null> } | null>(null)
@@ -632,6 +713,53 @@ export function ResearchPage({ eventId, onBack }: { eventId: string; onBack: () 
   }, [applyResearchState, eventId, start])
   useEffect(() => { void load() }, [load])
 
+  const loadFollowUps = useCallback(async () => {
+    try {
+      const conversation = await api.getFollowUps(eventId)
+      setTurns(conversation.turns)
+    } catch (reason) {
+      setFollowUpError(reason instanceof Error ? reason.message : '对话记录加载失败。')
+    }
+  }, [eventId])
+  useEffect(() => {
+    if (research?.status === 'completed') void loadFollowUps()
+  }, [loadFollowUps, research?.status])
+
+  const sendFollowUp = async () => {
+    const text = question.trim()
+    if (!text || sending) return
+    const requestId = globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`
+    const optimistic: FollowUpTurn = {
+      turn_id: `local-${requestId}`, user_message: text, status: 'running', candidate_count: 0,
+      created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+    }
+    setTurns(current => [...current, optimistic]); setQuestion(''); setSending(true); setFollowUpError('')
+    try {
+      const saved = await api.sendFollowUp(eventId, { request_id: requestId, question: text })
+      setTurns(current => current.map(item => item.turn_id === optimistic.turn_id ? saved : item))
+      if (saved.candidate_count > 0) setCandidateNotice(saved.candidate_count)
+    } catch (reason) {
+      setTurns(current => current.filter(item => item.turn_id !== optimistic.turn_id))
+      setQuestion(text)
+      setFollowUpError(reason instanceof Error ? reason.message : '继续研究未完成。')
+    } finally { setSending(false) }
+  }
+  const retryFollowUp = async (turnId: string) => {
+    setTurns(current => current.map(item => item.turn_id === turnId ? { ...item, status: 'running' } : item))
+    setSending(true); setFollowUpError('')
+    try {
+      const saved = await api.retryFollowUp(eventId, turnId)
+      setTurns(current => current.map(item => item.turn_id === turnId ? saved : item))
+    } catch (reason) {
+      setTurns(current => current.map(item => item.turn_id === turnId ? { ...item, status: 'failed' } : item))
+      setFollowUpError(reason instanceof Error ? reason.message : '重试未完成。')
+    } finally { setSending(false) }
+  }
+  const openPreferences = () => {
+    window.history.pushState({}, '', '/product?preferences=awaiting')
+    window.dispatchEvent(new PopStateEvent('popstate'))
+  }
+
   const retry = () => {
     setResearch(current => current ? { ...current, status: 'running' } : current)
     if (research) start(research, true)
@@ -645,13 +773,24 @@ export function ResearchPage({ eventId, onBack }: { eventId: string; onBack: () 
     <header className="research-header"><div className="research-width"><button className="back-button" onClick={onBack}>← 返回首页</button>
       <div className="flex items-start justify-between gap-6"><div><span className="eyebrow">深入研究事件</span><h1>{event?.title}</h1><div className="page-meta"><span>{event?.competitor}</span><span>{event ? eventTypeLabels[event.event_type] ?? event.event_type : ''}</span><span>{formatDate(event?.event_time ?? event?.observation_time)}</span><span className="confirmed">已确认</span></div></div>
         {research?.status === 'failed' && <button className="secondary-button" onClick={retry}>重新研究</button>}</div></div></header>
+    {research?.status === 'completed' && <div className="research-subnav"><div className="research-width"><button className={researchTab === 'result' ? 'active' : ''} onClick={() => setResearchTab('result')}>研究结果</button><button className={researchTab === 'follow-up' ? 'active' : ''} onClick={() => setResearchTab('follow-up')}>继续追问</button></div></div>}
     <div className="research-body research-width">
       {error && <ErrorNotice message={error} />}
       {showRunning && <div className="research-running"><span className="spinner" /><div className="research-running-copy"><div><h2>正在深入研究</h2><span className="badge badge-research">研究中</span></div><p>正在搜索、核验并整理与该事件相关的信息，研究完成后结果会自动显示在这里。</p><dl><div><dt>研究对象</dt><dd>{event?.title}</dd></div><div><dt>已有证据</dt><dd>{event?.evidence.length ?? 0} 条</dd></div></dl></div></div>}
       {research?.status === 'failed' && <div className="empty-state"><h2>研究失败</h2><p>本次深入研究未完成，事件及已有证据不受影响。</p><button className="primary-button" onClick={retry}>重新研究</button></div>}
-      {research?.status === 'completed' && research.result && <ResearchResult report={research.result} evidence={research.citations ?? []} />}
+      {research?.status === 'completed' && research.result && researchTab === 'result' && <ResearchResult report={research.result} evidence={research.citations ?? []} />}
+      {research?.status === 'completed' && researchTab === 'follow-up' && <div className="follow-up-conversation">
+        {candidateNotice > 0 && <div className="notice notice-success"><span>识别到 {candidateNotice} 条待确认的关注信息。</span><button className="text-button" onClick={openPreferences}>去确认</button></div>}
+        {followUpError && <ErrorNotice message={followUpError} />}
+        {turns.length === 0 && <div className="follow-up-empty"><h2>继续追问本次研究</h2><p>围绕本次事件继续提问。如现有证据不足，系统会继续查证相关资料。</p><div className="suggested-questions">{['这次变化对我们当前产品影响最大的是什么？', '还有哪些关键信息没有确认？', '如果继续跟踪，最值得关注什么？'].map(item => <button key={item} onClick={() => setQuestion(item)}>{item}</button>)}</div></div>}
+        {turns.map(turn => <div className="conversation-turn" key={turn.turn_id}><div className="user-message">{turn.user_message}</div><div className="assistant-message">
+          {turn.status === 'running' && <div className="follow-up-running"><span className="spinner" />正在继续研究…</div>}
+          {turn.status === 'completed' && <FollowUpResult turn={turn} />}
+          {turn.status === 'failed' && <div className="follow-up-failed"><p>{turn.error?.message ?? '本次继续研究未完成。'}</p><button className="secondary-button small" disabled={sending} onClick={() => void retryFollowUp(turn.turn_id)}>重试</button></div>}
+        </div></div>)}
+      </div>}
     </div>
-    {research?.status === 'completed' && <div className="followup"><div className="research-width"><input disabled placeholder="继续追问这个事件" aria-label="继续追问这个事件" /><button disabled>发送</button></div></div>}
+    {research?.status === 'completed' && researchTab === 'follow-up' && <div className="followup"><div className="research-width"><textarea value={question} rows={2} placeholder="围绕本次事件继续提问…" aria-label="围绕本次事件继续提问" disabled={sending} onChange={event => setQuestion(event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void sendFollowUp() } }} /><button className="primary-button" disabled={sending || !question.trim()} onClick={() => void sendFollowUp()}>{sending ? '正在继续研究…' : '发送'}</button></div></div>}
   </main>
 }
 

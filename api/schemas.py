@@ -30,6 +30,16 @@ class ResearchStart(ApiContract):
     retry: bool = False
 
 
+class FollowUpCreate(ApiContract):
+    request_id: str = Field(min_length=8, max_length=200)
+    question: str = Field(min_length=1, max_length=4000)
+
+
+class PreferenceWrite(ApiContract):
+    type: str = Field(pattern="^(focus|preference|constraint|goal|decision|hypothesis|open_question)$")
+    content: str = Field(min_length=1, max_length=2000)
+
+
 class ProductConfigurationUpdate(ApiContract):
     product_name: str | None = Field(default=None, max_length=200)
     current_focus: str | None = Field(default=None, max_length=2000)

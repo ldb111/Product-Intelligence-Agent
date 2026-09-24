@@ -4,6 +4,7 @@ import hashlib
 import json
 import sqlite3
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -236,6 +237,127 @@ class PipelineStore:
             running.pop("error_type", None)
             self._put(db, namespace, event_id, running)
             return {"claimed": True, "state": running}
+
+    @staticmethod
+    def follow_up_namespace(workspace_id: str, product_id: str, event_id: str) -> str:
+        """把追问对话严格限定在 workspace、product、event 三元组内。"""
+        return "research_follow_up:" + identity([workspace_id, product_id, event_id])
+
+    def claim_follow_up(
+        self, *, workspace_id: str, product_id: str, event_id: str,
+        request_id: str, question: str, process_token: str,
+    ) -> dict:
+        """先原子保存用户消息并占用执行权，重复请求不会再次调用研究智能体。
+
+        输入中的 request_id 只用于生成稳定 Turn 标识；原始值不进入记录。事务提交后，
+        用户消息已可恢复，即使后续模型或 Memory 识别失败也不会丢失。
+        """
+        namespace = self.follow_up_namespace(workspace_id, product_id, event_id)
+        turn_id = "turn_" + identity([workspace_id, product_id, event_id, request_id])[:24]
+        now = datetime.now(timezone.utc).isoformat()
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT body FROM records WHERE namespace=? AND key=?", (namespace, turn_id)
+            ).fetchone()
+            if row is not None:
+                return {"claimed": False, "turn": json.loads(row[0])}
+            turn = {
+                "turn_id": turn_id,
+                "user_message": question,
+                "status": "running",
+                "attempts": 1,
+                "process_token": process_token,
+                "candidate_count": 0,
+                "created_at": now,
+                "updated_at": now,
+            }
+            self._put(db, namespace, turn_id, turn)
+            return {"claimed": True, "turn": turn}
+
+    def retry_follow_up(
+        self, *, workspace_id: str, product_id: str, event_id: str,
+        turn_id: str, process_token: str,
+    ) -> dict:
+        """只允许显式重试失败回合；成功或运行中的回合保持幂等。"""
+        namespace = self.follow_up_namespace(workspace_id, product_id, event_id)
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT body FROM records WHERE namespace=? AND key=?", (namespace, turn_id)
+            ).fetchone()
+            if row is None:
+                return {"claimed": False, "turn": None}
+            turn = json.loads(row[0])
+            if turn.get("status") != "failed":
+                return {"claimed": False, "turn": turn}
+            turn.update(
+                status="running", attempts=turn.get("attempts", 0) + 1,
+                process_token=process_token,
+                updated_at=datetime.now(timezone.utc).isoformat(),
+            )
+            turn.pop("error_type", None)
+            self._put(db, namespace, turn_id, turn)
+            return {"claimed": True, "turn": turn}
+
+    def finish_follow_up(
+        self, *, workspace_id: str, product_id: str, event_id: str,
+        turn_id: str, process_token: str, artifact: dict, candidate_count: int,
+    ) -> dict:
+        """在同一事务内保存回答 Artifact，再把回合标记为完成。"""
+        namespace = self.follow_up_namespace(workspace_id, product_id, event_id)
+        artifact_namespace = namespace + ":artifacts"
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT body FROM records WHERE namespace=? AND key=?", (namespace, turn_id)
+            ).fetchone()
+            if row is None:
+                raise ValueError("待完成的追问回合不存在。")
+            turn = json.loads(row[0])
+            if turn.get("status") != "running" or turn.get("process_token") != process_token:
+                raise ValueError("追问回合执行权已变化。")
+            self._put(db, artifact_namespace, turn_id, artifact)
+            turn.update(
+                status="completed", candidate_count=max(0, candidate_count),
+                artifact={"namespace": artifact_namespace, "key": turn_id},
+                updated_at=datetime.now(timezone.utc).isoformat(),
+            )
+            turn.pop("process_token", None)
+            self._put(db, namespace, turn_id, turn)
+            return turn
+
+    def fail_follow_up(
+        self, *, workspace_id: str, product_id: str, event_id: str,
+        turn_id: str, process_token: str,
+    ) -> dict:
+        """保留已经写入的用户消息，只记录可重试失败状态，不保存异常正文。"""
+        namespace = self.follow_up_namespace(workspace_id, product_id, event_id)
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT body FROM records WHERE namespace=? AND key=?", (namespace, turn_id)
+            ).fetchone()
+            if row is None:
+                raise ValueError("待失败的追问回合不存在。")
+            turn = json.loads(row[0])
+            if turn.get("status") != "running" or turn.get("process_token") != process_token:
+                return turn
+            turn.update(
+                status="failed", error_type="follow_up_error",
+                updated_at=datetime.now(timezone.utc).isoformat(),
+            )
+            turn.pop("process_token", None)
+            self._put(db, namespace, turn_id, turn)
+            return turn
+
+    def follow_up_turns(self, *, workspace_id: str, product_id: str, event_id: str) -> list[dict]:
+        """按创建顺序返回一个事件的持久化对话，不跨产品或工作区读取。"""
+        namespace = self.follow_up_namespace(workspace_id, product_id, event_id)
+        return sorted(
+            self.items(namespace).values(),
+            key=lambda item: (item.get("created_at", ""), item.get("turn_id", "")),
+        )
 
     def observe_statements(self, workspace: str, statements: list[dict]) -> dict[str, dict]:
         """原子记录本次成功扫描实际看见的全部 statement identity。

@@ -50,6 +50,29 @@ export interface ResearchReport {
   evidence_refs: string[]
 }
 
+export interface FollowUpAnswer {
+  answer: Claim[]
+  uncertainties: string[]
+  evidence_refs: string[]
+}
+
+export interface FollowUpTurn {
+  turn_id: string
+  user_message: string
+  status: 'running' | 'completed' | 'failed'
+  candidate_count: number
+  created_at: string
+  updated_at: string
+  result?: FollowUpAnswer
+  citations?: Evidence[]
+  error?: { message: string }
+}
+
+export interface FollowUpConversation {
+  available: boolean
+  turns: FollowUpTurn[]
+}
+
 export interface ResearchState {
   event_id: string
   recommended: boolean
@@ -145,6 +168,21 @@ export interface OwnProduct {
   current_focus?: string | null
   editable: boolean
   documents: OwnProductDocument[]
+}
+
+export type PreferenceType = 'focus' | 'preference' | 'constraint' | 'goal' | 'decision' | 'hypothesis' | 'open_question'
+
+export interface PreferenceItem {
+  item_id: string
+  type: PreferenceType
+  content: string
+  source: string
+  updated_at: string
+}
+
+export interface Preferences {
+  confirmed_items: PreferenceItem[]
+  awaiting_confirmation_items: PreferenceItem[]
 }
 
 export interface ScanResult {

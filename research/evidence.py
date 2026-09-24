@@ -3,7 +3,7 @@
 import hashlib
 import re
 
-from .schemas import Citation, ResearchReport, VerificationResult
+from .schemas import Citation, FollowUpAnswer, ResearchReport, VerificationResult
 
 
 class EvidenceError(ValueError):
@@ -94,6 +94,21 @@ class EvidenceRegistry:
         if set(report.evidence_refs) != used:
             raise EvidenceError("总引用列表与逐项证据不一致。")
         return [self.get(i, factual=True) for i in dict.fromkeys(report.evidence_refs)]
+
+    def validate_follow_up(self, answer: FollowUpAnswer) -> list[Citation]:
+        """沿用正式研究引用门槛校验一次事件追问，不降低 Fact 证据标准。"""
+        no_generated_urls(answer.model_dump())
+        used = set()
+        for claim in answer.answer:
+            items = self.check_support(claim.support)
+            if claim.kind == "fact" and any(
+                item.source == "page" and item.credibility != "official" for item in items
+            ):
+                raise EvidenceError("第三方页面仅能作为待核实推论，不能覆盖官方事实。")
+            used.update(item.result_id for item in items)
+        if set(answer.evidence_refs) != used:
+            raise EvidenceError("总引用列表与逐项证据不一致。")
+        return [self.get(item, factual=True) for item in dict.fromkeys(answer.evidence_refs)]
 
     def validate_verification(self, result: VerificationResult, initial_ids: set[str]) -> list[Citation]:
         """验证只能使用本轮新读到的证据；缺少直接官方支持时不能定论。

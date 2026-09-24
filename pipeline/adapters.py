@@ -12,7 +12,7 @@ from event_core.inputs import build_explicit_statement_input, build_state_compar
 from knowledge import KnowledgeIngestor, KnowledgeRetriever, KnowledgeStore
 from knowledge.inputs import event_documents, own_product_file
 from llm.retrieval_models import get_embedding, get_rerank
-from memory import MemoryRetriever, MemoryStore, MemoryWriter
+from memory import MemoryRetriever, MemoryStore, MemoryWriter, PreferenceService
 from memory.policy import contains_secret
 from research.agent import ResearchAgent
 from research.tools import ResearchTools
@@ -142,6 +142,30 @@ class ModuleAdapters:
                               official_hosts=frozenset(official_hosts), **self.scope)
         return ResearchAgent(tools).run(event, mode=mode, triage_result=triage_result,
                                         current_focus=self.product.current_focus)
+
+    def follow_up(self, event, triage_result, official_hosts, *, initial_artifact: dict,
+                  conversation_history: list[dict], question: str) -> dict:
+        """复用同一 ResearchAgent、工具与引用登记表回答一个事件的后续问题。"""
+        knowledge, memory = self.readers()
+        tools = ResearchTools(
+            knowledge=knowledge, memory=memory, search=TencentWsaSearchProvider(),
+            official_hosts=frozenset(official_hosts), **self.scope,
+        )
+        return ResearchAgent(tools).run(
+            event, mode="follow_up", triage_result=triage_result,
+            current_focus=self.product.current_focus,
+            initial_report=initial_artifact["result"],
+            initial_citations=initial_artifact.get("evidence_registry", initial_artifact.get("citations", [])),
+            conversation_history=conversation_history,
+            question=question,
+        )
+
+    def extract_preference_candidates(self, text: str, *, event_id: str, turn_id: str) -> list[dict]:
+        """只把用户追问原文交给既有 Memory Extraction，并且只产生待确认项。"""
+        service = PreferenceService(MemoryStore(self.memory_path))
+        return service.extract_from_user_message(
+            self.product.workspace_id, text, event_id=event_id, turn_id=turn_id,
+        )
 
     def verification_inputs(self, candidate, verification) -> list:
         """把核验的新官方原文送回 Event Core，绝不把 decision 字符串直接改成 confirmed Event。

@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from event_core.schemas import EventCandidate
+from memory import MemoryStore, PreferenceNotFoundError, PreferenceService
 from pipeline.configuration import ProductConfigurationService
 from pipeline.documents import OwnProductDocumentService
 from pipeline.orchestrator import ProductPipeline
@@ -38,6 +39,11 @@ class ProductApplicationService:
         self.pipeline = pipeline or ProductPipeline(directory)
         self.documents = OwnProductDocumentService(self.pipeline.store.directory)
         self.configuration = ProductConfigurationService(self.pipeline.store)
+
+    def _preferences(self, workspace_id: str) -> PreferenceService:
+        """复用 Pipeline 已使用的 workspace Memory 文件，不建立第二套偏好存储。"""
+        path = self.pipeline.store.directory / (identity(workspace_id) + ".memory.sqlite3")
+        return PreferenceService(MemoryStore(path))
 
     def _configured_products(self, workspace_id: str) -> list[ProductInput]:
         products: list[ProductInput] = []
@@ -351,6 +357,102 @@ class ProductApplicationService:
         if result.get("accepted") and state is not None:
             result["research"] = self._research_view(workspace, state)
         return result
+
+    def _follow_up_view(
+        self, product: ProductInput, event_id: str, turn: dict[str, Any]
+    ) -> dict[str, Any]:
+        """将内部 Turn 与 Artifact 投影为网页对话，隐藏执行权、命名空间和审计轨迹。"""
+        view = {
+            key: turn[key] for key in (
+                "turn_id", "user_message", "status", "candidate_count", "created_at", "updated_at"
+            ) if key in turn
+        }
+        if turn.get("status") == "completed":
+            reference = turn.get("artifact", {})
+            artifact = self.pipeline.store.get(reference.get("namespace", ""), reference.get("key", ""))
+            if isinstance(artifact, dict):
+                public = present_artifact(artifact, "follow_up:" + turn["turn_id"])
+                raw_by_id = {item.get("result_id"): item for item in artifact.get("citations", [])}
+                prefix = "follow_up:" + turn["turn_id"] + ":"
+                citations = []
+                for citation in public["citations"]:
+                    raw = raw_by_id.get(citation.get("result_id", "").removeprefix(prefix), {})
+                    safe = {key: citation[key] for key in ("result_id", "url", "title", "content") if key in citation}
+                    for key in ("credibility", "status", "observed_at"):
+                        if raw.get(key) is not None:
+                            safe[key] = raw[key]
+                    citations.append(safe)
+                view.update(result=public["result"], citations=citations)
+        elif turn.get("status") == "failed":
+            view["error"] = {"message": "本次继续研究未完成，可以重试。"}
+        return view
+
+    def follow_up_conversation(self, workspace_id: str, event_id: str) -> dict[str, Any]:
+        product, _, _ = self._find_event(workspace_id, event_id)
+        workspace = self._workspace(product)
+        initial = self.pipeline.store.get("research_status:" + workspace, event_id)
+        available = bool(initial and initial.get("status") == "completed")
+        product_id = product.own_product_id or "default"
+        turns = self.pipeline.store.follow_up_turns(
+            workspace_id=workspace_id, product_id=product_id, event_id=event_id,
+        ) if available else []
+        return {"available": available, "turns": [
+            self._follow_up_view(product, event_id, turn) for turn in turns
+        ]}
+
+    def send_follow_up(
+        self, workspace_id: str, event_id: str, *, request_id: str, question: str
+    ) -> dict[str, Any]:
+        product, _, _ = self._find_event(workspace_id, event_id)
+        outcome = self.pipeline.follow_up_research(
+            product, event_id, request_id=request_id, question=question,
+        )
+        if not outcome.get("accepted"):
+            raise ProductApiError("follow_up_unavailable", "初始研究完成后才能继续追问。", 409)
+        return self._follow_up_view(product, event_id, outcome["turn"])
+
+    def retry_follow_up(self, workspace_id: str, event_id: str, turn_id: str) -> dict[str, Any]:
+        product, _, _ = self._find_event(workspace_id, event_id)
+        outcome = self.pipeline.follow_up_research(product, event_id, retry_turn_id=turn_id)
+        if not outcome.get("accepted"):
+            raise ProductApiError("follow_up_not_found", "未找到可重试的追问。", 404)
+        return self._follow_up_view(product, event_id, outcome["turn"])
+
+    def preferences(self, workspace_id: str, product_id: str) -> dict[str, Any]:
+        return self._preferences(workspace_id).list(workspace_id)
+
+    def add_preference(self, workspace_id: str, product_id: str, data: dict[str, str]) -> dict[str, Any]:
+        return self._preferences(workspace_id).add(workspace_id, data["type"], data["content"])
+
+    def edit_preference(
+        self, workspace_id: str, product_id: str, item_id: str, data: dict[str, str]
+    ) -> dict[str, Any]:
+        try:
+            return self._preferences(workspace_id).edit(
+                workspace_id, item_id, data["type"], data["content"]
+            )
+        except PreferenceNotFoundError:
+            raise ProductApiError("preference_not_found", "未找到该条关注信息。", 404) from None
+
+    def remove_preference(self, workspace_id: str, product_id: str, item_id: str) -> dict[str, bool]:
+        try:
+            self._preferences(workspace_id).remove(workspace_id, item_id)
+        except PreferenceNotFoundError:
+            raise ProductApiError("preference_not_found", "未找到该条关注信息。", 404) from None
+        return {"removed": True}
+
+    def confirm_preference(self, workspace_id: str, product_id: str, item_id: str) -> dict[str, Any]:
+        try:
+            return self._preferences(workspace_id).confirm(workspace_id, item_id)
+        except PreferenceNotFoundError:
+            raise ProductApiError("preference_not_found", "未找到该条待确认信息。", 404) from None
+
+    def ignore_preference(self, workspace_id: str, product_id: str, item_id: str) -> dict[str, bool]:
+        try:
+            self._preferences(workspace_id).ignore(workspace_id, item_id)
+        except PreferenceNotFoundError:
+            raise ProductApiError("preference_not_found", "未找到该条待确认信息。", 404) from None
+        return {"ignored": True}
 
     def own_product(self, workspace_id: str, product_id: str) -> dict[str, Any]:
         configuration = self.configuration.get(workspace_id, product_id)

@@ -59,6 +59,14 @@ class ResearchReport(Contract):
     evidence_refs: list[str] = Field(description="全部 support 中实际使用的事实证据 ID，去重")
 
 
+class FollowUpAnswer(Contract):
+    """单个事件追问的最小结构化答案；沿用 Claim 与 Support 证据体系。"""
+
+    answer: list[Claim] = Field(min_length=1, max_length=20)
+    uncertainties: list[str] = Field(default_factory=list, max_length=10)
+    evidence_refs: list[str] = Field(description="全部 answer.support 实际使用的事实证据 ID，去重")
+
+
 class VerificationResult(Contract):
     decision: Literal["event", "no_event", "still_pending"]
     reason: str = Field(min_length=1, max_length=2000)

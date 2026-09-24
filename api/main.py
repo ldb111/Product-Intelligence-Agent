@@ -18,6 +18,8 @@ from .schemas import (
     ApiEnvelope,
     CompetitorCreate,
     CompetitorUpdate,
+    FollowUpCreate,
+    PreferenceWrite,
     ProductConfigurationUpdate,
     ProductError,
     ResearchStart,
@@ -77,7 +79,7 @@ def create_app(
         CORSMiddleware,
         allow_origins=origins,
         allow_credentials=False,
-        allow_methods=["GET", "POST", "PUT"],
+        allow_methods=["GET", "POST", "PUT", "DELETE"],
         allow_headers=["Content-Type"],
     )
     cached = service
@@ -181,6 +183,29 @@ def create_app(
             workspace_id, event_id, retry=body.retry
         )}
 
+    @api.get(
+        "/api/workspaces/{workspace_id}/events/{event_id}/research/follow-ups",
+        response_model=ApiEnvelope,
+    )
+    async def follow_up_conversation(workspace_id: str, event_id: str):
+        return {"data": application().follow_up_conversation(workspace_id, event_id)}
+
+    @api.post(
+        "/api/workspaces/{workspace_id}/events/{event_id}/research/follow-ups",
+        response_model=ApiEnvelope,
+    )
+    async def send_follow_up(workspace_id: str, event_id: str, body: FollowUpCreate):
+        return {"data": application().send_follow_up(
+            workspace_id, event_id, request_id=body.request_id, question=body.question
+        )}
+
+    @api.post(
+        "/api/workspaces/{workspace_id}/events/{event_id}/research/follow-ups/{turn_id}/retry",
+        response_model=ApiEnvelope,
+    )
+    async def retry_follow_up(workspace_id: str, event_id: str, turn_id: str):
+        return {"data": application().retry_follow_up(workspace_id, event_id, turn_id)}
+
     @api.get("/api/workspaces/{workspace_id}/own-product", response_model=ApiEnvelope)
     async def own_product(workspace_id: str, product_id: str):
         return {"data": application().own_product(workspace_id, product_id)}
@@ -194,6 +219,42 @@ def create_app(
             product_id,
             body.model_dump(exclude_unset=True, exclude_none=True),
         )}
+
+    @api.get("/api/workspaces/{workspace_id}/own-product/preferences", response_model=ApiEnvelope)
+    async def preferences(workspace_id: str, product_id: str):
+        return {"data": application().preferences(workspace_id, product_id)}
+
+    @api.post("/api/workspaces/{workspace_id}/own-product/preferences", response_model=ApiEnvelope)
+    async def add_preference(workspace_id: str, product_id: str, body: PreferenceWrite):
+        return {"data": application().add_preference(workspace_id, product_id, body.model_dump())}
+
+    @api.put(
+        "/api/workspaces/{workspace_id}/own-product/preferences/{item_id}", response_model=ApiEnvelope
+    )
+    async def edit_preference(
+        workspace_id: str, item_id: str, product_id: str, body: PreferenceWrite
+    ):
+        return {"data": application().edit_preference(
+            workspace_id, product_id, item_id, body.model_dump()
+        )}
+
+    @api.delete(
+        "/api/workspaces/{workspace_id}/own-product/preferences/{item_id}", response_model=ApiEnvelope
+    )
+    async def remove_preference(workspace_id: str, item_id: str, product_id: str):
+        return {"data": application().remove_preference(workspace_id, product_id, item_id)}
+
+    @api.post(
+        "/api/workspaces/{workspace_id}/own-product/preferences/{item_id}/confirm", response_model=ApiEnvelope
+    )
+    async def confirm_preference(workspace_id: str, item_id: str, product_id: str):
+        return {"data": application().confirm_preference(workspace_id, product_id, item_id)}
+
+    @api.post(
+        "/api/workspaces/{workspace_id}/own-product/preferences/{item_id}/ignore", response_model=ApiEnvelope
+    )
+    async def ignore_preference(workspace_id: str, item_id: str, product_id: str):
+        return {"data": application().ignore_preference(workspace_id, product_id, item_id)}
 
     @api.post("/api/workspaces/{workspace_id}/own-product/documents", response_model=ApiEnvelope)
     async def add_document(

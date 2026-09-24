@@ -321,6 +321,96 @@ class ProductPipeline:
         return {"product": {"accepted": True, "research": present_research_action(self.store, workspace, completed)},
                 "audit": {"status": "completed", "artifact": artifact}}
 
+    def follow_up_research(
+        self, product: ProductInput, event_id: str, *, question: str | None = None,
+        request_id: str | None = None, retry_turn_id: str | None = None,
+    ) -> dict:
+        """在已完成的初始研究下创建或重试一个持久化追问回合。
+
+        用户消息先由 Store 原子保存，之后才执行候选偏好识别和 ResearchAgent。初始报告
+        只读，回答写入独立对话空间；失败仅改变当前 Turn，绝不回退初始研究或 Event。
+        """
+        workspace, adapter = self.configure_competitor(product)
+        event = next((
+            EventCandidate.model_validate(value)
+            for value in self.store.items("events:" + workspace).values()
+            if product_event_id(value) == event_id
+        ), None)
+        if event is None:
+            return {"accepted": False, "reason": "confirmed_event_not_found"}
+        state, triage = self._research_context(workspace, event)
+        if state is None or triage is None or state.get("status") != "completed":
+            return {"accepted": False, "reason": "initial_research_not_completed"}
+        reference = state.get("artifact", {})
+        initial_artifact = self.store.get(reference.get("namespace", ""), reference.get("key", ""))
+        if not isinstance(initial_artifact, dict):
+            return {"accepted": False, "reason": "initial_research_not_completed"}
+
+        product_id = product.own_product_id or "default"
+        if retry_turn_id is not None:
+            claim = self.store.retry_follow_up(
+                workspace_id=product.workspace_id, product_id=product_id, event_id=event_id,
+                turn_id=retry_turn_id, process_token=_PROCESS_TOKEN,
+            )
+        else:
+            if not isinstance(question, str) or not question.strip() or not request_id:
+                raise ValueError("继续追问需要用户问题和请求标识。")
+            claim = self.store.claim_follow_up(
+                workspace_id=product.workspace_id, product_id=product_id, event_id=event_id,
+                request_id=request_id, question=question.strip(), process_token=_PROCESS_TOKEN,
+            )
+        turn = claim.get("turn")
+        if turn is None:
+            return {"accepted": False, "reason": "follow_up_not_found"}
+        if not claim["claimed"]:
+            return {"accepted": True, "turn": turn, "reused": True}
+
+        candidate_count = int(turn.get("candidate_count", 0))
+        if retry_turn_id is None:
+            try:
+                candidates = adapter.extract_preference_candidates(
+                    turn["user_message"], event_id=event_id, turn_id=turn["turn_id"],
+                )
+                candidate_count = len(candidates)
+            except Exception:
+                # 偏好识别是 best-effort 辅助流程，不能让已经保存的用户追问失败。
+                candidate_count = 0
+
+        history = []
+        for previous in self.store.follow_up_turns(
+            workspace_id=product.workspace_id, product_id=product_id, event_id=event_id,
+        ):
+            if previous["turn_id"] == turn["turn_id"] or previous.get("status") != "completed":
+                continue
+            artifact_ref = previous.get("artifact", {})
+            artifact = self.store.get(artifact_ref.get("namespace", ""), artifact_ref.get("key", ""))
+            if isinstance(artifact, dict):
+                history.append({
+                    "user": previous["user_message"],
+                    "assistant": artifact.get("result", {}),
+                })
+        try:
+            artifact = adapter.follow_up(
+                event, triage, self._official_hosts(workspace, event),
+                initial_artifact=initial_artifact, conversation_history=history,
+                question=turn["user_message"],
+            )
+            completed = self.store.finish_follow_up(
+                workspace_id=product.workspace_id, product_id=product_id, event_id=event_id,
+                turn_id=turn["turn_id"], process_token=_PROCESS_TOKEN,
+                artifact=artifact, candidate_count=candidate_count,
+            )
+            return {"accepted": True, "turn": completed, "audit": {"status": "completed"}}
+        except Exception as exc:
+            failed = self.store.fail_follow_up(
+                workspace_id=product.workspace_id, product_id=product_id, event_id=event_id,
+                turn_id=turn["turn_id"], process_token=_PROCESS_TOKEN,
+            )
+            return {
+                "accepted": True, "turn": failed,
+                "audit": {"status": "failed", "exception_type": type(exc).__name__},
+            }
+
     def _official_hosts(self, workspace, candidate):
         """沿用正式发现或上游 Evidence 已确认的来源身份；回放事件也保留同一信任边界。"""
         sources = self.store.get("sources", workspace, {})

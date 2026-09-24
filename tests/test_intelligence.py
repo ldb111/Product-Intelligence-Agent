@@ -12,7 +12,7 @@ from llm.config import LLMConfigurationError
 from llm.research import ResearchClient, load_research_config
 from research.agent import ResearchAgent, ResearchLimits
 from research.evidence import EvidenceError, EvidenceRegistry
-from research.schemas import Claim, OwnComparison, ResearchReport, Support, VerificationResult
+from research.schemas import Claim, FollowUpAnswer, OwnComparison, ResearchReport, Support, VerificationResult
 from research.tools import ResearchTools, TOOL_DEFINITIONS, public_url
 from research.prompts import FINAL_PROMPT
 from triage.prompts import TRIAGE_PROMPT
@@ -509,6 +509,45 @@ class AgentTests(unittest.TestCase):
     def test_deep_requires_matching_research_triage(self):
         with self.assertRaises(ValueError):
             ResearchAgent(tools(), client=FakeClient([], report())).run(event(), mode="deep_research")
+
+    def test_follow_up_reuses_initial_report_evidence_and_conversation_context(self):
+        initial = ResearchAgent(tools(), client=FakeClient([], report())).run(
+            event(), mode="deep_research", triage_result=route()
+        )
+        answer = FollowUpAnswer(answer=[Claim(
+            text="这项变化可能提高免费用户的使用深度。", kind="inference",
+            support=[Support(
+                result_id="event_evidence_001", excerpt="每月 2000 积分",
+                evidence_summary="官方材料显示免费档调整为每月 2000 积分。",
+            )],
+        )], uncertainties=[], evidence_refs=["event_evidence_001"])
+        client = FakeClient([], answer)
+        output = ResearchAgent(tools(), client=client).run(
+            event(), mode="follow_up", triage_result=route(),
+            initial_report=initial["result"], initial_citations=initial["evidence_registry"],
+            conversation_history=[{"user": "先看免费用户。", "assistant": {"answer": []}}],
+            question="这会怎样影响免费用户？",
+        )
+        self.assertEqual(output["mode"], "follow_up")
+        self.assertEqual(client.payload["question"], "这会怎样影响免费用户？")
+        self.assertEqual(client.payload["conversation_history"][0]["user"], "先看免费用户。")
+        self.assertEqual(client.payload["initial_research"], initial["result"])
+
+    def test_follow_up_rejects_fabricated_evidence_id(self):
+        initial = ResearchAgent(tools(), client=FakeClient([], report())).run(
+            event(), mode="deep_research", triage_result=route()
+        )
+        fabricated = FollowUpAnswer(answer=[Claim(
+            text="无法核验的结论", kind="fact",
+            support=[Support(result_id="made_up_001", excerpt="不存在",
+                             evidence_summary="没有真实来源支持。")],
+        )], uncertainties=[], evidence_refs=["made_up_001"])
+        with self.assertRaises(EvidenceError):
+            ResearchAgent(tools(), client=FakeClient([], fabricated)).run(
+                event(), mode="follow_up", triage_result=route(),
+                initial_report=initial["result"], initial_citations=initial["evidence_registry"],
+                conversation_history=[], question="继续核验。",
+            )
 
     def test_agent_cannot_reuse_previous_evidence(self):
         _, agent, _ = self.verification([])

@@ -67,6 +67,49 @@ class StubHttpService:
         return {"accepted": True, "research": {"event_id": event_id, "recommended": True,
                                                    "status": "running"}}
 
+    def follow_up_conversation(self, workspace_id, event_id):
+        self.calls.append(("follow_up_conversation", workspace_id, event_id))
+        return {"available": True, "turns": []}
+
+    def send_follow_up(self, workspace_id, event_id, *, request_id, question):
+        self.calls.append(("send_follow_up", workspace_id, event_id, request_id, question))
+        return {"turn_id": "turn_1", "user_message": question, "status": "running",
+                "candidate_count": 0, "created_at": "2026-09-24T00:00:00Z",
+                "updated_at": "2026-09-24T00:00:00Z"}
+
+    def retry_follow_up(self, workspace_id, event_id, turn_id):
+        self.calls.append(("retry_follow_up", workspace_id, event_id, turn_id))
+        return {"turn_id": turn_id, "user_message": "原问题", "status": "running",
+                "candidate_count": 0, "created_at": "2026-09-24T00:00:00Z",
+                "updated_at": "2026-09-24T00:00:00Z"}
+
+    def preferences(self, workspace_id, product_id):
+        self.calls.append(("preferences", workspace_id, product_id))
+        return {"confirmed_items": [], "awaiting_confirmation_items": []}
+
+    def add_preference(self, workspace_id, product_id, body):
+        self.calls.append(("add_preference", workspace_id, product_id, body))
+        return {"item_id": "item_1", **body, "source": "你主动添加",
+                "updated_at": "2026-09-24T00:00:00Z"}
+
+    def edit_preference(self, workspace_id, product_id, item_id, body):
+        self.calls.append(("edit_preference", workspace_id, product_id, item_id, body))
+        return {"item_id": "item_2", **body, "source": "你主动添加",
+                "updated_at": "2026-09-24T00:00:00Z"}
+
+    def remove_preference(self, workspace_id, product_id, item_id):
+        self.calls.append(("remove_preference", workspace_id, product_id, item_id))
+        return {"removed": True}
+
+    def confirm_preference(self, workspace_id, product_id, item_id):
+        self.calls.append(("confirm_preference", workspace_id, product_id, item_id))
+        return {"item_id": "item_2", "type": "focus", "content": "关注权限治理",
+                "source": "从研究交流中确认", "updated_at": "2026-09-24T00:00:00Z"}
+
+    def ignore_preference(self, workspace_id, product_id, item_id):
+        self.calls.append(("ignore_preference", workspace_id, product_id, item_id))
+        return {"ignored": True}
+
     def own_product(self, workspace_id, product_id):
         self.calls.append(("own_product", workspace_id, product_id))
         return {"product_id": product_id, "product_name": None, "current_focus": None,
@@ -136,6 +179,35 @@ class HttpApiContractTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 200)
         self.assertIn(("start_research", "team", "evt_1", True), self.service.calls)
+
+    def test_follow_up_routes_keep_event_scope_and_request_identity(self):
+        sent = self.client.post(
+            "/api/workspaces/team/events/evt_1/research/follow-ups",
+            json={"request_id": "request-123", "question": "这件事有什么影响？"},
+        )
+        retry = self.client.post(
+            "/api/workspaces/team/events/evt_1/research/follow-ups/turn_1/retry"
+        )
+        self.assertEqual(sent.status_code, 200)
+        self.assertEqual(retry.status_code, 200)
+        self.assertIn(
+            ("send_follow_up", "team", "evt_1", "request-123", "这件事有什么影响？"),
+            self.service.calls,
+        )
+        self.assertIn(("retry_follow_up", "team", "evt_1", "turn_1"), self.service.calls)
+
+    def test_preference_routes_expose_product_actions_without_internal_status_fields(self):
+        added = self.client.post(
+            "/api/workspaces/team/own-product/preferences?product_id=main",
+            json={"type": "focus", "content": "关注权限治理"},
+        )
+        confirmed = self.client.post(
+            "/api/workspaces/team/own-product/preferences/item_1/confirm?product_id=main"
+        )
+        self.assertEqual(added.status_code, 200)
+        self.assertEqual(confirmed.status_code, 200)
+        self.assertNotIn("memory_key", added.text)
+        self.assertNotIn("status", added.json()["data"])
 
     def test_product_configuration_update_uses_product_scope_without_storage_key(self):
         response = self.client.put(

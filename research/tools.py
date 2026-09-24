@@ -94,6 +94,26 @@ class ResearchTools:
                 "uncertainty_reason": event.uncertainty_reason,
                 "evidence": self.registry.model_items()}
 
+    def seed_citations(self, citations: list[dict]) -> list[dict]:
+        """把已完成 Initial Research 的真实登记来源带入追问任务。
+
+        输入来自持久化 Artifact，而不是浏览器或模型。Registry 会按原始来源重新生成
+        本轮稳定 ID 与 source_group；传入的旧内部 ID 不被信任，也不会作为新来源。
+        """
+        ids = []
+        for item in citations:
+            data = {key: item.get(key) for key in (
+                "source", "domain", "source_id", "url", "title", "content",
+                "source_reference", "credibility", "status", "observed_at",
+            )}
+            if (data["source"] not in {"event", "page", "knowledge", "memory", "search"}
+                    or data["domain"] not in {"competitor", "own_product", "memory"}
+                    or not data["source_id"] or not data["title"] or not data["content"]):
+                continue
+            citation = self.registry.add(**data)
+            ids.append(citation.result_id)
+        return self.registry.model_items(ids)
+
     def _candidate(self, url: str, title: str, snippet: str):
         """仅把真实工具或输入中的有效 URL 登记为线索，输出稳定候选 ID。"""
         if not public_url(url):

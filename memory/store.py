@@ -236,6 +236,30 @@ class MemoryStore:
         except (sqlite3.Error, ValueError, TypeError, json.JSONDecodeError):
             raise MemoryStoreReadError("可检索 Memory 读取失败。") from None
 
+    def active_records(self, *, scope: str, scope_id: str,
+                       statuses: tuple[str, ...] = ("confirmed", "pending")) -> list[MemoryRecord]:
+        """读取一个明确业务范围内仍有效的长期信息，供产品服务生成安全列表。
+
+        输入是现有 Memory scope、scope_id 和允许状态；SQL 在返回前完成范围与 active
+        过滤，避免产品层先读取全库再自行筛选。输出不含向量，历史 superseded 记录默认
+        不进入页面，但仍保留在数据库中供审计。
+        """
+        allowed = {"pending", "confirmed", "superseded"}
+        if not statuses or len(set(statuses)) != len(statuses) or not set(statuses) <= allowed:
+            raise ValueError("Memory 状态过滤无效。")
+        placeholders = ",".join("?" for _ in statuses)
+        try:
+            with closing(self._connect()) as connection:
+                rows = connection.execute(
+                    f"SELECT {_COLUMNS} FROM memories WHERE scope=? AND scope_id=? "
+                    f"AND is_active=1 AND status IN ({placeholders}) "
+                    "ORDER BY updated_at DESC, memory_id DESC",
+                    [scope, scope_id, *statuses],
+                ).fetchall()
+            return [self._record(row) for row in rows]
+        except (sqlite3.Error, ValueError, TypeError, json.JSONDecodeError):
+            raise MemoryStoreReadError("长期信息列表读取失败。") from None
+
     def check_query_space(self, space_id: str, dimension: int) -> None:
         """查询向量生成后核对模型和维度，防止静默截断余弦计算。"""
         try:
