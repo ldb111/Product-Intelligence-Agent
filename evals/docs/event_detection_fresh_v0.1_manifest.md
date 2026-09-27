@@ -60,3 +60,19 @@ Acceptance 开发。只有相同来源材料、相同事件事实或其答案被
 来推断答案。Manifest 的 CLEAN 只表示开发污染检查通过，不表示 Gold Label 已经完成。
 人工标注前如发现来源无法复核、事实重复或曾用于开发，必须把 Case 移出 Fresh Holdout，
 而不是把 `contaminated` 改回 false 继续使用。
+
+## 标注状态事实（2026-09-27）
+
+原始 Candidate 已在 `35cc1ffb6d265d2c8a11829be209173a9d8bfd5b` 冻结。本轮 30 条已完成
+AI-assisted + Human Review：AI 辅助初标分析，用户最终确认 decision 与指定主类型，
+按保存证据整理适用字段，状态使用现有合法值 `ready`。记录
+`annotated_by=ai_assisted_human_review`、`annotation_method=ai_assisted_human_review`，
+不宣称 pure human gold，也不宣称用户逐字段确认了 AI 整理的所有内容。
+
+实际分布为 `12 event / 13 no_event / 5 uncertain`；Path A 为 `8/6/4`，Path B 为 `4/7/1`。
+主类型为 capability 10、availability 1、deprecation 1。ID、输入和 provenance 保持冻结内容。
+未知事实留空；Paddle 的 Windows 次级事实保留，截断摘要的字段局限写入 annotation_notes。
+
+`contaminated=false` 保持不变：Event Detector 从未在这些 Case 上运行，这些材料未用于
+Event Prompt / Event Core 开发。上文 CLEAN 是开发污染核查结果；本节单独记录后来完成的
+标注事实。本轮未运行正式模型评测，补充候选仍待人工复核。

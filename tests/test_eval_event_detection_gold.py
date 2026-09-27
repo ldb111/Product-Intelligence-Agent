@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import copy
 import unittest
+from collections import Counter
 from pathlib import Path
 
 from evals.event_detection_schema import (
@@ -29,13 +30,21 @@ class EventDetectionFreshGoldTests(unittest.TestCase):
         cls.records = load_and_validate(GOLD_PATH)
 
     def sample(self) -> dict:
-        """返回一条隔离副本，便于故障注入不污染其他测试。"""
-        return copy.deepcopy(self.records[0])
+        """返回未标注的隔离副本，验证 Candidate 边界而不改动正式 Gold。"""
+        record = copy.deepcopy(self.records[0])
+        record["metadata"].update(
+            annotation_status="pending_human_review", annotated_by=None, annotation_method=None
+        )
+        record["gold"] = {
+            field: [] if field == "change_items" else None for field in record["gold"]
+        }
+        return record
 
     def mark_ready(self, record: dict, decision: str) -> None:
         """把测试副本切换为人工已完成状态；调用方再填写对应答案字段。"""
         record["metadata"]["annotation_status"] = "ready"
-        record["metadata"]["annotated_by"] = "human-reviewer"
+        record["metadata"]["annotated_by"] = "ai_assisted_human_review"
+        record["metadata"]["annotation_method"] = "ai_assisted_human_review"
         record["gold"]["decision"] = decision
         record["gold"]["annotation_notes"] = "本地契约测试"
 
@@ -57,6 +66,78 @@ class EventDetectionFreshGoldTests(unittest.TestCase):
         """路径名必须使用当前 Event Core 的两条正式发现路径。"""
         record = self.sample()
         record["metadata"]["path"] = "unknown_path"
+        with self.assertRaises(EventDetectionGoldValidationError):
+            validate_records([record])
+
+    def test_original_gold_is_ready_with_review_provenance(self) -> None:
+        """真实 Gold 记录 AI 辅助与用户最终确认，不冒充纯人工或模型自动答案。"""
+        for record in self.records:
+            metadata = record["metadata"]
+            self.assertEqual(metadata["annotation_status"], "ready")
+            self.assertEqual(metadata["annotation_method"], "ai_assisted_human_review")
+            self.assertEqual(metadata["annotated_by"], "ai_assisted_human_review")
+            self.assertEqual(metadata["evaluation_use"], "independent_holdout")
+            self.assertIs(metadata["contaminated"], False)
+
+    def test_confirmed_decision_distribution_and_paths(self) -> None:
+        """真实答案保留用户确认分布，不按原来的选材配额调整标签。"""
+        self.assertEqual(Counter(r["gold"]["decision"] for r in self.records),
+                         {"event": 12, "no_event": 13, "uncertain": 5})
+        expected = {
+            "state_comparison": {"event": 8, "no_event": 6, "uncertain": 4},
+            "explicit_statement": {"event": 4, "no_event": 7, "uncertain": 1},
+        }
+        for path, distribution in expected.items():
+            self.assertEqual(Counter(r["gold"]["decision"] for r in self.records
+                                     if r["metadata"]["path"] == path), distribution)
+
+    def test_confirmed_event_types_and_secondary_paddle_fact(self) -> None:
+        """主类型保持 10/1/1；Windows 支持边界作为 Paddle 次级事实保留。"""
+        self.assertEqual(Counter(r["gold"]["event_type"] for r in self.records
+                                 if r["gold"]["decision"] == "event"),
+                         {"capability": 10, "availability": 1, "deprecation": 1})
+        paddle = next(r for r in self.records if r["metadata"]["case_id"] == "EDF-A-013")
+        self.assertEqual(paddle["gold"]["event_type"], "capability")
+        self.assertTrue(any("Windows" in item["current_state"]
+                            for item in paddle["gold"]["change_items"]))
+
+    def test_explicit_event_time_is_not_observation_time(self) -> None:
+        """只有保存证据明确给出的 Milvus Release date 写入事件时间。"""
+        dated = {r["metadata"]["case_id"]: r["gold"]["event_time"]
+                 for r in self.records if r["gold"]["event_time"] is not None}
+        self.assertEqual(dated, {"EDF-A-012": "2026-09-20"})
+
+    def test_each_case_keeps_user_confirmed_decision(self) -> None:
+        """逐条固定用户确认映射，防止只满足总比例却交换了不同 Case 的答案。"""
+        events = {"EDF-A-002", "EDF-A-007", "EDF-A-009", "EDF-A-012", "EDF-A-013",
+                  "EDF-A-014", "EDF-A-015", "EDF-A-017", "EDF-B-001", "EDF-B-008",
+                  "EDF-B-010", "EDF-B-012"}
+        uncertain = {"EDF-A-006", "EDF-A-010", "EDF-A-011", "EDF-A-016", "EDF-B-006"}
+        for record in self.records:
+            case_id = record["metadata"]["case_id"]
+            expected = "event" if case_id in events else "uncertain" if case_id in uncertain else "no_event"
+            self.assertEqual(record["gold"]["decision"], expected, case_id)
+
+    def test_event_item_states_come_from_saved_evidence(self) -> None:
+        """变化状态只从冻结摘录提取；旧材料未证明时必须保留未知。"""
+        for record in self.records:
+            for item in record["gold"]["change_items"]:
+                self.assertIn(item["current_state"], record["provenance"]["current_source"]["excerpt"])
+                if item["previous_state"] is not None:
+                    self.assertIn(item["previous_state"], record["provenance"]["previous_source"]["excerpt"])
+
+    def test_invalid_annotation_method_is_rejected(self) -> None:
+        """不能把当前流程伪装成纯人工或被测模型自动生成 Gold。"""
+        for method in ("pure_human_annotation", "model_generated_gold"):
+            record = copy.deepcopy(self.records[0])
+            record["metadata"]["annotation_method"] = method
+            with self.subTest(method=method), self.assertRaises(EventDetectionGoldValidationError):
+                validate_records([record])
+
+    def test_ready_requires_decision(self) -> None:
+        """已完成状态不能仍保留空决策。"""
+        record = copy.deepcopy(self.records[0])
+        record["gold"]["decision"] = None
         with self.assertRaises(EventDetectionGoldValidationError):
             validate_records([record])
 

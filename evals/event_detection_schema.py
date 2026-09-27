@@ -26,6 +26,14 @@ EVENT_TYPES = {
     "positioning",
 }
 ANNOTATION_STATUSES = {"pending_human_review", "ready"}
+ANNOTATION_METHODS = {"ai_assisted_human_review"}
+SUPPLEMENT_COVERAGE = {
+    "EDS-001": "pricing",
+    "EDS-002": "plan_packaging",
+    "EDS-003": "access_permission",
+    "EDS-004": "commercialization",
+    "EDS-005": "positioning",
+}
 GOLD_FIELDS = {
     "decision",
     "event_type",
@@ -284,6 +292,12 @@ def validate_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
             raise EventDetectionGoldValidationError(
                 f"record {index}.metadata.annotation_status is invalid"
             )
+        # 这是标注流程的来源记录，不是被测模型生成的答案或生产事件字段。
+        method = metadata.get("annotation_method")
+        if method is not None and method not in ANNOTATION_METHODS:
+            raise EventDetectionGoldValidationError(
+                f"record {index}.metadata.annotation_method is invalid"
+            )
 
         input_data = _require_object(record.get("input"), f"record {index}.input")
         provenance = _require_object(record.get("provenance"), f"record {index}.provenance")
@@ -296,6 +310,10 @@ def validate_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 f"record {index}.gold missing: {', '.join(missing_gold)}"
             )
         if status == "pending_human_review":
+            if method is not None:
+                raise EventDetectionGoldValidationError(
+                    f"record {index}.metadata.annotation_method must be null while pending"
+                )
             if metadata.get("annotated_by") is not None:
                 raise EventDetectionGoldValidationError(
                     f"record {index}.metadata.annotated_by must be null while pending"
@@ -304,6 +322,26 @@ def validate_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
         else:
             _require_non_empty_string(metadata.get("annotated_by"), f"record {index}.metadata.annotated_by")
             _validate_ready_gold(gold, index)
+    return records
+
+
+def validate_supplement_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """校验本轮 5 条补充候选的数量、选材目标和未标注边界。
+
+    输入为补充 JSONL 记录；先复用来源及空 Gold 校验，再检查固定 Case ID 与选材目标。
+    输出原记录。目标类型只解释选材原因，不会写入或推断 Gold event_type。
+    """
+    validate_records(records)
+    if {record["metadata"]["case_id"] for record in records} != set(SUPPLEMENT_COVERAGE):
+        raise EventDetectionGoldValidationError("supplement must contain exactly EDS-001 through EDS-005")
+    for record in records:
+        metadata = record["metadata"]
+        if metadata.get("target_coverage_type") != SUPPLEMENT_COVERAGE[metadata["case_id"]]:
+            raise EventDetectionGoldValidationError("supplement target_coverage_type is invalid")
+        if metadata.get("created_before_model_evaluation") is not True:
+            raise EventDetectionGoldValidationError("supplement must be created before model evaluation")
+        if metadata["annotation_status"] != "pending_human_review":
+            raise EventDetectionGoldValidationError("supplement must remain pending_human_review")
     return records
 
 

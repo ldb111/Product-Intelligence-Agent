@@ -68,7 +68,7 @@ Path B 没有可靠历史状态时，`previous_state` 保持 `null`。不得为�
 5. 只有 `decision=event` 时，填写完整事件字段。
 6. 证据不支持的时间、范围或旧状态保留 `null`，不要用常识补齐。
 7. 在 `annotation_notes` 记录关键判断依据、缺口和冲突，不复制整页正文。
-8. 由第二名人工复核者检查来源和标签；分歧未解决时保持 `pending_human_review`。
+8. 由最终人工复核者确认决策；分歧未解决时保持 `pending_human_review`。
 
 ## 6. Event Type
 
@@ -172,9 +172,21 @@ V0.1 的目标分布是：Path A 约 `8 event / 6 no_event / 4 uncertain`，Path
 Case 只有在以下条件全部满足后才能把 `annotation_status` 改为 `ready`：
 
 - 来源可重新打开并与保存的 provenance 一致；
-- 一名人工标注者完成决策和适用字段；
-- 第二名人工复核者确认或解决分歧；
-- `annotated_by` 记录实际人工标注者；
+- 初标分析完成，适用字段只取自保存的官方证据；
+- 最终人工复核者确认 decision 或解决分歧；
+- `annotated_by` 与 `annotation_method` 如实记录标注流程；
 - 本地数据校验通过。
 
 在全部 Case 完成人工标注前，不实现或运行正式 Event Detection Evaluation Runner。
+
+## 13. Annotation Method / 标注方式
+
+原始 30 条 Candidate 在 Event Detector 运行前已冻结于
+`35cc1ffb6d265d2c8a11829be209173a9d8bfd5b`。本轮 AI 协助第一轮语义分析，用户对最终
+decision（以及指定的主 event_type）进行人工确认；事件字段只从 Candidate 已保存证据
+整理，未知旧状态、时间和范围留空。被评测 Event Detector 没有参与 Gold 生成。
+
+因此记录 `annotated_by=ai_assisted_human_review` 与
+`annotation_method=ai_assisted_human_review`，不是纯人工标注，也不是模型自动 Gold。
+Gold 不根据 Evaluation Output 反向修改。补充集的 `target_coverage_type` 只是选材元数据，
+不能自动成为答案；5 条补充记录继续保持 `pending_human_review`、空 Gold 与空标注人。
