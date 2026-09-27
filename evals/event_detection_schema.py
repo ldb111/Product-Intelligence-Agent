@@ -326,10 +326,11 @@ def validate_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def validate_supplement_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """校验本轮 5 条补充候选的数量、选材目标和未标注边界。
+    """校验本轮 5 条补充记录的数量、选材目标和评测前冻结边界。
 
-    输入为补充 JSONL 记录；先复用来源及空 Gold 校验，再检查固定 Case ID 与选材目标。
-    输出原记录。目标类型只解释选材原因，不会写入或推断 Gold event_type。
+    输入为补充 JSONL 记录；先复用来源和 Gold 生命周期校验，再检查固定 Case ID、选材目标
+    与模型评测前创建标记。输出原记录。目标类型只解释选材原因，不会推断 Gold event_type；
+    待标注与人工完成状态均由通用校验规则处理。
     """
     validate_records(records)
     if {record["metadata"]["case_id"] for record in records} != set(SUPPLEMENT_COVERAGE):
@@ -340,8 +341,6 @@ def validate_supplement_records(records: list[dict[str, Any]]) -> list[dict[str,
             raise EventDetectionGoldValidationError("supplement target_coverage_type is invalid")
         if metadata.get("created_before_model_evaluation") is not True:
             raise EventDetectionGoldValidationError("supplement must be created before model evaluation")
-        if metadata["annotation_status"] != "pending_human_review":
-            raise EventDetectionGoldValidationError("supplement must remain pending_human_review")
     return records
 
 

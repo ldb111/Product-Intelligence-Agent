@@ -9,22 +9,23 @@
 - 核查基线：`35cc1ffb6d265d2c8a11829be209173a9d8bfd5b`
 - Candidate：5；Path A：0；Path B：5
 - 中国产品：4；海外产品 Notion：1
-- `annotation_status=pending_human_review`：5/5
-- `annotated_by=null`、`annotation_method=null`：5/5
-- 所有 Gold 标量字段为 null，change_items 为空；decision 非空：0
+- `annotation_status=ready`：5/5
+- `annotated_by=ai_assisted_human_review`、`annotation_method=ai_assisted_human_review`：5/5
+- 人工最终确认：`event` 5/5
+- Gold Event Type：pricing、plan_packaging、access_permission、commercialization、positioning 各 1 条
 - `evaluation_use=independent_holdout`、`contaminated=false`：5/5
 - `created_before_model_evaluation=true`：5/5
 - 未调用 Event Detector、Event Prompt、LLM Evaluation 或正式 Runner。
 
 ## Case 清单
 
-| Case ID | Product | Target Coverage Type（非 Gold） | Path | Source | Source Date | Freshness Check | Contamination Result |
-|---|---|---|---|---|---|---|---|
-| EDS-001 | DeepSeek API | pricing | explicit_statement | [官方来源](https://api-docs.deepseek.com/zh-cn/news/news0802/) | 2024-08-02 | URL / 事件特征 / 历史：0 命中 | CLEAN |
-| EDS-002 | Notion | plan_packaging | explicit_statement | [官方来源](https://www.notion.com/en-gb/releases/2025-05-13) | 2025-05-13 | URL / 事件特征 / 历史：0 命中 | CLEAN |
-| EDS-003 | NocoBase | access_permission | explicit_statement | [官方来源](https://www.nocobase.com/en/blog/2.2.0) | 2026-08-23 | URL / 事件特征 / 历史：0 命中 | CLEAN |
-| EDS-004 | MaxKB | commercialization | explicit_statement | [官方来源](https://blog.fit2cloud.com/?p=6b2f8c92-74a8-4129-acc2-1c696ca5e63a) | 2024-08-01 | URL / 事件特征 / 历史：0 命中 | CLEAN |
-| EDS-005 | WPS 365 | positioning | explicit_statement | [官方来源](https://www.wps.cn/learning/question/detail/id/334018.html) | 2024-09-19 | URL / 事件特征 / 历史：0 命中 | CLEAN |
+| Case ID | Product | Target Coverage Type（选材） | Final Gold Event Type（人工确认） | Path | Source | Source Date | Freshness | Contamination |
+|---|---|---|---|---|---|---|---|---|
+| EDS-001 | DeepSeek API | pricing | pricing | explicit_statement | [官方来源](https://api-docs.deepseek.com/zh-cn/news/news0802/) | 2024-08-02 | 0 命中 | CLEAN |
+| EDS-002 | Notion | plan_packaging | plan_packaging | explicit_statement | [官方来源](https://www.notion.com/en-gb/releases/2025-05-13) | 2025-05-13 | 0 命中 | CLEAN |
+| EDS-003 | NocoBase | access_permission | access_permission | explicit_statement | [官方来源](https://www.nocobase.com/en/blog/2.2.0) | 2026-08-23 | 0 命中 | CLEAN |
+| EDS-004 | MaxKB | commercialization | commercialization | explicit_statement | [官方来源](https://blog.fit2cloud.com/?p=6b2f8c92-74a8-4129-acc2-1c696ca5e63a) | 2024-08-01 | 0 命中 | CLEAN |
+| EDS-005 | WPS 365 | positioning | positioning | explicit_statement | [官方来源](https://www.wps.cn/learning/question/detail/id/334018.html) | 2024-09-19 | 0 命中 | CLEAN |
 
 ## Freshness 核查方法
 
@@ -61,11 +62,16 @@ Fresh 指未参与本项目开发与模型评测，不要求公告发布于最�
 - EDS-005：官方说明回顾 2023 年品牌升级；2024-09-19 是文档日期，不是升级日期。需人工判断是否证明定位变化或仅补充既有定位。
 
 EDS-001 来源日期由官方新闻导航中的 2024/08/02 核对；其他日期来自页面公开日期。
-Source Date 不是 Gold event_time，补充事件时间仍为空。
+EDS-001 至 EDS-004 的冻结官方发布或公告日期写入 event_time；EDS-005 只回顾 2023 年
+品牌升级，没有精确事件日期，因此 event_time 保持 null。采集时间没有用作事件时间。
 短摘录只定位所选声明，人工复核须打开官方原文阅读上下文，并独立决定是否构成事件。
 
 ## 人工队列与后续边界
 
-动态标注卡位于 `tmp/evals/event_detection_supplement_annotation_queue.md`。
-卡片没有预填 decision 或 event_type。五种目标不等于五个已确认正例。
-补充人工确认前：Ready for Model Evaluation = NO。
+5 条已完成 AI-assisted annotation + human final review。`target_coverage_type` 原本只解释
+为什么选择候选，并未自动成为 Gold；最终 decision 与 event_type 是后续人工复核确认结果。
+被评测 Event Detector、Event Prompt、正式 LLM Evaluation 与 Runner 均未参与 Gold 生成。
+
+动态标注卡仍位于 `tmp/evals/event_detection_supplement_annotation_queue.md`，作为未提交的
+工作过程文件保留，不属于最终 Gold。最终 35 条独立留出集继续分为 Original 与 Supplement
+两份 JSONL，以保留清晰 provenance；本轮不合并文件。
