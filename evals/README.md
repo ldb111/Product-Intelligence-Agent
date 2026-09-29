@@ -22,7 +22,7 @@ evaluation_use = regression_only
 
 ### B. Fresh Holdout Gold
 
-未来使用未参与 Prompt、Rule 或 Code 开发的新案例建立，用于独立质量 Evaluation。当前尚未建立。
+Event Detection 旧35条已完成首次独立 Baseline，随后参与开发，当前仅作 development_regression。最终新留出必须在 RC 之后采集，空候选和 Gold 分别冻结。详见 [评测历史](docs/event_detection_evaluation_lineage.md)。
 
 ### C. Test Fixture
 
@@ -34,7 +34,7 @@ evaluation_use = regression_only
 
 ## 当前边界
 
-本目录当前只完成 Source Discovery 与 Stage 1 的 Legacy Regression 数据基础。Event Detection、Verification、Triage、Research、Memory Extraction 和 Follow-up Research 的独立 Evaluation 尚未建立。
+Source Discovery 与 Stage 1 有 Legacy Regression；Event Detection 有正式数据、无泄漏适配、执行器和独立基线。Verification、Triage、Research、Memory Extraction、Follow-up 的独立质量评测尚未建立。
 
 ## Legacy Regression Runner V0.1
 
