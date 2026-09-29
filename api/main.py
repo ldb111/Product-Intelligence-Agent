@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import logging
+import asyncio
 import os
 import tempfile
+import threading
 from pathlib import Path
 from typing import Annotated, Callable
 from urllib.parse import urlsplit
@@ -12,6 +14,7 @@ from urllib.parse import urlsplit
 from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from starlette.concurrency import run_in_threadpool
 
 from .application import ProductApiError, ProductApplicationService
 from .schemas import (
@@ -83,11 +86,15 @@ def create_app(
         allow_headers=["Content-Type"],
     )
     cached = service
+    service_lock = threading.Lock()
+    scan_locks: dict[str, threading.Lock] = {}
 
     def application() -> ProductApplicationService:
         nonlocal cached
         if cached is None:
-            cached = (service_factory or (lambda: ProductApplicationService(_default_state_directory())))()
+            with service_lock:
+                if cached is None:
+                    cached = (service_factory or (lambda: ProductApplicationService(_default_state_directory())))()
         return cached
 
     def allow_test_reset(request: Request) -> bool:
@@ -117,7 +124,8 @@ def create_app(
 
     @api.exception_handler(Exception)
     async def unexpected_error_handler(_request: Request, exc: Exception):
-        LOGGER.exception("API request failed", exc_info=exc)
+        # 底层异常可能包含请求正文或认证信息；产品服务仅保留错误类别作定位。
+        LOGGER.error("API request failed type=%s", type(exc).__name__)
         return JSONResponse(
             status_code=500,
             content=ProductError(code="request_failed", message="请求未完成，请重试。").model_dump(),
@@ -128,20 +136,28 @@ def create_app(
         return {"data": {"status": "ok"}}
 
     @api.get("/api/workspaces/{workspace_id}/overview", response_model=ApiEnvelope)
-    async def overview(workspace_id: str):
+    def overview(workspace_id: str):
         return {"data": application().overview(workspace_id)}
 
     @api.post("/api/workspaces/{workspace_id}/scan", response_model=ApiEnvelope)
     async def scan(workspace_id: str):
-        return {"data": await application().scan(workspace_id)}
+        # Pipeline 的异步来源发现与同步模型/SQLite 工作混合。整次工作流放入独立线程
+        # 的事件循环，避免耗时模型阻塞 API 主循环，使状态查询和页面刷新保持可用。
+        lock = scan_locks.setdefault(workspace_id, threading.Lock())
+        if not lock.acquire(blocking=False):
+            raise ProductApiError("scan_running", "当前工作区正在扫描，请等待本次完成。", 409)
+        try:
+            return {"data": await run_in_threadpool(asyncio.run, application().scan(workspace_id))}
+        finally:
+            lock.release()
 
     @api.get("/api/workspaces/{workspace_id}/competitors", response_model=ApiEnvelope)
-    async def competitors(workspace_id: str):
+    def competitors(workspace_id: str):
         return {"data": application().list_competitors(workspace_id)}
 
     @api.post("/api/workspaces/{workspace_id}/competitors", response_model=ApiEnvelope)
     async def add_competitor(workspace_id: str, body: CompetitorCreate):
-        return {"data": await application().add_competitor(workspace_id, body.model_dump())}
+        return {"data": await run_in_threadpool(asyncio.run, application().add_competitor(workspace_id, body.model_dump()))}
 
     @api.put(
         "/api/workspaces/{workspace_id}/competitors/{competitor_name}",
@@ -150,9 +166,9 @@ def create_app(
     async def update_competitor(
         workspace_id: str, competitor_name: str, body: CompetitorUpdate
     ):
-        return {"data": await application().update_competitor(
+        return {"data": await run_in_threadpool(asyncio.run, application().update_competitor(
             workspace_id, competitor_name, body.model_dump()
-        )}
+        ))}
 
     @api.post(
         "/api/workspaces/{workspace_id}/competitors/{competitor_name}/reset-test-data",
@@ -171,14 +187,14 @@ def create_app(
         "/api/workspaces/{workspace_id}/events/{event_id}/research",
         response_model=ApiEnvelope,
     )
-    async def research(workspace_id: str, event_id: str):
+    def research(workspace_id: str, event_id: str):
         return {"data": application().research(workspace_id, event_id)}
 
     @api.post(
         "/api/workspaces/{workspace_id}/events/{event_id}/research",
         response_model=ApiEnvelope,
     )
-    async def start_research(workspace_id: str, event_id: str, body: ResearchStart):
+    def start_research(workspace_id: str, event_id: str, body: ResearchStart):
         return {"data": application().start_research(
             workspace_id, event_id, retry=body.retry
         )}
@@ -187,14 +203,14 @@ def create_app(
         "/api/workspaces/{workspace_id}/events/{event_id}/research/follow-ups",
         response_model=ApiEnvelope,
     )
-    async def follow_up_conversation(workspace_id: str, event_id: str):
+    def follow_up_conversation(workspace_id: str, event_id: str):
         return {"data": application().follow_up_conversation(workspace_id, event_id)}
 
     @api.post(
         "/api/workspaces/{workspace_id}/events/{event_id}/research/follow-ups",
         response_model=ApiEnvelope,
     )
-    async def send_follow_up(workspace_id: str, event_id: str, body: FollowUpCreate):
+    def send_follow_up(workspace_id: str, event_id: str, body: FollowUpCreate):
         return {"data": application().send_follow_up(
             workspace_id, event_id, request_id=body.request_id, question=body.question
         )}
@@ -203,15 +219,15 @@ def create_app(
         "/api/workspaces/{workspace_id}/events/{event_id}/research/follow-ups/{turn_id}/retry",
         response_model=ApiEnvelope,
     )
-    async def retry_follow_up(workspace_id: str, event_id: str, turn_id: str):
+    def retry_follow_up(workspace_id: str, event_id: str, turn_id: str):
         return {"data": application().retry_follow_up(workspace_id, event_id, turn_id)}
 
     @api.get("/api/workspaces/{workspace_id}/own-product", response_model=ApiEnvelope)
-    async def own_product(workspace_id: str, product_id: str):
+    def own_product(workspace_id: str, product_id: str):
         return {"data": application().own_product(workspace_id, product_id)}
 
     @api.put("/api/workspaces/{workspace_id}/own-product", response_model=ApiEnvelope)
-    async def update_own_product(
+    def update_own_product(
         workspace_id: str, product_id: str, body: ProductConfigurationUpdate
     ):
         return {"data": application().update_own_product(
@@ -221,17 +237,17 @@ def create_app(
         )}
 
     @api.get("/api/workspaces/{workspace_id}/own-product/preferences", response_model=ApiEnvelope)
-    async def preferences(workspace_id: str, product_id: str):
+    def preferences(workspace_id: str, product_id: str):
         return {"data": application().preferences(workspace_id, product_id)}
 
     @api.post("/api/workspaces/{workspace_id}/own-product/preferences", response_model=ApiEnvelope)
-    async def add_preference(workspace_id: str, product_id: str, body: PreferenceWrite):
+    def add_preference(workspace_id: str, product_id: str, body: PreferenceWrite):
         return {"data": application().add_preference(workspace_id, product_id, body.model_dump())}
 
     @api.put(
         "/api/workspaces/{workspace_id}/own-product/preferences/{item_id}", response_model=ApiEnvelope
     )
-    async def edit_preference(
+    def edit_preference(
         workspace_id: str, item_id: str, product_id: str, body: PreferenceWrite
     ):
         return {"data": application().edit_preference(
@@ -241,19 +257,19 @@ def create_app(
     @api.delete(
         "/api/workspaces/{workspace_id}/own-product/preferences/{item_id}", response_model=ApiEnvelope
     )
-    async def remove_preference(workspace_id: str, item_id: str, product_id: str):
+    def remove_preference(workspace_id: str, item_id: str, product_id: str):
         return {"data": application().remove_preference(workspace_id, product_id, item_id)}
 
     @api.post(
         "/api/workspaces/{workspace_id}/own-product/preferences/{item_id}/confirm", response_model=ApiEnvelope
     )
-    async def confirm_preference(workspace_id: str, item_id: str, product_id: str):
+    def confirm_preference(workspace_id: str, item_id: str, product_id: str):
         return {"data": application().confirm_preference(workspace_id, product_id, item_id)}
 
     @api.post(
         "/api/workspaces/{workspace_id}/own-product/preferences/{item_id}/ignore", response_model=ApiEnvelope
     )
-    async def ignore_preference(workspace_id: str, item_id: str, product_id: str):
+    def ignore_preference(workspace_id: str, item_id: str, product_id: str):
         return {"data": application().ignore_preference(workspace_id, product_id, item_id)}
 
     @api.post("/api/workspaces/{workspace_id}/own-product/documents", response_model=ApiEnvelope)
@@ -266,7 +282,7 @@ def create_app(
         path = await _copy_upload(file)
         try:
             name = (display_name or Path(file.filename or "资料").name).strip()
-            return {"data": application().add_document(workspace_id, product_id, path, name)}
+            return {"data": await run_in_threadpool(application().add_document, workspace_id, product_id, path, name)}
         finally:
             path.unlink(missing_ok=True)
 
@@ -282,7 +298,7 @@ def create_app(
     ):
         path = await _copy_upload(file)
         try:
-            return {"data": application().replace_document(
+            return {"data": await run_in_threadpool(application().replace_document,
                 workspace_id, product_id, document_id, path
             )}
         finally:

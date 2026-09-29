@@ -895,6 +895,22 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ScriptedAdapters.calls["extract_preference"], 1)
         self.assertEqual(first["turn"]["candidate_count"], 1)
 
+    async def test_initial_artifact_survives_growing_conversation_and_service_reopen(self):
+        """初始成果独立存储；多轮追问及重新打开服务均不能覆盖或依赖聊天恢复报告。"""
+        _, event_id = await self.recommendation()
+        original = self.pipeline.start_research(self.product, event_id)["product"]["research"]
+        workspace = identity([self.product.workspace_id, self.product.competitor_name])
+        artifacts_before = self.pipeline.store.items("research:" + workspace)
+        for index in range(4):
+            reopened = ProductPipeline(self.pipeline.store.directory, adapter_type=ScriptedAdapters)
+            result = reopened.follow_up_research(self.product, event_id,
+                request_id=f"persistent-question-{index}", question=f"分析角度 {index}")
+            self.assertEqual(result["turn"]["status"], "completed")
+            self.assertEqual(reopened.start_research(self.product, event_id)["product"]["research"], original)
+            self.assertEqual(reopened.store.items("research:" + workspace), artifacts_before)
+        self.assertEqual(ScriptedAdapters.calls["deep_research"], 1)
+        self.assertEqual(len(ScriptedAdapters.follow_up_inputs[-1]["history"]), 3)
+
     async def test_follow_up_failure_keeps_turn_and_retry_uses_conversation_history(self):
         _, event_id = await self.recommendation()
         self.pipeline.start_research(self.product, event_id)

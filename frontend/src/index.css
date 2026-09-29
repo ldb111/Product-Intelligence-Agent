@@ -224,6 +224,37 @@ label { display: flex; flex-direction: column; gap: 7px; color: #52525b; font-si
 .followup textarea { min-height: 48px; flex: 1; resize: none; background: #fafafa; line-height: 1.5; }
 .followup button { min-width: 118px; }
 
+.research-header { position: static; }
+.research-session-nav { position: sticky; top: 0; z-index: 12; border-bottom: 1px solid #e4e4e7; background: #fff; padding: 14px 0; }
+.research-session-nav > div { display: flex; align-items: center; gap: 24px; }
+.research-session-nav a, .conversation-heading a { color: #1d4ed8; font-size: 14px; text-decoration: none; }
+.research-session-nav span { margin-left: auto; color: #71717a; font-size: 12px; }
+#initial-research, #follow-up, .answer-sources li, .conversation-turn { scroll-margin-top: 75px; }
+#follow-up { margin-top: 64px; border-top: 1px solid #d4d4d8; padding-top: 32px; }
+.conversation-heading { display: flex; justify-content: space-between; align-items: center; gap: 20px; }
+.conversation-heading h2 { margin: 0; font-size: 22px; }
+.conversation-heading p { margin: 8px 0 0; color: #71717a; font-size: 14px; }
+.assistant-message { width: 100%; padding: 20px 4px; background: transparent; }
+.answer-prose { color: #27272a; font-size: 16px; line-height: 1.85; overflow-wrap: anywhere; }
+.answer-prose p { margin: 0 0 10px; }
+.answer-prose h3 { margin: 20px 0 10px; font-size: 17px; }
+.answer-prose ul, .answer-prose ol { margin: 10px 0; padding-left: 25px; }
+.answer-prose ul { list-style: disc; }
+.answer-prose ol { list-style: decimal; }
+.answer-prose blockquote, .answer-sources blockquote { margin: 10px 0; border-left: 2px solid #d4d4d8; padding-left: 14px; white-space: pre-wrap; }
+.answer-part + .answer-part { margin-top: 18px; }
+.inline-citation { margin-left: 2px; color: #2563eb; font-size: 12px; vertical-align: super; text-decoration: none; white-space: nowrap; }
+.answer-source-missing { color: #92400e; font-size: 12px; }
+.answer-sources { margin-top: 24px; color: #52525b; font-size: 13px; line-height: 1.7; }
+.answer-sources summary { cursor: pointer; }
+.answer-sources ol { padding: 0; list-style: none; }
+.answer-sources li { margin-top: 20px; }
+.answer-sources a { color: #2563eb; }
+.answer-table { overflow-x: auto; margin: 14px 0; }
+.answer-table table { width: 100%; border-collapse: collapse; font-size: 14px; }
+.answer-table th, .answer-table td { padding: 10px 14px; border: 1px solid #e4e4e7; text-align: left; }
+.answer-table th { background: #f4f4f5; }
+
 @media (max-width: 1180px) {
   .competitor-grid { grid-template-columns: 1fr; }
   .filters { align-items: flex-start; flex-direction: column; }

@@ -37,7 +37,10 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     const error = body && 'message' in body ? body : null
     throw new ApiError(error?.code ?? 'request_failed', error?.message ?? '请求未完成，请重试。', response.status)
   }
-  return (body as Envelope<T>).data
+  if (!body || typeof body !== 'object' || !('data' in body)) {
+    throw new ApiError('invalid_response', '服务返回的数据不完整，请重试。', response.status)
+  }
+  return body.data
 }
 
 const root = (workspace = workspaceId) => `/api/workspaces/${encodeURIComponent(workspace)}`

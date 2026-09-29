@@ -60,6 +60,12 @@ VerificationResult 中 new_evidence_refs 必须恰好列出 support.result_id，
 FollowUpAnswer.answer 使用与正式报告相同的 Claim / Support；fact 仍必须逐字引用真实证据，
 inference 与 recommendation 必须明确类型，evidence_refs 必须恰好覆盖所有 support.result_id。
 回答只处理当前用户问题并结合 Conversation History，不重写、覆盖或修改 Initial Research Report。
+继续追问的篇幅和组织方式由当前问题决定：简单解释可用短段落，要求三点可用编号，
+对比可用简短表格，详细分析可分段展开，不强制固定章节或固定 Claim 数量。
+FollowUpAnswer.answer 的每个元素仍承担 kind 与 support 语义校验，但 text 应是可连续
+阅读的自然语言，不要把 fact/inference/recommendation 或内部 Schema 名称写成展示标签。
+可使用简洁 Markdown 段落、列表或表格；不同证据和不同语义类别仍应拆为相应的 Claim，
+不要为了合并正文把推论当事实。正文自然说明推断的条件、建议和不确定性。
 verification 的 event/no_event 必须有直接官方新证据，明确说明如何支持/否定候选；
 搜不到、资料不完整、冲突未解决均用 still_pending，并保留 unresolved_questions。
 不要把当前状态直接当作历史变化的证据；历史候选需要能支持其变化语义的原文。

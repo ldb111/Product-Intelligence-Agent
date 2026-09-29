@@ -45,6 +45,32 @@ beforeEach(() => {
 })
 
 describe('竞争事件工作台', () => {
+  it('没有事件日期时明确标记观察时间', () => {
+    render(<EventCard event={event({ event_time: null })} onResearch={vi.fn()} />)
+    expect(screen.getByText(/观察时间：/)).toBeInTheDocument()
+    expect(screen.queryByText(/事件时间：/)).not.toBeInTheDocument()
+  })
+
+  it('同时展示有历史对照的变化和只有官方声明的变化', () => {
+    render(<EventCard event={event({ change_items: [
+      { item: '存储', previous_state: '10GB', current_state: '20GB' },
+      { item: '导出', previous_state: null, current_state: '新增 PDF 导出' },
+    ] })} onResearch={vi.fn()} />)
+    expect(screen.getByText('10GB')).toBeInTheDocument()
+    expect(screen.getByText('新增 PDF 导出')).toBeInTheDocument()
+  })
+
+  it('部分扫描失败仍刷新已经成功保存的事件', async () => {
+    mocks.getOverview.mockResolvedValueOnce(overview([])).mockResolvedValueOnce(overview([event()]))
+    mocks.scan.mockResolvedValue({ status: 'partial', completed_at: '2026-09-28', new_event_count: 1,
+      competitors: [], error: { message: '部分来源无法访问，请稍后重试。' } })
+    render(<HomePage onResearch={vi.fn()} />)
+    await screen.findByText('暂无竞争事件')
+    await userEvent.click(screen.getByRole('button', { name: '立即扫描' }))
+    expect(await screen.findByText('发布企业能力')).toBeInTheDocument()
+    expect(await screen.findByText('部分来源无法访问，请稍后重试。')).toBeInTheDocument()
+  })
+
   it('按 research、monitor、no_action 分组，并在组内按时间倒序', () => {
     const rows = [
       event({ event_id: 'm', event_time: '2026-09-20', triage: { ...event().triage!, decision: 'monitor' } }),
@@ -158,7 +184,7 @@ describe('深入研究生命周期', () => {
         result_id: 'research:evt_1:page_001', excerpt: '入口已简化为输入竞品名称。',
         evidence_summary: '竞品已将监测入口简化为输入竞品名称。',
       }] }], watch_next: [{ text: '关注正式定价', kind: 'recommendation', support: [] }],
-      uncertainties: ['source_group source_d388bf6d76f4e1b9 与 tool trace 仍需核对'], evidence_refs: ['research:evt_1:page_001'] },
+      uncertainties: ['现有证据来自同一原始来源，暂不能视为独立交叉验证。'], evidence_refs: ['research:evt_1:page_001'] },
   }
 
   it('completed Research 再次打开时不重新启动', async () => {
@@ -232,7 +258,7 @@ describe('深入研究生命周期', () => {
     const recommendation = screen.getByText('考虑缩短首次配置流程').closest('.claim')
     expect(recommendation).toHaveTextContent('产品建议')
     expect(recommendation).toHaveTextContent('参考依据')
-    expect(screen.getByText('来源组与研究过程仍需核对').closest('li')?.querySelector('.research-evidence-card')).toBeNull()
+    expect(screen.getByText('现有证据来自同一原始来源，暂不能视为独立交叉验证。').closest('li')?.querySelector('.research-evidence-card')).toBeNull()
   })
 
   it('completed 页面采用最终六段信息结构并合并待关注事项', async () => {
@@ -297,8 +323,16 @@ describe('深入研究生命周期', () => {
     expect(document.body).not.toHaveTextContent('source_group')
     expect(document.body).not.toHaveTextContent('source_d388bf6d76f4e1b9')
     expect(document.body).not.toHaveTextContent('tool trace')
-    expect(document.body).toHaveTextContent('来源组与研究过程仍需核对')
+    expect(document.body).toHaveTextContent('现有证据来自同一原始来源，暂不能视为独立交叉验证。')
     expect(screen.getByText('全部来源（1）').closest('details')).not.toHaveAttribute('open')
+  })
+
+  it('研究正文保留原始语义，不机械替换技术术语', async () => {
+    const report = { ...completed, result: { ...completed.result!, uncertainties: ['Event API 的 null 值仍需核对。'] } }
+    mocks.getOverview.mockResolvedValue(overview([event({ research: report })]))
+    mocks.getResearch.mockResolvedValue(report)
+    render(<ResearchPage eventId="evt_1" onBack={vi.fn()} />)
+    expect(await screen.findByText('Event API 的 null 值仍需核对。')).toBeVisible()
   })
 
   it('failed Research 可通过真实 retry 参数重试', async () => {
@@ -320,7 +354,7 @@ describe('深入研究生命周期', () => {
     let resolve!: (value: unknown) => void
     mocks.sendFollowUp.mockReturnValue(new Promise(value => { resolve = value }))
     render(<ResearchPage eventId="evt_1" onBack={vi.fn()} />)
-    await userEvent.click(await screen.findByRole('button', { name: '继续追问' }))
+    await userEvent.click(await screen.findByRole('link', { name: '继续追问' }))
     expect(screen.getByRole('heading', { name: '发布企业能力' })).toBeInTheDocument()
     await userEvent.click(screen.getByRole('button', { name: '这次变化对我们当前产品影响最大的是什么？' }))
     await userEvent.click(screen.getByRole('button', { name: '发送' }))
@@ -330,6 +364,8 @@ describe('深入研究生命周期', () => {
       candidate_count: 0, created_at: '2026-09-24T00:00:00Z', updated_at: '2026-09-24T00:00:01Z',
       result: { answer: [{ text: '应优先验证管理入口的采用率。', kind: 'recommendation', support: [] }], uncertainties: [], evidence_refs: [] }, citations: [] })
     expect(await screen.findByText('应优先验证管理入口的采用率。')).toBeInTheDocument()
+    expect(screen.getByRole('region', { name: '初始研究成果' })).toBeVisible()
+    expect(screen.getByText('竞品已上线更轻量的监测向导，可能降低首次使用门槛。')).toBeVisible()
   })
 
   it('继续追问引用默认折叠，识别到待确认关注后提供产品入口', async () => {
@@ -342,10 +378,37 @@ describe('深入研究生命周期', () => {
       citations: [{ result_id: 'follow_up:turn_1:page_001', title: '官方说明', content: '权限覆盖' }],
     }] })
     render(<ResearchPage eventId="evt_1" onBack={vi.fn()} />)
-    await userEvent.click(await screen.findByRole('button', { name: '继续追问' }))
+    await userEvent.click(await screen.findByRole('link', { name: '继续追问' }))
     const source = await screen.findByText('参考来源（1）')
     expect(source.closest('details')).not.toHaveAttribute('open')
     expect(document.body).not.toHaveTextContent('follow_up:turn_1:page_001')
+  })
+
+  it('重新打开同一研究时同时恢复独立报告和全部追问，不用互斥 Tab', async () => {
+    mocks.getOverview.mockResolvedValue(overview([event({ research: completed })]))
+    mocks.getResearch.mockResolvedValue(completed)
+    mocks.getFollowUps.mockResolvedValue({ available: true, turns: Array.from({ length: 4 }, (_, n) => ({
+      turn_id: `turn_${n}`, user_message: `问题 ${n}`, status: 'completed', candidate_count: 0,
+      result: { answer: [{ text: `回答 ${n}`, kind: 'recommendation', support: [] }], uncertainties: [], evidence_refs: [] }, citations: [],
+    })) })
+    const first = render(<ResearchPage eventId="evt_1" onBack={vi.fn()} />)
+    await screen.findByText('回答 3')
+    first.unmount()
+    render(<ResearchPage eventId="evt_1" onBack={vi.fn()} />)
+    expect(await screen.findByText('回答 3')).toBeVisible()
+    expect(screen.getByRole('region', { name: '初始研究成果' })).toBeVisible()
+    expect(screen.queryByRole('tab')).not.toBeInTheDocument()
+    expect(screen.getByRole('link', {name:'回看研究成果 ↑'})).toHaveAttribute('href', '#initial-research')
+    expect(mocks.startResearch).not.toHaveBeenCalled()
+  })
+
+  it('刷新时仍在运行的研究通过状态查询自动恢复成果，不重复启动', async () => {
+    mocks.getOverview.mockResolvedValue(overview([event()]))
+    mocks.getResearch.mockResolvedValueOnce({ ...completed, status: 'running', result: undefined }).mockResolvedValue(completed)
+    render(<ResearchPage eventId="evt_1" onBack={vi.fn()} />)
+    expect(await screen.findByText('正在深入研究')).toBeVisible()
+    expect(await screen.findByRole('region', {name:'初始研究成果'}, {timeout:3500})).toBeVisible()
+    expect(mocks.startResearch).not.toHaveBeenCalled()
   })
 })
 

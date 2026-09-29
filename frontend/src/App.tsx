@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api } from './api/client'
+import { FollowUpResult } from './ResearchAnswer'
 import {
   documentStatus,
   eventTypeLabels,
@@ -122,7 +123,7 @@ export function EventCard({ event, onResearch }: {
         <div className="flex flex-wrap items-center gap-2">
           <strong className="text-sm text-zinc-950">{event.competitor}</strong>
           <span className="event-type">{eventTypeLabels[event.event_type] ?? event.event_type}</span>
-          <span className="muted">{formatDate(event.event_time ?? event.observation_time)}</span>
+          <span className="muted">{event.event_time ? '事件时间：' : '观察时间：'}{formatDate(event.event_time ?? event.observation_time)}</span>
           {event.discovery_origin === 'historical_backfill' && <span className="badge badge-muted">历史回溯</span>}
         </div>
         {triage && <TriageBadge decision={triage.decision} />}
@@ -136,7 +137,7 @@ export function EventCard({ event, onResearch }: {
           <div className="state-box state-current"><span>现在</span><p>{pairedChanges.map(item => item.current_state).join('；')}</p></div>
         </div>
       )}
-      {pairedChanges.length === 0 && explicitChanges.length > 0 && (
+      {explicitChanges.length > 0 && (
         <div className="explicit-change"><span>明确变化</span><p>{explicitChanges.map(item => item.current_state).join('；')}</p></div>
       )}
       <EvidenceList evidence={event.evidence} />
@@ -187,9 +188,10 @@ export function HomePage({ onResearch }: { onResearch: (event: CompetitionEvent)
     setScanMessage('')
     try {
       const result = await api.scan()
+      // 部分竞品失败时，其他竞品已持久化的事件仍应立即显示。
+      await load()
       if (result.status !== 'complete') throw new Error(result.error?.message ?? '扫描失败，请重试。')
       setScanMessage(scanSummary(result))
-      await load()
     } catch (reason) {
       setScanMessage(reason instanceof Error ? reason.message : '扫描失败，请重试。')
     } finally {
@@ -228,7 +230,7 @@ export function HomePage({ onResearch }: { onResearch: (event: CompetitionEvent)
       </header>
       {scanMessage && <div className={scanMessage.startsWith('扫描完成') ? 'notice notice-success' : 'notice notice-error'}>{scanMessage}</div>}
       {overview?.competitor_count === 0 ? (
-        <div className="empty-state"><h2>请先添加竞品</h2><p>添加监控对象后即可开始扫描。</p></div>
+        <div className="empty-state"><h2>请先添加竞品</h2><p>先在自身产品中配置关注重点，再添加监控对象开始扫描。</p><a href="/product" className="text-button">配置自身产品</a><a href="/competitors" className="text-button">添加竞品</a></div>
       ) : (
         <>
           <div className="filters">
@@ -506,24 +508,8 @@ function credibilityLabel(value: Evidence['credibility']) {
 }
 
 function researchCopy(value: string) {
-  return value
-    .replace(/\bsource_group\b(?:\s+source_[a-f0-9]{8,})?\s*/gi, '来源组')
-    .replace(/\bsource_[a-f0-9]{8,}\b/gi, '')
-    .replace(/\bresult_id\b/gi, '来源引用')
-    .replace(/\bartifact[_ ]?id\b/gi, '研究产物')
-    .replace(/\bchunk_id\b/gi, '文本片段')
-    .replace(/\s*\btool[_ ]?trace\b\s*/gi, '研究过程')
-    .replace(/\bown_product_comparison\b\s*/gi, '自身产品对照')
-    .replace(/\s*\binsufficient_own_product_context\b/gi, '自身产品资料不足')
-    .replace(/\bprevious_state\b/gi, '先前状态')
-    .replace(/\bcurrent_state\b/gi, '当前状态')
-    .replace(/\beffective_time\b/gi, '实际生效时间')
-    .replace(/\b(?:research_evidence|event_evidence|knowledge|candidate)_\d+\b/gi, '证据')
-    .replace(/\bknowledge\b/gi, '知识资料')
-    .replace(/\bEvent\b/g, '事件证据')
-    .replace(/\bnull\b/gi, '未记录')
-    .replace(/\s{2,}/g, ' ')
-    .trim()
+  // 自然语言由模型输出约束负责；前端不能机械删词而改变事实或技术名词含义。
+  return value.trim()
 }
 
 function plainEvidence(value: string) {
@@ -624,32 +610,18 @@ function ResearchResult({ report, evidence }: { report: ResearchReport; evidence
   </div>
 }
 
-function FollowUpResult({ turn }: { turn: FollowUpTurn }) {
-  const evidence = turn.citations ?? []
-  const citations = new Map(evidence.map(item => [item.result_id, item]))
-  const labels = new Map(evidence.map((item, index) => [item.result_id, `E${index + 1}`]))
-  return <div className="follow-up-answer">
-    {turn.result && <ClaimList claims={turn.result.answer} citations={citations} labels={labels} />}
-    {!!turn.result?.uncertainties.length && <div className="follow-up-uncertainties"><strong>仍需确认</strong><ul>{turn.result.uncertainties.map(item => <li key={item}>{researchCopy(item)}</li>)}</ul></div>}
-    {evidence.length > 0 && <details className="source-index"><summary>参考来源（{evidence.length}）</summary><ol>{evidence.map((item, index) => <li key={item.result_id}>
-      <span className="evidence-id">E{index + 1}</span><span className="source-index-copy"><strong>{item.title}</strong><span>{credibilityLabel(item.credibility) ?? '已核验来源'}</span></span>
-      {item.url && <a href={item.url} target="_blank" rel="noreferrer">查看来源</a>}
-    </li>)}</ol></details>}
-  </div>
-}
-
 export function ResearchPage({ eventId, onBack }: { eventId: string; onBack: () => void }) {
   const [event, setEvent] = useState<CompetitionEvent | null>(null)
   const [research, setResearch] = useState<ResearchState | null>(null)
   const [executionState, setExecutionState] = useState<ResearchExecutionState>('idle')
   const [state, setState] = useState<LoadState>('loading')
   const [error, setError] = useState('')
-  const [researchTab, setResearchTab] = useState<'result' | 'follow-up'>('result')
   const [turns, setTurns] = useState<FollowUpTurn[]>([])
   const [question, setQuestion] = useState('')
   const [followUpError, setFollowUpError] = useState('')
   const [sending, setSending] = useState(false)
   const [candidateNotice, setCandidateNotice] = useState(0)
+  const latestTurn = useRef<HTMLDivElement>(null)
   const loadVersion = useRef(0)
   const activeEventId = useRef(eventId)
   const startRequest = useRef<{ eventId: string; promise: Promise<ResearchState | null> } | null>(null)
@@ -716,7 +688,9 @@ export function ResearchPage({ eventId, onBack }: { eventId: string; onBack: () 
   const loadFollowUps = useCallback(async () => {
     try {
       const conversation = await api.getFollowUps(eventId)
+      if (activeEventId.current !== eventId) return
       setTurns(conversation.turns)
+      setFollowUpError('')
     } catch (reason) {
       setFollowUpError(reason instanceof Error ? reason.message : '对话记录加载失败。')
     }
@@ -725,9 +699,30 @@ export function ResearchPage({ eventId, onBack }: { eventId: string; onBack: () 
     if (research?.status === 'completed') void loadFollowUps()
   }, [loadFollowUps, research?.status])
 
+  // 刷新会丢失原 POST Promise，但后端任务仍在执行。只查询状态，不重复启动任务。
+  useEffect(() => {
+    if (research?.status !== 'running') return
+    let active = true
+    const timer = window.setInterval(() => {
+      void api.getResearch(eventId).then(value => {
+        if (active && value) { applyResearchState(value); setError('') }
+      }).catch(() => { if (active) setError('暂时无法同步研究进度，正在重试查询。') })
+    }, 2000)
+    return () => { active = false; window.clearInterval(timer) }
+  }, [applyResearchState, eventId, research?.status])
+  const hasRunningTurn = turns.some(turn => turn.status === 'running')
+  useEffect(() => {
+    if (sending) latestTurn.current?.scrollIntoView?.({ block: 'start', behavior: 'smooth' })
+  }, [sending, turns.length])
+  useEffect(() => {
+    if (!hasRunningTurn || sending) return
+    const timer = window.setInterval(() => { void loadFollowUps() }, 2000)
+    return () => window.clearInterval(timer)
+  }, [hasRunningTurn, sending, loadFollowUps])
+
   const sendFollowUp = async () => {
     const text = question.trim()
-    if (!text || sending) return
+    if (!text || sending || hasRunningTurn) return
     const requestId = globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`
     const optimistic: FollowUpTurn = {
       turn_id: `local-${requestId}`, user_message: text, status: 'running', candidate_count: 0,
@@ -773,24 +768,25 @@ export function ResearchPage({ eventId, onBack }: { eventId: string; onBack: () 
     <header className="research-header"><div className="research-width"><button className="back-button" onClick={onBack}>← 返回首页</button>
       <div className="flex items-start justify-between gap-6"><div><span className="eyebrow">深入研究事件</span><h1>{event?.title}</h1><div className="page-meta"><span>{event?.competitor}</span><span>{event ? eventTypeLabels[event.event_type] ?? event.event_type : ''}</span><span>{formatDate(event?.event_time ?? event?.observation_time)}</span><span className="confirmed">已确认</span></div></div>
         {research?.status === 'failed' && <button className="secondary-button" onClick={retry}>重新研究</button>}</div></div></header>
-    {research?.status === 'completed' && <div className="research-subnav"><div className="research-width"><button className={researchTab === 'result' ? 'active' : ''} onClick={() => setResearchTab('result')}>研究结果</button><button className={researchTab === 'follow-up' ? 'active' : ''} onClick={() => setResearchTab('follow-up')}>继续追问</button></div></div>}
+    {research?.status === 'completed' && <nav className="research-session-nav" aria-label="本次研究页内导航"><div className="research-width"><a href="#initial-research">研究成果</a><a href="#follow-up">继续追问</a><span>研究成果与对话均已保存</span></div></nav>}
     <div className="research-body research-width">
       {error && <ErrorNotice message={error} />}
       {showRunning && <div className="research-running"><span className="spinner" /><div className="research-running-copy"><div><h2>正在深入研究</h2><span className="badge badge-research">研究中</span></div><p>正在搜索、核验并整理与该事件相关的信息，研究完成后结果会自动显示在这里。</p><dl><div><dt>研究对象</dt><dd>{event?.title}</dd></div><div><dt>已有证据</dt><dd>{event?.evidence.length ?? 0} 条</dd></div></dl></div></div>}
       {research?.status === 'failed' && <div className="empty-state"><h2>研究失败</h2><p>本次深入研究未完成，事件及已有证据不受影响。</p><button className="primary-button" onClick={retry}>重新研究</button></div>}
-      {research?.status === 'completed' && research.result && researchTab === 'result' && <ResearchResult report={research.result} evidence={research.citations ?? []} />}
-      {research?.status === 'completed' && researchTab === 'follow-up' && <div className="follow-up-conversation">
+      {research?.status === 'completed' && research.result && <section id="initial-research" aria-label="初始研究成果"><ResearchResult report={research.result} evidence={research.citations ?? []} /></section>}
+      {research?.status === 'completed' && <section id="follow-up" className="follow-up-conversation" aria-label="继续追问">
+        <header className="conversation-heading"><div><h2>继续追问</h2><p>基于上方研究成果，继续分析与查证本次事件。</p></div><a href="#initial-research">回看研究成果 ↑</a></header>
         {candidateNotice > 0 && <div className="notice notice-success"><span>识别到 {candidateNotice} 条待确认的关注信息。</span><button className="text-button" onClick={openPreferences}>去确认</button></div>}
-        {followUpError && <ErrorNotice message={followUpError} />}
+        {followUpError && <ErrorNotice message={followUpError} retry={loadFollowUps} />}
         {turns.length === 0 && <div className="follow-up-empty"><h2>继续追问本次研究</h2><p>围绕本次事件继续提问。如现有证据不足，系统会继续查证相关资料。</p><div className="suggested-questions">{['这次变化对我们当前产品影响最大的是什么？', '还有哪些关键信息没有确认？', '如果继续跟踪，最值得关注什么？'].map(item => <button key={item} onClick={() => setQuestion(item)}>{item}</button>)}</div></div>}
-        {turns.map(turn => <div className="conversation-turn" key={turn.turn_id}><div className="user-message">{turn.user_message}</div><div className="assistant-message">
+        {turns.map((turn, index) => <div className="conversation-turn" ref={index === turns.length - 1 ? latestTurn : undefined} key={turn.turn_id}><div className="user-message">{turn.user_message}</div><div className="assistant-message">
           {turn.status === 'running' && <div className="follow-up-running"><span className="spinner" />正在继续研究…</div>}
           {turn.status === 'completed' && <FollowUpResult turn={turn} />}
           {turn.status === 'failed' && <div className="follow-up-failed"><p>{turn.error?.message ?? '本次继续研究未完成。'}</p><button className="secondary-button small" disabled={sending} onClick={() => void retryFollowUp(turn.turn_id)}>重试</button></div>}
         </div></div>)}
-      </div>}
+      </section>}
     </div>
-    {research?.status === 'completed' && researchTab === 'follow-up' && <div className="followup"><div className="research-width"><textarea value={question} rows={2} placeholder="围绕本次事件继续提问…" aria-label="围绕本次事件继续提问" disabled={sending} onChange={event => setQuestion(event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void sendFollowUp() } }} /><button className="primary-button" disabled={sending || !question.trim()} onClick={() => void sendFollowUp()}>{sending ? '正在继续研究…' : '发送'}</button></div></div>}
+    {research?.status === 'completed' && <div className="followup"><div className="research-width"><textarea value={question} rows={2} placeholder="围绕本次事件继续提问…" aria-label="围绕本次事件继续提问" disabled={sending || hasRunningTurn} onChange={event => setQuestion(event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void sendFollowUp() } }} /><button className="primary-button" disabled={sending || hasRunningTurn || !question.trim()} onClick={() => void sendFollowUp()}>{sending || hasRunningTurn ? '正在继续研究…' : '发送'}</button></div></div>}
   </main>
 }
 
