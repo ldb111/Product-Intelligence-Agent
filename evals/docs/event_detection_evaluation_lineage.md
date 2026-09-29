@@ -73,4 +73,69 @@ RC 后才收集新的公开来源；先提交全部空候选与标注规则，�
 `annotation_method=independent_expert_model_review`，不声称真人复核。最终使用
 `event_detection_closure --dataset ... --rc-commit ... --candidate-commit ... --freeze-commit ...`。
 运行器校验冻结顺序、输入不变、实现与 RC 一致，并为 Gold Commit 写独占运行凭条，
-阻止第二次生产执行。一次性最终结果和冻结哈希将在执行后追加；不因普通错误调系统。
+阻止第二次生产执行。一次性最终结果和冻结哈希已记录在下节；不因普通错误调系统。
+
+## 最终新留出：2026-09-29 已完成
+
+冻结链条（均为真实 Git 祖先顺序）：
+
+- RC：`1516eae1a51fe66a4b327477612789383e5601fd`
+- 空候选及规则：`ffd58c6e924f7178ee8307273822df0df424e6be`
+- 专家 Gold：`d1172a5eabbf64088fff3e05c8960d10c53b314c`
+- 首次且唯一运行：`20260929T060649661220Z`，DeepSeek / deepseek-flash，12 次调用。
+
+候选集共12条，Path A 4、Path B 8；Gold 为 event 7、no_event 4、uncertain 1。
+标注方法为 `independent_expert_model_review`，没有真人最终复核。Gold 类型覆盖5类：
+commercialization 2、deprecation 2、capability 1、availability 1、pricing 1；未覆盖的
+access_permission、plan_packaging、positioning 不作质量结论。没有 consumed diagnostic holdout。
+
+Gold SHA256：`47354b6641700e9a7d1e16ae4c110a8f60ed864c7b56f5dbe420791517ece824`。
+Prompt SHA256：`9c0f31d94771c73393d6fa4ec9e52908d28ffab546f7903cfb3e67d6b3de439e`。
+结果 SHA256：`c1dad4cbff96a185036ffeed75cf8f97fb8e3ecc3df1656f03baa2f033678d86`。
+原始结果、错例与字段队列保存在本地 `tmp/evals/closure/20260929T060649661220Z/`，不入 Git。
+
+| 指标 | 最终留出结果 |
+|---|---:|
+| Execution Success | 12/12 |
+| ERROR / BLOCKED / EvidenceValidationError | 0 / 0 / 0 |
+| Validated Decision Accuracy | 12/12 |
+| End-to-End Decision Correct Rate | 12/12 |
+| Decision Macro F1 | 1.0000 |
+| Event Precision / Recall / F1 | 1 / 1 / 1 |
+| Path A / Path B Accuracy | 4/4 / 8/8 |
+| Type Strict / Conditional Accuracy | 4/7 / 4/7 |
+| 有资格的事件日期标准化匹配 | 1/1 |
+| 日期应留空检查 | 10/11 |
+| Unsupported event_time | 1 |
+| 原始语义诊断覆盖 / 决策一致 | 12/12 / 12/12 |
+
+这里的端到端正确率是**决策级**，并不代表全部事实字段正确。Path A 分组没有 uncertain
+真值，运行器固定三类的分组 Macro F1 为2/3；不能与全体三类 Macro F1 混用。
+逐类 TP 为 event 7、no_event 4、uncertain 1，决策混淆矩阵无非对角项。
+
+### 保留的错例与字段问题
+
+- EFH-A-001：预测 availability，Gold deprecation；变化事实正确，停止 Node.js 18 支持的主类型不一致。
+- EFH-B-001：预测 capability，Gold availability；保留公测语义，主类型选择不同。
+- EFH-B-004：预测 pricing，Gold commercialization；免费化被当成价格变化。冻结前已记录分类邻近性，评测后不改标签。
+- EFH-B-003：把明确的未来生效日期同时填入 event_time，与 Gold 的“发生日期未知”不一致。
+  不是伪造日历值，而是时间字段角色混淆。粒度上把四个费率聚为一项，原始整行仍有证据。
+- EFH-A-002：change_action 额外称旧许可为“BSD 式”；冻结短摘录没有这个名称。
+  逐字状态与引用合法不代表自然语言归纳完全被支持，此处保留为语义过度推断。
+- EFH-B-005：只提取停止新购，未覆盖后续预计 EOFS/EOS 子项，属于事实覆盖不完整。
+- EFH-B-008：待确认解释仍出现少量内部上下文字段名称；不影响安全待确认判断，但产品语言约束仍非绝对保证。
+
+字段队列7条是所有 event 的待审阅队列，不等于7条错误。B-004 的 scope 自动复核标记来自
+Gold 空值与预测非空；预测的插件名称确实逐字存在，人工式专家读审不将它判成幻觉。
+程序报告的 hard-constraint violation 1 是 Gold 比较层的 unsupported_event_time，
+不是生产逐字引用 Validator 接受了不存在的引文。两层边界须分别解释。
+
+未针对任何最终错误修改系统、Gold 或重新调用。该12条是有意覆盖的小样本，来源与类型
+集中、部分边界判断较清晰，不能代表全部真实监控噪声或泛化到其他 AI 模块。
+
+## 最终软件与全局审计
+
+新增5条最终数据检查后，全量后端 **670/670 PASS**；前端 **47/47 PASS**、typecheck、build
+均通过。RC 后生产目录与执行器无差异。旧35条 Gold 未改，历史评测未重复或覆盖。
+研究同页、刷新持久恢复、自然回答和行内多引用均完成真实页面验收。
+Secret 扫描0、禁止提交路径0；`.env` 未改，tmp 数据保留且忽略。

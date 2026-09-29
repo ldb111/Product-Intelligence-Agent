@@ -72,12 +72,16 @@ npm run build
 
 详见 [评测历史与结果](evals/docs/event_detection_evaluation_lineage.md)。动态评测输出留在本地 `tmp/`。
 
+最终软件验收：后端670项、前端47项、类型检查与生产构建通过。新12条留出一次执行，
+决策12/12、事件类型4/7；小样本与字段问题均如实保留，不能宣称模型整体准确率100%。
+
 ## 阅读与演示
 
 - [真实实现事实索引](docs/PIA_MVP_Implementation_Fact_Index.md)：能力、API、持久化与源码入口。
 - [架构与设计理由](docs/final_architecture.md)：事件、证据、RAG、记忆、研究及可靠性。
 - [Demo 指南](docs/demo_guide.md)：运行、演示路径与失败时的解释。
 - [Word 实现报告](docs/PIA_MVP_Current_Implementation_Report.docx)：适合学习与项目讲解。
+- [最终收尾报告](docs/final_closure_report.md)：验收、冻结提交、完整评测解释与剩余限制。
 
 各 V0.1、Repair 文档是阶段验收记录；当前行为以事实索引和真实代码为准。
 
