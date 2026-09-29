@@ -54,6 +54,7 @@ def detect_event(data: DetectionInput) -> DetectionResult:
             # 只附加已经按业务 Schema 解析的内容与非敏感审计信息，便于复盘真实 Bad Case。
             # 不附加底层响应、请求、认证头或隐藏推理；调用方仍然收到明确失败。
             exc.failed_decision = decision.model_dump(mode="json")
+            exc.raw_decisions = decisions.model_dump(mode="json")
             exc.runtime = runtime.model_dump(mode="json") if runtime else None
             raise
         candidate_id = content_fingerprint({"input": data.model_dump(mode="json"), "decision": decision.model_dump()})

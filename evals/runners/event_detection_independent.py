@@ -717,7 +717,7 @@ def build_result(
     ]
     field_queue = build_field_review_queue(cases)
     result = {
-        "evaluation_type": "independent_holdout",
+        "evaluation_type": "development_regression",
         "gold_freeze_commit": GOLD_FREEZE_COMMIT,
         "runner_commit": None,
         "code_head_at_run": _code_head(),
@@ -750,7 +750,7 @@ def build_result(
         "blocked_case_ids": [case["case_id"] for case in cases if case["execution_status"] == "BLOCKED"],
         "error_case_ids": [case["case_id"] for case in cases if case["execution_status"] == "ERROR"],
         "limitations": [
-            "这是小规模、冻结、独立留出评测，不能解释为 PIA 总体 AI 准确率。",
+            "旧 35 条已用于开发；新运行仅为开发回归，不能解释为独立质量或 PIA 总体 AI 准确率。",
             "单样本事件类型只用于发现问题，不能证明稳定泛化能力。",
             "event_subject、change_action、change_items 与 affected_scope 的语义等价性需要人工复核。",
         ],
@@ -849,7 +849,7 @@ def render_report(result: dict[str, Any]) -> str:
         "", "## Limitations", "",
         *[f"- {item}" for item in result["limitations"]],
         "", "## Interpretation", "",
-        "结果只表示当前生产 Event Detector 在这 35 条冻结 Independent Holdout 上的 Baseline #1。",
+        "结果用途由 evaluation_type 标识；旧 35 条首次运行后已用于开发，后续分数不再独立。",
         "不能据此声称 PIA 总体 AI 准确率、生产级准确率或充分证明模型泛化能力。", "",
     ])
     return "\n".join(lines)

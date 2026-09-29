@@ -25,8 +25,8 @@ EVENT_TYPES = {
     "deprecation",
     "positioning",
 }
-ANNOTATION_STATUSES = {"pending_human_review", "ready"}
-ANNOTATION_METHODS = {"ai_assisted_human_review"}
+ANNOTATION_STATUSES = {"pending_human_review", "pending_expert_review", "ready"}
+ANNOTATION_METHODS = {"ai_assisted_human_review", "independent_expert_model_review"}
 SUPPLEMENT_COVERAGE = {
     "EDS-001": "pricing",
     "EDS-002": "plan_packaging",
@@ -309,7 +309,7 @@ def validate_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
             raise EventDetectionGoldValidationError(
                 f"record {index}.gold missing: {', '.join(missing_gold)}"
             )
-        if status == "pending_human_review":
+        if status in {"pending_human_review", "pending_expert_review"}:
             if method is not None:
                 raise EventDetectionGoldValidationError(
                     f"record {index}.metadata.annotation_method must be null while pending"

@@ -12,6 +12,18 @@ from .schemas import DetectionInput, EventDecision, Evidence
 class EvidenceValidationError(ValueError):
     """输出引用不属于输入，或事实超出了证据可确定的范围。"""
 
+    def __init__(self, message: str, *, rule: str = "evidence_invalid",
+                 field_path: str | None = None, input_field: str | None = None):
+        """保存可定位的规则诊断；不记录原文、请求、凭据或底层异常。
+
+        输入是校验器自己的固定约束说明与字段位置。输出仍是 ValueError，兼容原有
+        失败关闭语义；diagnostic 仅供开发审计，不自动进入下一次模型上下文。
+        """
+        super().__init__(message)
+        self.diagnostic = {"validation_rule": rule, "field_path": field_path,
+                           "input_field": input_field, "expected_constraint": message,
+                           "actual_problem": rule}
+
 
 def content_fingerprint(value: Any) -> str:
     """给精确内容生成稳定标识，只用于内容去重，不推断事件同一性。"""
@@ -42,37 +54,50 @@ def validate_claims(data: DetectionInput, decision: EventDecision) -> None:
     """
     facts = fact_fields(decision)
     if set(decision.citations) != set(facts):
-        raise EvidenceValidationError("每个非空事实都必须且只能引用对应字段的证据。")
+        missing = sorted(set(facts) - set(decision.citations))
+        extra = sorted(set(decision.citations) - set(facts))
+        raise EvidenceValidationError("每个非空事实都必须且只能引用对应字段的证据。",
+                                      rule="citation_missing" if missing else "invalid_reference",
+                                      field_path=(missing or extra)[0])
     for field, value in facts.items():
         quotes = decision.citations[field]
         if not quotes:
-            raise EvidenceValidationError("事实字段缺少原文引用。")
+            raise EvidenceValidationError("事实字段缺少原文引用。", rule="citation_empty", field_path=field)
         for quote in quotes:
             text = getattr(data, quote.input_field) or ""
             if not quote.excerpt.strip() or quote.excerpt not in text:
-                raise EvidenceValidationError("原文引用不属于本次输入。")
+                raise EvidenceValidationError("原文引用不属于本次输入。", rule="excerpt_not_found",
+                                              field_path=field, input_field=quote.input_field)
             if field.endswith(".previous_state"):
                 # Path B 可引用官方正文中明确叙述的历史，但仍禁止从当前事实反推历史。
                 allowed = {"previous_state"} if data.detection_path == "state_comparison" else {"previous_state", "current_state"}
                 if quote.input_field not in allowed:
-                    raise EvidenceValidationError("历史状态必须引用历史观察或明确历史声明。")
+                    raise EvidenceValidationError("历史状态必须引用历史观察或明确历史声明。",
+                                                  rule="invalid_input_field", field_path=field,
+                                                  input_field=quote.input_field)
             if field.endswith(".current_state") and quote.input_field != "current_state":
-                raise EvidenceValidationError("当前状态必须引用当前观察。")
+                raise EvidenceValidationError("当前状态必须引用当前观察。", rule="invalid_input_field",
+                                              field_path=field, input_field=quote.input_field)
         verbatim = field in {"event_time", "effective_time", "affected_scope"} or field.endswith((".previous_state", ".current_state"))
         if verbatim and not any(value in quote.excerpt for quote in quotes):
-            raise EvidenceValidationError("状态、时间或范围字段必须为所引原文的直接摘录。")
+            raise EvidenceValidationError("状态、时间或范围字段必须为所引原文的直接摘录。",
+                                          rule="claim_not_verbatim", field_path=field)
     if decision.decision != "event":
         return
     if data.evidence_status != "confirmed":
-        raise EvidenceValidationError("未确认或冲突输入不允许确认事件。")
+        raise EvidenceValidationError("未确认或冲突输入不允许确认事件。", rule="unconfirmed_input")
     if data.detection_path == "state_comparison":
-        for item in decision.change_items:
+        for index, item in enumerate(decision.change_items):
             if item.previous_state is None or item.current_state is None:
-                raise EvidenceValidationError("状态比较事件必须有两侧明确状态，单侧观察不足以证明新增或消失。")
+                side = "previous_state" if item.previous_state is None else "current_state"
+                raise EvidenceValidationError("状态比较事件必须有两侧明确状态，单侧观察不足以证明新增或消失。",
+                                              rule="comparison_side_missing",
+                                              field_path=f"change_items.{index}.{side}")
             if item.previous_state == item.current_state:
-                raise EvidenceValidationError("相同状态不能被声明为状态迁移。")
+                raise EvidenceValidationError("相同状态不能被声明为状态迁移。", rule="identical_states",
+                                              field_path=f"change_items.{index}")
     elif data.source_credibility != "official":
-        raise EvidenceValidationError("明确变化声明路径需要已确认的官方来源。")
+        raise EvidenceValidationError("明确变化声明路径需要已确认的官方来源。", rule="unofficial_statement")
 
 
 def build_evidence(data: DetectionInput, decision: EventDecision) -> list[Evidence]:
