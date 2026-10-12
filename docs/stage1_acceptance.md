@@ -1,10 +1,19 @@
-# Stage 1 Final Acceptance Record（阶段一最终验收记录）
+# 阶段一最终验收记录
+
+> 历史记录：本文保留原阶段计划、验收数字、代码字段与输出，不代表当前待办。当前产品能力见[实现事实索引](PIA_MVP_Implementation_Fact_Index.md)，面试阅读入口见[产品决策](product_decisions.md)。
+
+<details>
+<summary>历史记录阅读术语（代码字段与原始输出保留原样）</summary>
+
+LLM（大语言模型）；Evaluation（评测）；Agent（智能体）；Triage（事件分诊）；Research（研究）；Event（竞争事件）；Evidence（证据）；Schema（数据结构）；Verification（核验）；Snapshot（页面快照）；Stage 1（采集与状态比较阶段）；E2E（端到端验收）；Fixture（测试材料）；Regression（回归测试）；Baseline（基线）；Frozen（已冻结）；HTTP（超文本传输协议）；State（状态）；Deep Research（深入研究）。
+
+</details>
 
 > 验收日期：2026-09-07  
 > Stage 1 Final Acceptance（阶段一最终验收）：**PASS**  
 > Stage 1（阶段一）：**Frozen（已冻结）**
 
-## 1. Stage 1 目标
+## 1. 阶段一目标
 
 Stage 1（阶段一）负责把公开网页转化为可追踪、可比较的历史页面快照与交互状态观察结果，为 Stage 2 Event Detection（阶段二事件检测）提供可信、结构化、可审计的输入。
 
@@ -89,9 +98,9 @@ Stage 1（阶段一）负责把公开网页转化为可追踪、可比较的历�
 - Scan 3：仅 `Personal → Yearly` 状态变为 `modified`，`Price 100` 变为 `Price 120`。
 - Scan 3 的 `contextual_state_diff` 只包含 Yearly；Monthly、Reference 和不可比较的 Personal 导航节点均未生成详细差异。
 - 验收入口：[manual_v034a_state_matching_e2e.py](../experiments/manual_v034a_state_matching_e2e.py)。
-- 留存结果：[acceptance_summary.json](../experiments/output/v034a_state_matching_e2e/20260907_231207_301762/acceptance_summary.json)。
+- 留存结果：`experiments/output/v034a_state_matching_e2e/20260907_231207_301762/acceptance_summary.json`（本地历史产物，不随仓库提交；公开验证入口见上方验收脚本）。
 
-## 6. Known Limitations（已知限制）
+## 6. 已知限制
 
 - 当前只自动遍历符合安全规则的标准 ARIA Tab（无障碍标签页），不会主动操作无法可靠判断副作用的控件。
 - 最大嵌套深度为 2。
@@ -103,7 +112,7 @@ Stage 1（阶段一）负责把公开网页转化为可追踪、可比较的历�
 - 不保证覆盖 Shadow DOM（影子文档对象模型）、非标准复杂交互或任意网站。
 - 当前目标是 **validated extraction + visible failure（经过验证的抽取 + 可见失败）**，而不是承诺任意网站永不失败。
 
-## 7. Stage 1 明确未包含的能力
+## 7. 阶段一明确未包含的能力
 
 以下能力尚未实现，属于后续阶段：
 

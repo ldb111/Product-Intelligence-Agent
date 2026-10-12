@@ -1,6 +1,15 @@
-# 2026-09-02 ～ 2026-09-06 求职冲刺 Sprint
+# 2026-09-02 ～ 2026-09-06 求职冲刺迭代
 
-## Sprint 目标
+> 历史记录：本文保留原阶段计划、验收数字、代码字段与输出，不代表当前待办。当前产品能力见[实现事实索引](PIA_MVP_Implementation_Fact_Index.md)，面试阅读入口见[产品决策](product_decisions.md)。
+
+<details>
+<summary>历史记录阅读术语（代码字段与原始输出保留原样）</summary>
+
+MVP（最小可行产品）；AI（人工智能）；LLM（大语言模型）；Prompt（提示词）；Gold（金标准答案）；Evaluation（评测）；Agent（智能体）；RAG（检索增强生成）；Memory（长期记忆）；Research（研究）；Event（竞争事件）；Evidence（证据）；Snapshot（页面快照）；Stage 1（采集与状态比较阶段）；Commit（代码提交）；API（程序接口）；JSON（结构化数据格式）；PC Web（电脑网页端）；State（状态）；Structured Output（结构化输出）；Deep Research（深入研究）；Done（完成）。
+
+</details>
+
+## 迭代目标
 
 在 9 月 6 日结束前，形成一个接近完成、可运行、可演示、可评测、可用于简历和面试展示的 MVP（最小可行产品）。
 
@@ -86,7 +95,7 @@ Fixed Source（固定来源）
 
 ---
 
-## 9 月 4 日｜Model Selection（模型选型）+ Prompt Tuning（提示词调优）+ Competitor State（竞品状态）
+## 9 月 4 日｜模型选型+ Prompt Tuning（提示词调优）+ Competitor State（竞品状态）
 
 ### 目标
 
@@ -223,7 +232,7 @@ Previous State（历史状态）
 
 ---
 
-## 本 Sprint 的最高优先级
+## 本迭代的最高优先级
 
 1. 真实实现，不虚构。
 2. AI 评测证据优先于外围功能数量。

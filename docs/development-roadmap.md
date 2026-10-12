@@ -1,4 +1,13 @@
-# Product Intelligence Agent 开发路线图
+# 产品智能研究助手 开发路线图
+
+> 历史记录：本文保留原阶段计划、验收数字、代码字段与输出，不代表当前待办。当前产品能力见[实现事实索引](PIA_MVP_Implementation_Fact_Index.md)，面试阅读入口见[产品决策](product_decisions.md)。
+
+<details>
+<summary>历史记录阅读术语（代码字段与原始输出保留原样）</summary>
+
+AI（人工智能）；LLM（大语言模型）；Prompt（提示词）；Gold（金标准答案）；Evaluation（评测）；Agent（智能体）；Research（研究）；Event（竞争事件）；Evidence（证据）；Verification（核验）；Snapshot（页面快照）；Baseline（基线）；API（程序接口）；PC Web（电脑网页端）；State（状态）；Tool（工具）；Tool Calling（工具调用）；Structured Output（结构化输出）；Deep Research（深入研究）。
+
+</details>
 
 ## 文档用途
 
@@ -165,7 +174,7 @@
 
 **核心产出：** 可定时执行、可识别来源健康状态，并能处理重试和部分失败的持续监控流程。调度方式待技术选型。
 
-## 阶段 8：Deep Research Agent（深入研究智能体）
+## 阶段 8：深入研究 Agent（深入研究智能体）
 
 **状态：未开始**
 

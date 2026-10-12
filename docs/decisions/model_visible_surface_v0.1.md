@@ -1,4 +1,13 @@
-# Model-visible Surface Review v0.1（模型可见面审查）
+# 模型可见面审查 v0.1
+
+> 历史记录：本文保留原阶段计划、验收数字、代码字段与输出，不代表当前待办。当前产品能力见[实现事实索引](../PIA_MVP_Implementation_Fact_Index.md)，面试阅读入口见[产品决策](../product_decisions.md)。
+
+<details>
+<summary>历史记录阅读术语（代码字段与原始输出保留原样）</summary>
+
+LLM（大语言模型）；Prompt（提示词）；Tool（工具）。
+
+</details>
 
 ## 问题
 

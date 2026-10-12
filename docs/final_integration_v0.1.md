@@ -1,6 +1,15 @@
-# Final Integration V0.1 Implementation Report
+# 最终集成 V0.1 实现报告
 
-## 1. Repository Inspection
+> 历史记录：本文保留原阶段计划、验收数字、代码字段与输出，不代表当前待办。当前产品能力见[实现事实索引](PIA_MVP_Implementation_Fact_Index.md)，面试阅读入口见[产品决策](product_decisions.md)。
+
+<details>
+<summary>历史记录阅读术语（代码字段与原始输出保留原样）</summary>
+
+LLM（大语言模型）；Prompt（提示词）；Gold（金标准答案）；Evaluation（评测）；Agent（智能体）；RAG（检索增强生成）；Memory（长期记忆）；Knowledge（产品知识）；Triage（事件分诊）；Research（研究）；Event Core（事件核心）；Event（竞争事件）；Evidence（证据）；Citation（引用）；Schema（数据结构）；Pending（待确认候选）；Verification（核验）；Pipeline（产品工作流）；Snapshot（页面快照）；Artifact（成果资产）；Store（存储）；Embedding（向量化）；Rerank（重排序）；Source Discovery（来源发现）；Stage 1（采集与状态比较阶段）；Path A（前后状态比较路径）；Path B（官方明确声明路径）；Dedup（去重）；E2E（端到端验收）；Fixture（测试材料）；Baseline（基线）；Commit（代码提交）；HEAD（当前提交）；Frozen（已冻结）；HTTP（超文本传输协议）；JSON（结构化数据格式）；SQLite（本地数据库）；State（状态）；Reasoning（推理模型角色）；Deep Research（深入研究）；Done（完成）。
+
+</details>
+
+## 1. 仓库检查
 
 Repair C 基于已提交的 Repair A/B HEAD `f4ccd0b1e59b942b9b323b6ba25c1faa5ea367de`
 继续。实际检查了工作区、现有 Path B 接口、Structured Content、Source credibility 和 SQLite
@@ -8,7 +17,7 @@ Repair C 基于已提交的 Repair A/B HEAD `f4ccd0b1e59b942b9b323b6ba25c1faa5ea
 
 保留现有实现，仅在 Integration 层补齐配置失败检查点、官方域身份传递及重定向后的可信度边界。原有 `tmp/` 保持原样。Source Discovery、Stage 1、Event Core、Knowledge、Memory、Intelligence 及 `llm/` 的既有文件未修改。
 
-## 2. Integration Architecture
+## 2. 集成架构
 
 采用显式 Workflow：`ProductPipeline` 管流转与检查点，`ModuleAdapters` 调用冻结公共入口，`PipelineStore` 保存结构化状态，`output.py` 投影用户结果。没有新增模型、Prompt、业务推理规则、Agent 框架或依赖。
 
@@ -23,7 +32,7 @@ ProductInput → 配置 → Source Discovery / 已确认来源
   → ProductResult + 独立 Audit
 ```
 
-## 3. Files Changed
+## 3. 文件变更
 
 Final Integration 及 Repair A/B/C 的当前相关交付文件：
 
@@ -47,7 +56,7 @@ Final Integration 及 Repair A/B/C 的当前相关交付文件：
 
 `experiments/output/` 中的真实运行 JSON、审计和数据库是本地验收产物，受既有忽略规则保护，不属于交付文件。
 
-## 4. Product State
+## 4. 产品状态
 
 `ProductInput` 支持 workspace_id、competitor_name、可选 official_url / additional_urls / product_profile / current_focus / own_product_documents。无需填写 event_id、candidate_id、chunk_id 或 memory_id。
 
@@ -74,7 +83,7 @@ developer_audit = output["audit"]
 
 示例域名只是输入格式说明；实际运行应提供真实竞品。再次调用 `run(product)` 创建下一次扫描；失败时使用保存的内部 run_id 调用 `resume(run_id)`。该 ID 由调用程序管理，无需产品使用者填写。
 
-## 5. Main Workflow
+## 5. 主工作流
 
 `run()` 是 Monitoring 入口。它只消费已经持久化的 Own Product Knowledge，不读取或解析上传文件；首次无来源时调用真实 `run_source_discovery()` 并保存结果，此后复用已确认来源，再逐来源扫描、比较及处理候选。自身文件通过独立 `OwnProductDocumentService` 的 Add/Replace Workspace Configuration 生命周期入库。显式可信调用方也可用 `confirm_monitoring_sources()` 确认来源。
 
@@ -82,7 +91,7 @@ developer_audit = output["audit"]
 
 Triage 的 `research` 只创建 `not_started` recommendation，主 Pipeline 正常完成且不会调用 Research Agent。用户另行调用 `start_research(product, event_id)` 后，程序从 SQLite 恢复同一 confirmed Event 与对应 Triage，才执行现有 `deep_research`。客户端不能指定模型、Prompt、工具轨迹或内部 candidate / artifact 键。
 
-## 6. Baseline / Subsequent Scan
+## 6. 首次与后续扫描
 
 扫描通过冻结 Quality Gate 后调用 `create_snapshot()`。Snapshot 是不可回滚的真实观察历史：当前观察和 `observed_latest` 会立即保存；`processed_latest` 只表示最近已经完成事件判断、可安全用于下一次 State Comparison 的 Snapshot。每一组 previous/current 引用及处理状态保存在 `comparisons:<workspace>`，不需要修改冻结的 Stage 1 Snapshot Schema。
 
@@ -104,7 +113,7 @@ Monitoring Source 的 Structured Content 中形成有限局部 statement 候选�
 没有可靠 event_time 仍可进入正常 Path B，由 Event Core 保持 event_time 为 null。Path A
 unchanged 不会阻止 Path B 处理新的 Explicit Statement。
 
-## 7. Event Routing
+## 7. 事件路由
 
 | 输入/结果 | 后续行为 |
 | --- | --- |
@@ -121,7 +130,7 @@ unchanged 不会阻止 Path B 处理新的 Explicit Statement。
 
 Verification Agent / Research Agent 的自然语言 decision 不能直接改写正式 Event Truth。event 与 no_event 都必须携新官方原文进入 Event Core；只有 Event Core 的正式结果能解决 Candidate。证据不足、无法构造 DetectionInput 或正式结果仍 uncertain 时保留 Pending，且不会循环核验直到成功。事件事实已确认但语义去重给出同一性 UNCERTAIN 时单独保留待处理，不把它伪装成事实不确定候选。
 
-## 8. Knowledge / Memory Integration
+## 8. 知识与记忆接入
 
 Structured State、Knowledge、Memory 分开。两知识域复用冻结 KnowledgeStore 的 domain / product / competitor 过滤，Memory 使用独立数据库及 workspace scope。
 
@@ -131,7 +140,7 @@ Structured State、Knowledge、Memory 分开。两知识域复用冻结 Knowledg
 
 没有提供自身文档时记录上下文缺口；不能由未检索到资料推断某项能力不存在。
 
-## 9. Persistence
+## 9. 持久化
 
 简单 SQLite records 表保存命名空间、键与 JSON；每次操作提交并关闭连接。结构化运行、步骤、事件、产物引用可重新打开读取。
 
@@ -153,13 +162,13 @@ Event/Dedup outcome 持久化，uncertain 必须先保存 Pending Candidate，�
 
 这是本地单进程任务级保护；不提供跨数据库事务或供应商请求的 exactly-once。外部请求完成而本地检查点尚未保存时崩溃，恢复可能再次请求。
 
-## 10. Error Handling
+## 10. 异常处理
 
 区分 configuration_error、source_discovery_error、scan_error、event_detection_error、retrieval_error、triage_error、research_error。配置和检索异常在相关步骤识别；失败保存阶段、异常类别和尝试次数，产品结果只给受控错误说明。
 
 已完成快照、事件、分诊保留，失败后不生成后续成功结果。多来源部分扫描失败时返回 partial。用户触发的 Deep Research 失败只把独立 Research action 标为 failed，主 Pipeline、confirmed Event 和 Triage 继续保持 complete；底层异常正文不进入产品输出。
 
-## 11. Product Output vs Audit
+## 11. 产品输出与审计记录
 
 ProductResult 包含 competitor、monitoring_sources、scan_status、baseline_created、带产品级
 `event_id` 的 detected_events、单独的 historical_events、带独立 `pending_id` 的
@@ -175,7 +184,7 @@ hash、processing key、checkpoint 或内部 candidate_id。
 
 审计单独保存真实步骤、模型运行数据和工具轨迹；不直接用作用户 Demo 数据。
 
-## 12. Targeted Tests
+## 12. 定向测试
 
 `python -X utf8 -m unittest tests.test_pipeline -q`：**68/68 PASS**，26.735 秒。覆盖 Repair A/B 全部语义，
 并加入 Repair C 的首次 Baseline/Backfill 分离、90 天与 20 条顺序、可靠日期、官方来源、
@@ -186,7 +195,7 @@ Repair B 新增覆盖 research recommendation 不自动执行、not_started/runn
 
 控制测试使用脚本替身隔离真实模型副作用，并复用正式差异与事件构造接口；只证明控制流和边界，不代表模型语义质量评测。首次运行一项新增测试因测试数据未以 JSON 模式序列化日期失败，修复的是新增测试数据，未改冻结测试或业务规则。
 
-## 13. Real E2E
+## 13. 真实端到端验收
 
 本地验收产物：`experiments/output/pia_v01_live_01.json`（用户数据）、同名 `.audit.json`（技术审计）及 `.state/`（状态库）。
 
@@ -230,7 +239,7 @@ Own Product Document 的并发审计另以 4 项受控测试验证 Registry 原�
 
 恢复入口：准备阶段用 `--resume-setup` 复用已通过 Baseline；主链开始后用 `--resume-run <已保存的 run_id>`。不通过新建状态目录反复重跑成功步骤。
 
-## 14. Runtime Metrics
+## 14. 运行指标
 
 以下计量来自最终保留的成功步骤与产物；重试前失败调用的完整用量未由冻结客户端返回，不计为 0，也不混称完整账单。
 
@@ -248,11 +257,11 @@ Own Product Document 的并发审计另以 4 项受控测试验证 Registry 原�
 
 现有实际配置：Reasoning / Research 分别使用独立角色入口，模型均为 `deepseek-flash`；Embedding 为 `text-embedding-v4`，Rerank 为 `qwen3-rerank`。这些信息只在技术报告/审计中，不进入用户产品结果的运行配置字段。
 
-## 15. Full Regression
+## 15. 全量回归
 
 `python -X utf8 -m unittest discover -s tests -q`：**535/535 PASS**，82.399 秒。原模块、Repair A/B/C 及 16 项 Own Product Document Integration 测试全部通过；其中 4 项新增受控并发测试。日志中的无效 PDF、存储/响应故障和工具失败警告来自受控负向测试，最终结果为 OK。
 
-## 16. Code Quality
+## 16. 代码质量
 
 核心操作按配置、扫描、候选处理、产物保存、输出投影分开，中文说明关键边界；没有 500 行 run、Manager、协调框架或多 Agent。既有公共函数的名称、返回结构及输入要求已按真实代码核对。
 
@@ -260,7 +269,7 @@ Own Product Document 的并发审计另以 4 项受控测试验证 Registry 原�
 LF/CRLF 提示不是空白错误。本轮 9 个 Repair C 文件的高置信度 Secret 扫描命中 **0**；
 Frozen 模块 tracked 修改 **0**，`.env` 和 `experiments/output/` 修改 **0**。扫描只报告数量。
 
-## 17. Known Limitations
+## 17. 已知限制
 
 - 本轮两例是链路验收：Case A 受控真实采集，Case B 既有公开真实事件回放；没有重新完成一次 Source Discovery → 后续扫描 → 新事件的全程联网验收。相应接线由控制测试和原冻结模块测试覆盖。
 - 真实模型可能返回无效结构或引用；保留失败而不修改结果，也不自动无限重试。已用于开发的 Fixture 不构成独立、无污染的质量 Evaluation；本轮不创建 Gold Set。
@@ -281,7 +290,7 @@ Frozen 模块 tracked 修改 **0**，`.env` 和 `experiments/output/` 修改 **0
   日期；未进入 Snapshot 的 HTML metadata 不会被猜测补齐。每来源最多形成 60 个有界结构候选，
   Initial Backfill 再执行全竞品最近 90 天、最多 20 条限制。
 
-## 18. Git Status
+## 18. Git（版本管理）状态
 
 Repair C 未 Commit，HEAD 保持 Repair A/B 提交
 `f4ccd0b1e59b942b9b323b6ba25c1faa5ea367de`。暂存区为空，审阅以工作区最新内容为准。

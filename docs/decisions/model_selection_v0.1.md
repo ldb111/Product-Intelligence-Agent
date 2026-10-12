@@ -1,4 +1,13 @@
-# Model Selection V0.1｜模型选型记录
+# 模型选型 V0.1｜模型选型记录
+
+> 历史记录：本文保留原阶段计划、验收数字、代码字段与输出，不代表当前待办。当前产品能力见[实现事实索引](../PIA_MVP_Implementation_Fact_Index.md)，面试阅读入口见[产品决策](../product_decisions.md)。
+
+<details>
+<summary>历史记录阅读术语（代码字段与原始输出保留原样）</summary>
+
+PIA（产品智能研究助手）；Prompt（提示词）；Gold（金标准答案）；Evaluation（评测）；Agent（智能体）；Schema（数据结构）；Source Discovery（来源发现）；Baseline（基线）；State（状态）；Tool（工具）；Tool Calling（工具调用）；Structured Output（结构化输出）。
+
+</details>
 
 ## 1. 背景
 
@@ -59,7 +68,7 @@ PIA 默认以中国国内市场与可用条件为基准。
 
 模型需要能够按照固定 Schema（数据结构约束）返回结构化结果，供后续程序稳定消费。
 
-### 3.4 Agent 多轮决策能力
+### 3.4 智能体多轮决策能力
 
 模型需要能够根据：
 
@@ -71,7 +80,7 @@ PIA 默认以中国国内市场与可用条件为基准。
 
 决定下一步行动，而不是只完成单轮问答。
 
-### 3.5 API 与框架接入
+### 3.5 接口与框架接入
 
 需要能够较稳定地接入当前技术栈：
 

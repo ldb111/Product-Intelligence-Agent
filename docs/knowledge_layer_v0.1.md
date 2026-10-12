@@ -1,8 +1,17 @@
-# Knowledge Layer V0.1 Implementation Report
+# 知识层 V0.1 实现报告
+
+> 历史记录：本文保留原阶段计划、验收数字、代码字段与输出，不代表当前待办。当前产品能力见[实现事实索引](PIA_MVP_Implementation_Fact_Index.md)，面试阅读入口见[产品决策](product_decisions.md)。
+
+<details>
+<summary>历史记录阅读术语（代码字段与原始输出保留原样）</summary>
+
+MVP（最小可行产品）；LLM（大语言模型）；Prompt（提示词）；Gold（金标准答案）；Agent（智能体）；RAG（检索增强生成）；Memory（长期记忆）；Knowledge（产品知识）；Triage（事件分诊）；Research（研究）；Event Core（事件核心）；Event（竞争事件）；Evidence（证据）；Schema（数据结构）；Pending（待确认候选）；Embedding（向量化）；Rerank（重排序）；Source Discovery（来源发现）；Stage 1（采集与状态比较阶段）；E2E（端到端验收）；Fixture（测试材料）；Commit（代码提交）；HEAD（当前提交）；API（程序接口）；HTTP（超文本传输协议）；JSON（结构化数据格式）；SQLite（本地数据库）；Done（完成）。
+
+</details>
 
 状态：**READY FOR REVIEW**。实现、自动化检查和最小真实 RAG 验收通过；不是正式 Done 或新的冻结声明。仍需项目本人实际运行、验收并能解释核心代码。本轮未 Commit。
 
-## 1. Repository Inspection
+## 1. 仓库检查
 
 已读取 AGENTS.md、仓库结构、Event Core Schema/Input/Evidence、Source Discovery Schema/配置与候选边界、公共 llm 配置及客户端、requirements、模型选型与模型可见面 decision docs、已有测试和上轮真实验收报告。
 
@@ -13,7 +22,7 @@
 - 仓库没有向量数据库依赖。使用 Python 标准库 SQLite 和数学运算，**无新增依赖**，requirements 不变；不需要安装 FAISS/Chroma 或大型服务。
 - 开始时已有未跟踪 `tmp/`，本轮未修改。
 
-## 2. Architecture
+## 2. 架构
 
 ```text
 显式产品资料 / 已核验的竞品事实
@@ -29,7 +38,7 @@ query + 显式知识域
 
 `knowledge/` 只依赖 EmbeddingRole/RerankRole 契约。`llm/retrieval_models.py` 负责配置、HTTP 协议和脱敏运行审计；没有 Chat fallback、System Prompt 或 Agent 循环。独立增加公共角色文件，未重构冻结的 Chat/Event/Discovery 配置。
 
-## 3. Files Changed
+## 3. 文件变更
 
 全部为新增文件，原有受跟踪文件没有修改：
 
@@ -51,7 +60,7 @@ query + 显式知识域
 
 本地验收 JSON/SQLite 位于已有忽略目录 `experiments/output/`，不作为正式产品数据。
 
-## 4. Knowledge Domains
+## 4. 知识域
 
 文档必须属于 `own_product` 或 `competitor`。数据库文档主键为 `(domain, document_id)`，chunk ID 也包含域身份。相同文本、相同文档 ID 在两个域不会碰撞。
 
@@ -59,7 +68,7 @@ query + 显式知识域
 
 Own Product 只接收调用方明确提供的产品资料，可标记 PRD、定位、能力、定价、Release Notes、Roadmap 等来源类型。不扫描目录或生成正式产品事实。竞品只接收已确认的官方内容、事件证据、Evidence 和确认产品状态；要求 `verification_reference`。未验证候选、pending/conflict、Search Result 和当前尚未实现的 Research Result 会明确拒绝。
 
-## 5. Knowledge Schema
+## 5. 知识数据结构
 
 每个切片保存 `knowledge_domain`、`document_id`、`chunk_id`、`product_id`、`competitor_id`、`source_type`、`source_url`、`source_reference`、`title`、`content`、`observed_at`、`document_time`、`evidence_status`、`content_hash`、`metadata`。
 
@@ -67,7 +76,7 @@ Own Product 只接收调用方明确提供的产品资料，可标记 PRD、定�
 
 Research Result 后续可复用文档/来源契约；需要先明确验证规则再扩展入库类型，本轮不实现 Research。
 
-## 6. Ingestion
+## 6. 知识入库
 
 `KnowledgeIngestor.ingest(document)` 是确定性工作流，返回 `inserted`、`updated` 或 `unchanged`。
 
@@ -77,7 +86,7 @@ Embedding 全部成功后才写入；写入事务失败会回滚，旧知识仍�
 
 Own Product Document Integration 另增加窄范围的 `replace_document_set()` 公共契约：一个逻辑文件的全部 unit 在事务外完成 Chunking/Embedding，再与当前 Document Registry 一起在单个 SQLite 事务中替换。该接口只服务 current-version-only 文件配置，不改变既有单文档 `ingest()`、双域 Retrieval、Rerank、过滤或 Chunk Schema。结构缩减时旧 unit 通过外键级联删除，事务失败则完整保留旧 set。
 
-## 7. Chunking
+## 7. 分块
 
 优先识别 Markdown ATX 标题、章节、空行段落、列表和表格。相同章节的小段可以合并，不同章节分开；围栏代码里的 `#` 不当作标题。单个超长结构块先按换行/句子边界拆分，再按字符长度兜底。
 
@@ -85,7 +94,7 @@ Own Product Document Integration 另增加窄范围的 `replace_document_set()` 
 
 不是完整 Markdown 解析器；不支持复杂 HTML、PDF/DOCX 解析、Setext 标题或完整嵌套列表语义。超长标题/表头明确拒绝，不静默丢失上下文。字符上限不是 Token 精确上限，模型输入超限由 API 明确失败。
 
-## 8. Embedding
+## 8. 向量化
 
 模型名和供应商来自环境：
 
@@ -100,7 +109,7 @@ RERANK_MODEL=qwen3-rerank
 
 已按[阿里云 Embedding 官方接口](https://help.aliyun.com/zh/model-studio/text-embedding-synchronous-api)核对 HTTP 请求。每批最多 10 条，不传 dimensions，真实返回 **1024 维**。校验响应数量、index、有限非零向量以及维度一致性；不能用 Chat 输出替代向量。
 
-## 9. Vector Storage
+## 9. 向量存储
 
 SQLite 保存规范化完整文档、切片 JSON 和真实向量。向量以单位向量保存，查询通过余弦相似度排序；没有字符串匹配冒充向量检索。
 
@@ -108,7 +117,7 @@ SQLite 保存规范化完整文档、切片 JSON 和真实向量。向量以单�
 
 每次操作及时关闭连接，避免 Windows 文件占用。写入使用事务和外键级联删除；数据库重开及独立 Python 进程读取已真实验证。当前是线性精确扫描，适合小库；未来大规模语料可替换专用向量索引，无需本轮提前引入。
 
-## 10. Retrieval
+## 10. 检索
 
 默认 `top_n=10`、`top_k=5`，要求 `1 <= top_k <= top_n <= 100`。支持 `product_id`、`competitor_id`、`source_type`、`evidence_status` 的精确过滤；过滤在 Top-N 截断前完成，避免其他产品占用候选名额。这是元数据筛选，不是完整访问控制。
 
@@ -131,13 +140,13 @@ for result in response.results:
 
 没有可用候选时返回 `status="no_results"` 和空列表，不调用 Rerank。没有相关性阈值，存在候选不代表一定能够回答问题；本轮不生成答案。
 
-## 11. Rerank
+## 11. 重排序
 
 按[阿里云 qwen3-rerank 官方接口](https://help.aliyun.com/zh/model-studio/text-rerank-api)核对扁平请求体和顶层 `results`，未使用旧排序接口的 `input/parameters/output` 结构。现有环境使用 `/compatible-api/v1/reranks`；公共层从已配置的服务地址推导路径，可用非 Secret 的 `RERANK_BASE_URL` 显式覆盖。
 
 只发送初步召回的候选正文，使用响应 index 关联本地结果。忽略响应里任何文档原文或 URL。返回不足、重复/越界 index、非法分数均失败；不会偷偷跳过排序。调用方可以在构造时显式传 `rerank=None` 做不排序的受控实验。
 
-## 12. Provenance
+## 12. 来源追溯
 
 检索结果携带来源元数据、正文区间、文档/切片哈希、retrieval score/rank、rerank score。`candidates` 保留向量排序，`results` 保留最终顺序，可为后续 Recall@K、Precision@K、MRR/NDCG、Domain Leakage 和 Provenance Correctness 提供数据；本轮没有创建 Gold Set 或评测框架。
 
@@ -145,7 +154,7 @@ Event 适配按 Evidence 分文档，避免把不同来源的事实归到同一 
 
 Embedding/Rerank 输入只包含查询及标题/章节/表头/正文。Provider、Key、Endpoint、SDK、调用统计不拼入语义输入；运行审计通过独立的 `last_runtime` 提供。调用方提供的业务 metadata 仍需遵守模型可见面规范。
 
-## 13. Targeted Tests
+## 13. 定向测试
 
 ```powershell
 .\.venv\Scripts\python.exe -X utf8 -m unittest tests.test_knowledge tests.test_retrieval_models -q
@@ -157,7 +166,7 @@ Embedding/Rerank 输入只包含查询及标题/章节/表头/正文。Provider�
 
 这些 Mock 测试只证明控制逻辑，真实模型证据见下一节。
 
-## 14. Real E2E
+## 14. 真实端到端验收
 
 ```powershell
 .\.venv\Scripts\python.exe -X utf8 experiments/knowledge_e2e.py
@@ -182,7 +191,7 @@ Embedding/Rerank 输入只包含查询及标题/章节/表头/正文。Provider�
 
 第一次受限环境运行在 Embedding 连接阶段失败，记录保留于 `knowledge_v01_live_01.json`，不计为成功或零费用证明。随后联网执行的自动审批曾因外发授权判断拒绝；补充用户第 20 节明确要求、具体 Fixture/公开证据以及实际目的地检查后，同一验收操作获准并通过。未绕过审批或改用其他执行通道。
 
-## 15. Runtime Model Verification
+## 15. 实际运行模型核验
 
 | Role | 配置 provider/model | API 返回 model | 实际观察 |
 | --- | --- | --- | --- |
@@ -191,7 +200,7 @@ Embedding/Rerank 输入只包含查询及标题/章节/表头/正文。Provider�
 
 运行 JSON 保存逐调用 request ID、model、response_model、latency、usage、input_count，以及全部候选与最终结果。不保存 Key 或认证头。
 
-## 16. Full Regression
+## 16. 全量回归
 
 ```powershell
 .\.venv\Scripts\python.exe -X utf8 -m unittest discover -s tests -q
@@ -199,13 +208,13 @@ Embedding/Rerank 输入只包含查询及标题/章节/表头/正文。Provider�
 
 结果：**321/321 PASS**，包括原有 279 项与新增 42 项，运行 47.482 s。冻结 Stage 1、Source Discovery、Event Core 测试继续通过。运行中既有 LangChain beta/异步调试提示和故障注入测试日志不属于失败；未重跑 Source Discovery E2E。
 
-## 17. Code Quality
+## 17. 代码质量
 
 核心函数有中文业务、输入输出和边界解释。优先直观函数、单层 Role 契约和 SQLite 事务，没有工厂链、Agent、复杂框架或新增依赖。
 
 已检查 Python 语法、真实 requests.post 签名、`git diff --check` 和全部新增文件的空白格式。冻结目录及旧 llm/config.py、llm/client.py、requirements 与冻结提交保持一致。使用本地实际 Secret 值进行只返回命中数的检查，确认新增源码、测试、报告和验收产物未包含这些 Secret；没有读取展示完整环境文件。
 
-## 18. Known Limitations
+## 18. 已知限制
 
 1. 小型本地 SQLite 精确扫描，没有 ANN、混合检索、大规模性能/并发压测或正式权限系统。
 2. MVP 文件入口只支持 UTF-8 `.md/.txt`；其他资料需先提取正文并保留原来源。切片不是完整 Markdown/语义解析器。
@@ -220,7 +229,7 @@ Embedding/Rerank 输入只包含查询及标题/章节/表头/正文。Provider�
 11. 真实 Event/Evidence 回放文件和验收 SQLite/JSON 是本地忽略产物，新的仓库克隆需要用户提供已有真实报告或自行准备受支持的核验资料。没有将 Fixture 冒充正式产品数据。
 12. 本轮没有 Memory、Triage、Research Agent、GraphRAG、Knowledge Graph、最终答案生成或前端。
 
-## 19. Git Status
+## 19. Git（版本管理）状态
 
 提交前核实新增 13 个交付文件；已有受跟踪文件没有修改。两个测试文件均不在 HEAD 或历史索引中，属于本轮真正新增；界面显示的增删行数不是 tracked 文件修改。原有 `tmp/` 保持未跟踪，未触碰。验收产物被既有 `experiments/output/` 规则忽略，`.env` 仍被忽略。
 

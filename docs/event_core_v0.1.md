@@ -1,4 +1,13 @@
-# Event Core V0.1：实现与验收说明
+# 事件核心 V0.1：实现与验收说明
+
+> 历史记录：本文保留原阶段计划、验收数字、代码字段与输出，不代表当前待办。当前产品能力见[实现事实索引](PIA_MVP_Implementation_Fact_Index.md)，面试阅读入口见[产品决策](product_decisions.md)。
+
+<details>
+<summary>历史记录阅读术语（代码字段与原始输出保留原样）</summary>
+
+LLM（大语言模型）；Prompt（提示词）；Agent（智能体）；Research（研究）；Event Core（事件核心）；Event（竞争事件）；Evidence（证据）；Pending（待确认候选）；Verification（核验）；Source Discovery（来源发现）；Stage 1（采集与状态比较阶段）；Path A（前后状态比较路径）；Path B（官方明确声明路径）；Dedup（去重）；Fixture（测试材料）；Commit（代码提交）；API（程序接口）；HTTP（超文本传输协议）；Runtime（运行时）；Fast（快速模型角色）；Reasoning（推理模型角色）；Done（完成）。
+
+</details>
 
 Event Core 是固定 Workflow + LLM Semantic Decision。它接收 Stage 1 的局部观察证据，
 返回事件候选及可追踪 Evidence，再做事件语义去重。没有 Agent、MCP、Research、数据库
@@ -49,7 +58,7 @@ unresolved/missing_unconfirmed 不证明产品新增或消失。Path B 的历史
 历史，而不能由当前状态反推。宣布、Beta/Preview 与 GA 的区别由 Prompt 约束并由模型判断；
 模型改造 current_state 为原文不存在的 GA 文本会被逐字校验拒绝。
 
-## Schema 与 Pending
+## 数据结构与待确认候选
 
 - 输入：竞品、来源身份、可信度、采集证据状态、路径、状态上下文、前后局部原文、差异、
   两侧观察时间和可选补充原文。
@@ -79,7 +88,7 @@ pending，输入冲突保留 conflict。后续 Evidence Verification/Research �
 留在新增 Evidence 的 claim_snapshot 中。函数返回新对象，不修改调用方已有集合。
 no_event 不进入去重；uncertain 返回 pending_candidate，等待后续核验。
 
-## 静态 Model Role
+## 静态模型角色
 
 公共 `llm/` 使用已安装 ChatOpenAI 的 OpenAI-compatible 调用方式。Default/Fast 可解析
 已有 LLM_PROVIDER/LLM_BASE_URL/LLM_MODEL/LLM_API_KEY；冻结的 Source Discovery 仍保留

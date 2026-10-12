@@ -1,5 +1,14 @@
 # PIA MVP 当前实现事实索引
 
+> 本文用于核查实现；招聘阅读建议从[产品决策](product_decisions.md)和[AI（人工智能）架构](ai_architecture.md)开始。
+
+<details>
+<summary>历史记录阅读术语（代码字段与原始输出保留原样）</summary>
+
+PIA（产品智能研究助手）；MVP（最小可行产品）；AI（人工智能）；Prompt（提示词）；Gold（金标准答案）；Agent（智能体）；RAG（检索增强生成）；Memory（长期记忆）；Knowledge（产品知识）；Triage（事件分诊）；Research（研究）；Follow-up（事件内继续追问）；Initial Research（初始研究）；Initial Report（初始报告）；Event Core（事件核心）；Event（竞争事件）；Evidence（证据）；Pending（待确认候选）；Verification（核验）；Pipeline（产品工作流）；Snapshot（页面快照）；Artifact（成果资产）；Store（存储）；Embedding（向量化）；Rerank（重排序）；Path A（前后状态比较路径）；Path B（官方明确声明路径）；Dedup（去重）；E2E（端到端验收）；Baseline（基线）；Commit（代码提交）；API（程序接口）；SQLite（本地数据库）；PC Web（电脑网页端）；Reasoning（推理模型角色）。
+
+</details>
+
 审计日期：2026-09-29。本文记录 Final Closure 实现；冻结 Commit 与评测数值见评测历史文档及 Git 历史。旧 V2 对应 f94195a 的历史事实已由本文更新。
 
 ## 1 产品流程
@@ -31,7 +40,7 @@ observed_latest 表示最新抓取，processed_latest 表示正式结果已经�
 
 Path A 只用真正可比较的前后同项原文；模型不许由新文字补造过去不存在。Path B 使用官方明确变化声明，程序控制首次回溯范围、后续新声明、重试与去重。
 
-## 4 Research 与独立成果
+## 4 研究与独立成果
 
 Initial Report 保存在 `pipeline.sqlite3` 的 `research:<runtime_workspace>` namespace，研究状态保存 Artifact 引用。再次进入从持久化成果恢复，不依赖前端或聊天历史，不重跑已完成研究。
 
@@ -39,19 +48,19 @@ Follow-up 的 namespace 为 `research_follow_up:` 加 workspace/product/event �
 
 前端同时渲染成果与对话。回答支持自然段、短列表、编号、简单表格；不强制固定章节或 Fact 卡片。证据编号附在被支持正文末尾，按需展开原文；内部 kind/support 仍完整保留在后端。刷新时运行中任务通过只读查询恢复，不重复启动。
 
-## 5 Knowledge 与资料
+## 5 知识与资料
 
 Own Product 显式 Add/Replace，与监控分离。logical document_id 稳定，content_hash 只标识内容。相同内容跨路径幂等；整份替换原子提交并移除旧单元；失败保留旧版；并发新增去重，并发替换拒绝陈旧写入。
 
 每个 workspace 独立 Knowledge SQLite，产品以 scope ID 过滤，own_product 与 competitor 领域分开。仅当前版本进入检索。五种格式为 DOCX、文本型 PDF、XLSX、MD、TXT；扫描 PDF 无 OCR。
 
-## 6 Current Focus 与 Memory
+## 6 当前关注重点与长期记忆
 
 当前关注重点是产品配置，不需语义抽取。长期关注与偏好支持主动添加、编辑、移除、确认或忽略。主动添加立即 confirmed；Follow-up 仅从用户原文抽取 pending 候选，用户确认后才参与后续判断。模型回答、网页与 Event 不进入 Memory 写入入口。
 
 Memory 是用户意图，不能证明产品事实。当前产品界面的偏好为 workspace scope，product_id 不进一步细分该偏好范围；不能宣称跨团队多租户权限能力。
 
-## 7 API 与运行
+## 7 产品接口与运行
 
 | 路径 | 用途 |
 |---|---|
@@ -68,7 +77,7 @@ Memory 是用户意图，不能证明产品事实。当前产品界面的偏好�
 
 表内除 health、overview 外均承接 `/api/workspaces/{workspace}`。同步模型任务使用线程池，状态查询不会被模型等待阻塞；同 workspace 扫描有单进程并发门闩。SQLite 每次操作独立连接，原子操作使用事务。不是跨进程任务队列。
 
-## 8 Evidence 责任
+## 8 证据责任
 
 Program 登记真实来源与 ID、验证逐字 excerpt、两侧状态、引用字段与作用域。模型负责事实含义、竞争意义、推断与建议。未读搜索摘要、Memory 和待确认材料不能成为产品 Fact。自身比较必须同时引用自身与竞品事实；无资料时明确不足，不能推断不支持。
 
