@@ -1,6 +1,6 @@
 # PIA 的 AI（人工智能）能力与程序分工
 
-PIA（Product Intelligence Agent，产品智能研究助手）帮助产品经理发现具有竞争意义的竞品变化，并基于可核查证据开展深入研究。本文是面试阅读入口，状态与存储细节见[完整架构](final_architecture.md)。
+PIA（Product Intelligence Agent，产品智能研究助手）帮助产品经理发现具有竞争意义的竞品变化，并基于可核查证据开展深入研究。本文解释 AI（人工智能）能力与程序的职责分工，状态与存储细节见[完整架构](final_architecture.md)。
 
 运行结构：React（界面库）与 TypeScript（带类型检查的编程语言）前端 → FastAPI（Python编程语言的接口框架）后端 → SQLite（本地数据库）与业务模块。模型和搜索服务由后端调用，前端不持有凭据。
 

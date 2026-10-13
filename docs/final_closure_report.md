@@ -1,6 +1,6 @@
 # PIA MVP 最终收尾报告
 
-> 验收基线：本文记录2026-09-29的最终收尾，数字、模型结果与机器结论保留原样。招聘阅读摘要见[评测方法](evaluation.md)与[产品决策](product_decisions.md)。
+> 历史验收记录：本文记录2026-09-29的最终收尾与当时 Git（版本管理）状态，不代表当前工作区状态。验收数字、模型结果与产品验收结论保留，设计与验证方法见[评测方法](evaluation.md)和[产品决策](product_decisions.md)。
 
 <details>
 <summary>历史记录阅读术语（代码字段与原始输出保留原样）</summary>
@@ -9,7 +9,7 @@ PIA（产品智能研究助手）；MVP（最小可行产品）；AI（人工智
 
 </details>
 
-验收日期：2026-09-29。范围：本地单用户、PC Web 的作品级 MVP；不表示企业公网生产就绪。
+验收日期：2026-09-29。范围：本地单用户桌面网页 MVP（最小可行产品）；不表示企业公网生产就绪。
 
 ## 1. 最终状态
 
@@ -232,11 +232,11 @@ NocoBase插件名在原文中，不能因Gold范围为空就断言幻觉。
 ## 22. 未来可选增强
 
 更广泛的独立Gold与专家复核、研究/记忆质量评测、企业身份和部署安全、定时与通知可以
-作为未来产品阶段。本地作品MVP不以这些扩展为完成前提，也没有遗留必须继续开发的阶段任务。
+作为未来产品阶段。本地单用户MVP不以这些扩展为完成前提，也没有遗留必须继续开发的阶段任务。
 
-## 23. 最终 Git（版本管理）状态
+## 23. 当时的 Git（版本管理）状态
 
-正式成果均进入本轮提交；tracked工作区干净、暂存区为空。保留既有未跟踪历史审计：
+以下为2026-09-29验收提交时的记录：正式成果均进入当时提交，受跟踪工作区干净、暂存区为空，保留既有未跟踪历史审计：
 
 ```text
 ?? docs/full_implementation_drift_audit_v1.md
@@ -277,7 +277,5 @@ Final Evaluation Executed Once Per Holdout = YES
 Same Final Holdout Retuned Against = NO
 Documentation Matches Production = YES
 Git State Explainable = YES
-Production Ready for Portfolio Demo = YES
 Ready for Project Explanation = YES
-Ready for Interview Preparation = YES
 ```

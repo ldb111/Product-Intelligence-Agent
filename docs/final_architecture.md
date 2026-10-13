@@ -1,6 +1,6 @@
 # PIA 详细架构与设计理由
 
-PIA（Product Intelligence Agent，产品智能研究助手）帮助产品经理发现具有竞争意义的竞品变化，并基于可核查证据开展深入研究。面试阅读入口见[AI（人工智能）架构](ai_architecture.md)，本文提供状态与实现细节。
+PIA（Product Intelligence Agent，产品智能研究助手）帮助产品经理发现具有竞争意义的竞品变化，并基于可核查证据开展深入研究。[AI（人工智能）架构](ai_architecture.md)解释能力与职责分工，本文提供状态与实现细节。
 
 ## 产品边界
 

@@ -1,9 +1,9 @@
 # PIA MVP 当前实现事实索引
 
-> 本文用于核查实现；招聘阅读建议从[产品决策](product_decisions.md)和[AI（人工智能）架构](ai_architecture.md)开始。
+> 本文用于核查当前实现；产品设计与 AI（人工智能）能力说明见[产品决策](product_decisions.md)和[AI架构](ai_architecture.md)。
 
 <details>
-<summary>历史记录阅读术语（代码字段与原始输出保留原样）</summary>
+<summary>实现术语（代码字段与原始输出保留原样）</summary>
 
 PIA（产品智能研究助手）；MVP（最小可行产品）；AI（人工智能）；Prompt（提示词）；Gold（金标准答案）；Agent（智能体）；RAG（检索增强生成）；Memory（长期记忆）；Knowledge（产品知识）；Triage（事件分诊）；Research（研究）；Follow-up（事件内继续追问）；Initial Research（初始研究）；Initial Report（初始报告）；Event Core（事件核心）；Event（竞争事件）；Evidence（证据）；Pending（待确认候选）；Verification（核验）；Pipeline（产品工作流）；Snapshot（页面快照）；Artifact（成果资产）；Store（存储）；Embedding（向量化）；Rerank（重排序）；Path A（前后状态比较路径）；Path B（官方明确声明路径）；Dedup（去重）；E2E（端到端验收）；Baseline（基线）；Commit（代码提交）；API（程序接口）；SQLite（本地数据库）；PC Web（电脑网页端）；Reasoning（推理模型角色）。
 

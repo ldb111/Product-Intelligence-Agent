@@ -45,10 +45,12 @@ flowchart LR
 
 ## 深入阅读与运行
 
-- **3分钟**：[产品决策](docs/product_decisions.md)。
-- **10分钟**：[AI架构](docs/ai_architecture.md) · [评测](docs/evaluation.md) · [个人产品经理贡献](docs/product_manager_contribution.md)。
+- **产品设计**：[关键产品决策](docs/product_decisions.md)。
+- **AI能力与架构**：[模型与程序分工](docs/ai_architecture.md)。
+- **验证方法**：[评测与失败案例](docs/evaluation.md)。
+- **项目分工**：[个人产品经理贡献](docs/product_manager_contribution.md)。
 - **体验与复现**：[演示、截图和完整配置](docs/demo.md)。
-- **核查实现**：[事实索引](docs/PIA_MVP_Implementation_Fact_Index.md) · [详细架构](docs/final_architecture.md) · [历史最终验收](docs/final_closure_report.md)。
+- **技术实现**：[事实索引](docs/PIA_MVP_Implementation_Fact_Index.md) · [详细架构](docs/final_architecture.md) · [历史最终验收](docs/final_closure_report.md)。
 
 ## 当前边界
 

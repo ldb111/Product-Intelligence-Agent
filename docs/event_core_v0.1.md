@@ -1,6 +1,6 @@
 # 事件核心 V0.1：实现与验收说明
 
-> 历史记录：本文保留原阶段计划、验收数字、代码字段与输出，不代表当前待办。当前产品能力见[实现事实索引](PIA_MVP_Implementation_Fact_Index.md)，面试阅读入口见[产品决策](product_decisions.md)。
+> 历史记录：本文记录对应阶段的开发与验收状态，保留原阶段计划、验收数字、代码字段与输出，不代表当前产品状态、待办或 Git（版本管理）状态。当前产品能力见[实现事实索引](PIA_MVP_Implementation_Fact_Index.md)，设计取舍见[产品决策](product_decisions.md)。
 
 <details>
 <summary>历史记录阅读术语（代码字段与原始输出保留原样）</summary>
